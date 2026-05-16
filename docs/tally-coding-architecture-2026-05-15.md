@@ -108,6 +108,63 @@ Phase 1B Tally status: Sub-PR 1 + Sub-PR 3 merged. Sub-PR 2 (MCP plugin) and Sub
 
 See [`tally-coding-stack-integration-2026-05-16.md`](tally-coding-stack-integration-2026-05-16.md) for code-shape integration patterns including the OpenHands tool wrappers for both Skytale and Tally.
 
+### Phala Cloud platform reference (research as of 2026-05-16)
+
+Detailed Phala Cloud primitives the platform consumes. Verify specifics in week 1 spike; current understanding from `docs.phala.com`:
+
+**CLI + SDKs**
+- Install: `npm install -g phala`; auth via `phala login`; credentials in `~/.phala-cloud/credentials.json`
+- API access: REST API (versioned; current `2026-01-21`) + Python SDK + JavaScript SDK + Go SDK + Terraform Provider
+- Override credentials via `PHALA_CLOUD_API_KEY` env var
+
+**CVM lifecycle commands**
+- `phala deploy` — create or update CVM from Docker Compose
+- `phala cvms` — start, stop, restart, delete, resize
+- `phala apps` — list deployed CVMs
+- `phala logs`, `phala ssh`, `phala cp`, `phala ps` — operations
+- `phala runtime-config` — inspect config
+- `phala instance-types` — see hardware options
+
+**Pricing (per CVM instance, as of 2026-05-16)**
+- `tdx.medium`: $0.07/hour
+- `tdx.large` (default): $0.14/hour
+- `tdx.2xlarge`: $0.28/hour
+- Storage: $0.000139/GB/hour (continues after CVM stop until delete)
+- GPU TEE: from $2.38/GPU/hour for H100
+- New verified accounts: $20 CVM credits
+
+**Auto-HTTPS networking**
+- Every CVM port gets an automatic public HTTPS endpoint: `https://<app-id>-<port>.dstack-prod5.phala.network`
+- TLS certificates provisioned automatically (no Let's Encrypt setup)
+- TCP-with-TLS for any protocol; gRPC via URL suffix `g`
+- Custom domains via `dstack-ingress` container (integrates with Cloudflare DNS — relevant for `worker.tally.codes` later)
+- Outbound: full internet access from CVMs (CVMs can call Skytale relay, Tally Workers, Redpill API, GitHub, etc. without restriction)
+
+**Secrets management (client-side encryption)**
+- Secrets encrypted client-side with **X25519 + AES-256-GCM** before transmission to Phala
+- Phala server never sees plaintext; only decrypted inside the CVM's TEE at boot
+- CLI: `phala deploy -e KEY=value` or `-e .env`
+- SDKs auto-encrypt; Terraform supports auto-encryption mode
+- Caveat: "Updating encrypted secrets is a full replacement operation" — can't update individual variables; rotate all-or-nothing
+
+**Attestation**
+- Intel TDX hardware-signed quotes
+- 3 verification layers: application (Docker container measurements), platform (OS/KMS/network integrity), complete chain (end-to-end no-trust-assumption)
+- Quote includes "measurements of the Intel TDX CPU, OS images, your application configuration, and optional custom data" — usable as public cryptographic proof in marketing claims
+- Customer-facing: Tally Coding can surface "attestation verified at time X" in the UI for compliance customers
+
+**Scaling**
+- Horizontal: multi-replica deployments built-in
+- Vertical: resize CPU/memory/disk per CVM
+- Auto-scaling: mentioned in docs but specifics need week-1 verification
+
+**Other Phala primitives potentially relevant for Phase 2**
+- Onchain KMS — deterministic key generation; could augment Skytale key management
+- Crypto wallet creation — built-in wallets inside CVMs
+- Datadog integration — for v1.0 observability (week 15-19)
+- Webhooks — CVM event triggers
+- Templates: Eliza, ERC-8004, Next.js/Python (ERC-8004 is the agent-identity proposal — worth investigating for Phase 2)
+
 ### State + real-time sync: Convex (convex.dev)
 
 Reactive backend with WebSocket subscriptions. TypeScript backend functions; matches Next.js frontend. Built-in Clerk auth integration. Document database with reactive queries. Free tier covers prototype; $25/mo Starter for early users.

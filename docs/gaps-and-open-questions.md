@@ -96,6 +96,37 @@ Full-text search on E2E-encrypted messages is genuinely hard:
 
 v1.0 ships without search; decide v1.5 implementation approach.
 
+### B.14 — Phala CVM cold-start time (week 1 verification)
+
+Modal cold starts are 2-10s for Python containers. Phala CVM cold start time is not documented at the level of detail needed for the per-task-worker pattern.
+
+**Why this matters:** Tally Coding's orchestrator dispatches workers via Tally wakes; ideally a worker CVM spins up quickly enough that user latency is acceptable. If cold start is 30s+, per-task spawning hurts UX; we'd switch to pooled CVMs.
+
+**Verify in:** Week 1 Day 2-3 spike. Measure: time from `phala cvm deploy` invocation to first HTTP response from the CVM. If >15s consistently, switch to pooled-worker pattern in week 2 architecture.
+
+### B.15 — CVM-to-CVM internal networking (week 2 design decision)
+
+Orchestrator CVM (long-running) needs to coordinate with worker CVMs (per-task ephemeral). Options:
+
+- **(a) Via Tally Workers** (architecture default) — orchestrator dispatches wakes to workers; workers poll inboxes. Bytes flow through Cloudflare relay. Latency ~50-100ms per round-trip. Works regardless of Phala internal networking capabilities.
+- **(b) Via Phala auto-HTTPS public endpoints** — orchestrator calls worker's `https://<app-id>-<port>.dstack-prod5.phala.network` directly. Bytes flow over public internet to Phala's edge. Latency lower if CVMs are in same region.
+- **(c) Via Phala internal networking** — if Phala provides CVM-to-CVM internal network (not yet confirmed), bypass public hop entirely.
+
+**Recommendation:** stay with (a) for v0.1. It's the architecture we've designed; doesn't depend on Phala's specific networking semantics; matches the Stoa `WakeRouter` abstraction.
+
+**Verify in:** Week 1-2. Worth checking if Phala has CVM-internal networking for future optimization but not blocking v0.1.
+
+### B.16 — Per-task vs pooled worker CVM lifecycle (week 2)
+
+Two patterns for worker CVMs:
+
+- **Per-task ephemeral** — each worker dispatch spawns a fresh CVM; destroyed after task complete. Strongest isolation; matches the Modal Sandbox model; clean billing per task. Higher cold-start cost.
+- **Pooled long-running** — maintain a pool of worker CVMs; tasks routed to available workers via internal queue. Lower cold-start cost; weaker per-task isolation (multiple tasks share state); needs pool management.
+
+**Recommendation:** start with per-task ephemeral for v0.1 (simpler; matches existing architecture). Switch to pooled in v1.5+ if cold-start UX hurts and B.14 confirms it's the bottleneck.
+
+**Decide:** Week 2 based on B.14 cold-start measurements.
+
 ### B.11 — Convex from Flutter (Dart) integration (week 5)
 
 Convex is TypeScript-first; Dart support is less mature. Options:
@@ -233,6 +264,9 @@ Items to resolve before week 1 day 1 begins:
 | Daemon distribution + auto-update (B.8) | Under-specified | Weeks 13-14 | tally-cli install + upgrade UX |
 | Daemon trust model (B.9) | Under-specified | Week 14 | Local execution safety |
 | Chat search architecture (B.10) | Under-specified | v1.5+ | Search UX |
+| Phala CVM cold-start time (B.14) | Under-specified | Week 1 spike | Worker dispatch UX |
+| CVM-to-CVM internal networking (B.15) | Under-specified | Week 2 | Inter-agent latency |
+| Per-task vs pooled worker CVM lifecycle (B.16) | Under-specified | Week 2 | Architecture model |
 | Convex/Clerk JWT verification (C.1) | Missing | Week 3 | Auth implementation |
 | Failure contingencies (C.2) | Missing | Phase 2 | v1.0 readiness |
 | Skytale semi-public API (C.3) | Missing | Week 2 | Version pinning policy |
@@ -246,4 +280,4 @@ Items to resolve before week 1 day 1 begins:
 
 ## Provenance
 
-Drafted 2026-05-15 (Claude Code synthesis pass over the 5 source artifacts). Revised 2026-05-16 after two rounds of source-level research across the Skytale repo, Tally repo, and OpenHands SDK docs (via context7). Updated 2026-05-16 to add B.8-B.10 (daemon distribution, trust model, chat search) after the multi-runtime + human-collaboration architecture was locked. Re-read whenever source artifacts are revised.
+Drafted 2026-05-15 (Claude Code synthesis pass over the 5 source artifacts). Revised 2026-05-16 after two rounds of source-level research across the Skytale repo, Tally repo, and OpenHands SDK docs (via context7). Updated 2026-05-16 to add B.8-B.10 (daemon distribution, trust model, chat search) after the multi-runtime + human-collaboration architecture was locked. Updated 2026-05-16 to add B.14-B.16 (Phala CVM cold-start, CVM-to-CVM networking, worker CVM lifecycle) after Phala Cloud was locked as the unified TEE provider. Re-read whenever source artifacts are revised.
