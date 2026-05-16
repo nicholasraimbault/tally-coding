@@ -11,7 +11,6 @@ import base64
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 from openhands.sdk import LLM, Agent, Conversation, Tool
