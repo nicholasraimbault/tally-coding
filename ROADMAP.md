@@ -237,6 +237,8 @@ Patterns from Phase 1B Tally work that apply here. Surface to user before procee
 
 Phase 2 / v1.5 candidates:
 
+- **Skytale relay → Cloudflare Durable Objects** — true serverless rewrite of the Skytale relay. Each MLS group becomes a Durable Object; Iroh QUIC transport replaced with Cloudflare-native WebSocket/HTTP; relay state lives in DO storage. Estimated 6-10 weeks of work. Unlocks: fully serverless infrastructure (no long-running servers operated by Pronoic); same Cloudflare ecosystem as Tally Workers; global auto-scaling. Cost trade-off: re-implementing the traffic-analysis-resistance stack (Padme padding, cover traffic, BSL-licensed differentiator) on Cloudflare's edge primitives. **Decision locked 2026-05-16: keep Skytale relay + API as-is through Tally Coding v1.0 launch; begin Path B (Durable Objects rewrite) post-launch.**
+- **Skytale API → Cloud Run or Cloudflare Workers** — alongside the relay rewrite. Containerize Axum on Cloud Run + Neon Postgres (1-week migration), or rewrite for `worker-rs` + Hyperdrive Postgres (~3-4 weeks). Lower priority than relay rewrite; do whichever fits the broader ops simplification.
 - **Chat polish** — reactions, message editing/deletion, read receipts, file sharing, link previews, full-text search (client-side index)
 - **Mobile push notifications** — PWA push first; native iOS / Android apps later
 - **Local sandboxing** — `tally-cli serve` daemon runs OpenHands inside a local Docker container (Modal Sandbox equivalent for local)
