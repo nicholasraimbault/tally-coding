@@ -79,9 +79,9 @@ platform/
 
 Tally Coding depends on two infrastructure components:
 
-- **Tally Workers** — lives in the parent directory of this repo (`../`). Cloudflare-hosted runtime for Stoa's `WakeRouter` trait. Provides synchronous request-response dispatch between agent identities via HTTP API. Same product family (`Tally`); both BSL 1.1.
+- **[Tally Workers](https://github.com/nicholasraimbault/tally-workers)** — sibling repo. Cloudflare-hosted runtime for Stoa's `WakeRouter` trait. Provides synchronous request-response dispatch between agent identities via HTTP API. Same product family (`Tally`); both BSL 1.1.
 
-- **Skytale** at `~/Projects/pronoic/skytale/` (sibling repo) — Apache 2.0 open-source E2E encryption for AI agents (MLS RFC 9420). Provides Python SDK (`pip install skytale-sdk`), Rust SDK, TypeScript SDK, QUIC/gRPC relay at `relay.skytale.sh`, REST API at `api.skytale.sh`, CLI (`cargo install skytale-cli`). Includes a ready-made `OrchestrationAgent` integration for multi-agent coding workflows. Stoa (the protocol-interface crate that Tally Workers implements) also lives in the Skytale repo.
+- **[Skytale](https://github.com/nicholasraimbault/skytale)** — open-source (Apache 2.0). E2E encryption for AI agents (MLS RFC 9420). Provides Python SDK (`pip install skytale-sdk`), Rust SDK, TypeScript SDK, QUIC/gRPC relay at `relay.skytale.sh`, REST API at `api.skytale.sh`, CLI (`cargo install skytale-cli`). Includes a ready-made `OrchestrationAgent` integration for multi-agent coding workflows. Stoa (the protocol-interface crate that Tally Workers implements) also lives in the Skytale repo.
 
 **Stack relationship:**
 - Skytale provides open primitives (Apache 2.0); Tally provides commercial value-add (BSL 1.1).
