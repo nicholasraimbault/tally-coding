@@ -10,4 +10,9 @@ RUN uv sync --frozen --no-dev
 COPY orchestrator_spike.py /app/
 COPY tally_coding_core /app/tally_coding_core
 
+# Create non-root user (TEE security hygiene)
+RUN useradd -m -u 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["uv", "run", "python", "orchestrator_spike.py"]

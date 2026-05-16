@@ -22,4 +22,9 @@ RUN mkdir -p /workspace
 
 ENV WORKSPACE_DIR=/workspace
 
+# Create non-root user (TEE security hygiene)
+RUN useradd -m -u 1000 appuser \
+    && chown -R appuser:appuser /app /workspace
+USER appuser
+
 CMD ["uv", "run", "python", "worker_spike.py"]
