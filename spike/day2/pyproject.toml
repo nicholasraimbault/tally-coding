@@ -5,7 +5,6 @@ description = "Day 2 spike: containerized OpenHands + Phala Redpill for Phala CV
 requires-python = ">=3.12"
 dependencies = [
     "openhands-ai",
-    "python-dotenv>=1.0.0",
 ]
 
 [tool.uv]

@@ -43,9 +43,22 @@ def main() -> int:
     conversation = Conversation(agent=agent, workspace=str(workspace))
 
     task = """\
-Create greet.py that prints "hello, $NAME" (or "hello, world" if NAME unset),
-plus test_greet.py with pytest tests for both cases, install pytest, run it,
-and report pass/fail.
+You're in an empty Python workspace. Complete this task:
+
+1. Create `greet.py`. It should:
+   - Read the environment variable `NAME`
+   - Print `hello, <NAME>` (substituting the actual value) followed by a newline
+   - If `NAME` is not set or is empty, print `hello, world`
+
+2. Create `test_greet.py` using pytest. It should:
+   - Test that running `greet.py` with `NAME=alice` produces the output `hello, alice\\n`
+   - Test that running `greet.py` with no `NAME` env var produces `hello, world\\n`
+
+3. Install pytest if not available (use pip).
+
+4. Run pytest. If tests pass, you're done. If they fail, debug and fix.
+
+Report success or failure clearly when done.
 """
     conversation.send_message(task)
     conversation.run()
