@@ -1,0 +1,11 @@
+services:
+  spike-day2:
+    build: .
+    environment:
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+      - REDPILL_BASE_URL=${REDPILL_BASE_URL:-https://api.redpill.ai/v1}
+      - REDPILL_MODEL=${REDPILL_MODEL:-moonshotai/Kimi-K2-6}
+    volumes:
+      - workspace:/workspace
+volumes:
+  workspace:
