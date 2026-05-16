@@ -1,0 +1,18 @@
+[project]
+name = "tally-coding-core"
+version = "0.0.1"
+description = "Tally Coding core Python package: identity, Tally Workers client, Skytale wrappers"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27.0",
+    "skytale-sdk",
+    "openhands-ai",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
