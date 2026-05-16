@@ -8,7 +8,7 @@
 Tally is **a privacy-first AI coding team platform**. Your AI coding team lives in the cloud and keeps working while your devices are off. You access them through native apps on every device — macOS, Linux, Windows, iOS, Android. End-to-end encrypted across all messaging: AI ↔ AI, AI ↔ human, human ↔ human. Even Tally's operator cannot read your team's conversations.
 
 A "team" is a roster of mixed members:
-- **AI agents in the cloud** — board (architect, reviewer, communicator, orchestrator) + workers (executor, tester, documenter) running in Modal. The canonical home for coding work.
+- **AI agents in the cloud** — board (architect, reviewer, communicator, orchestrator) + workers (executor, tester, documenter) running in Phala Cloud. The canonical home for coding work.
 - **AI agents on your local desktop** (opt-in) — when enabled in the desktop app's settings, your Mac / Linux / Windows machine becomes an agent in your team, executing tasks against your local filesystem. For work on uncommitted code or in your specific dev environment.
 - **Human teammates** — real people you invite to your team, participating in the same encrypted channels as the AI agents.
 
@@ -20,7 +20,7 @@ Agents are persistent with long-term roles. Multi-device sync via native apps. M
 
 It is not an IDE. Users use their existing tools (VS Code, Cursor, GitHub, terminal) to read code. Tally is the **coordination + collaboration layer above code-writing** — where coding work gets directed, deliberated, dispatched, observed, reviewed, and discussed.
 
-**Why OpenHands SDK** is the runtime: it ships production-grade code-writing tools (FileEditorTool, TerminalTool, TaskTrackerTool, BrowserTool) and a persistent Conversation primitive with built-in event streaming. OpenHands runs as Python in cloud agents (Modal functions) and inside the desktop app's optional local execution mode (Python subprocess managed by the Flutter app). The platform inherits these primitives and layers multi-agent coordination + human collaboration (via Skytale + Tally Workers) on top.
+**Why OpenHands SDK** is the runtime: it ships production-grade code-writing tools (FileEditorTool, TerminalTool, TaskTrackerTool, BrowserTool) and a persistent Conversation primitive with built-in event streaming. OpenHands runs as Python in cloud agents (Phala CVMs) and inside the desktop app's optional local execution mode (Python subprocess managed by the Flutter app). The platform inherits these primitives and layers multi-agent coordination + human collaboration (via Skytale + Tally Workers) on top.
 
 **Why Flutter** is the client framework: one codebase targets iOS, Android, macOS, Linux, Windows. Single team builds and maintains all five clients. Native push notifications work everywhere (no PWA-install friction on iOS). Marketing site stays Next.js or static at `tally.codes`. Since Skytale is operator-owned, the platform builds Dart bindings as part of v0.1 — adding to Skytale's SDK lineup (Python, Rust, TypeScript, now Dart).
 
@@ -28,7 +28,7 @@ It is not an IDE. Users use their existing tools (VS Code, Cursor, GitHub, termi
 
 Privacy-first encrypted team chat with AI coding teammates. Two cryptographic guarantees:
 
-1. **LLM inference is TEE-attested** — Maple AI via Maple Proxy. LLM provider cannot see prompts or code.
+1. **LLM inference is TEE-attested** — Phala Redpill (Phala Cloud Confidential AI). LLM provider cannot see prompts or code.
 2. **All team messaging (AI ↔ AI, AI ↔ human, human ↔ human) is E2E encrypted** — Skytale MLS RFC 9420. Even the platform operator cannot read messages, decisions, or DMs.
 
 Privacy as infrastructure, not policy.
@@ -70,8 +70,8 @@ Three problems addressed together:
 2. Board deliberates internally — architect proposes implementation approach; reviewer flags risks; orchestrator decomposes into worker tasks. Humans on the team can chime in here too (they're channel members like the AI agents).
 3. Communicator surfaces consensus to user — translates board deliberation into an actionable plan with files-to-touch, tests-to-add, PR-shape
 4. User confirms — explicit "go" action (or rejects with feedback)
-5. Orchestrator dispatches workers via Tally wakes. Per task: target cloud (Modal Sandbox) OR target local PC (user's `tally-cli` daemon)
-6. Workers execute — either in Modal Sandbox containers or on the user's local machine via the daemon. Both use OpenHands tools (`FileEditorTool`, `TerminalTool`, `TaskTrackerTool`); the only difference is whose filesystem they touch
+5. Orchestrator dispatches workers via Tally wakes. Per task: target cloud (Phala CVM) OR target local PC (user's `tally-cli` daemon)
+6. Workers execute — either in Phala CVM containers or on the user's local machine via the daemon. Both use OpenHands tools (`FileEditorTool`, `TerminalTool`, `TaskTrackerTool`); the only difference is whose filesystem they touch
 7. Workers report status via Skytale-channel `StatusData` messages (files_modified, tests_passing, branch); blockers via `BlockData`
 8. Orchestrator escalates to board when needed (e.g., test discovers a flaw in the original plan)
 9. Board escalates to user for final calls (e.g., breaking-change decisions)
@@ -87,12 +87,12 @@ User (and any human teammate) can intervene in any conversation at any layer.
 - **Marketing site (Next.js or static)** — `tally.codes` landing, pricing, docs, signup-to-download. Separate from the app codebase.
 
 **Cloud (the canonical home for agents and state):**
-- **Agent runtime:** OpenHands SDK (MIT, Python; `pip install openhands-ai`). Runs as Python in Modal cloud functions for cloud agents; runs as embedded Python subprocess in the Flutter desktop app for opt-in local execution.
-- **LLM inference:** Maple Proxy → Maple AI Trusted Execution Environments
+- **Agent runtime:** OpenHands SDK (MIT, Python; `pip install openhands-ai`). Runs as Python in Phala CVMs for cloud agents; runs as embedded Python subprocess in the Flutter desktop app for opt-in local execution.
+- **LLM inference:** Phala Redpill → Phala GPU TEE Trusted Execution Environments
 - **Encrypted channels (AI ↔ AI, AI ↔ human, human ↔ human):** Skytale SDK ─► Skytale relay at `relay.skytale.sh` (MLS RFC 9420; QUIC/gRPC)
 - **Platform's Skytale account/team management:** Skytale REST API at `api.skytale.sh` (one operator-owned Skytale account; customers never sign up for Skytale)
 - **Transient wake-routing dispatch:** Tally Workers (Cloudflare Workers HTTP) — implements Stoa's `WakeRouter` trait
-- **Cloud agent hosting:** Modal Sandbox per task
+- **Cloud agent hosting:** Phala CVM per task
 - **State backend:** Convex (operator-owned; the Flutter app subscribes via Dart-wrapped Convex client OR REST + WebSocket; provides cross-device sync of conversation state)
 - **Auth:** Clerk (browser OAuth flow opens during Flutter app signup, returns to app)
 - **Billing:** Stripe (Phase 2)
@@ -110,7 +110,7 @@ Considered and rejected:
 - Marketing site at `tally.codes` (Next.js or static) with signup → download flow
 - Flutter native app on macOS, Linux, Windows, iOS, Android (single codebase)
 - Skytale Dart SDK (built as part of v0.1 by operator)
-- Cloud agent runtime (Modal Sandbox; board + workers) — the default execution path
+- Cloud agent runtime (Phala CVM; board + workers) — the default execution path
 - Optional local execution within the desktop app (toggle in settings; embeds Python OpenHands subprocess)
 - Humans as first-class team members (Flutter-side AgentIdentity at signup)
 - Human-to-human chat (DM channels, group channels, @mentions, threading)
@@ -133,7 +133,7 @@ Considered and rejected:
 
 ## Explicitly NOT in v1.0
 
-Multi-tenancy/team accounts; native mobile apps; IDE features; multi-LLM-provider choice (Maple-only); marketplace; voice/video; non-GitHub source control; local model option; public API; self-hosted enterprise deployment. All Phase 2.
+Multi-tenancy/team accounts; native mobile apps; IDE features; multi-LLM-provider choice (Phala-only); marketplace; voice/video; non-GitHub source control; local model option; public API; self-hosted enterprise deployment. All Phase 2.
 
 ## Open product questions
 
@@ -142,7 +142,7 @@ Multi-tenancy/team accounts; native mobile apps; IDE features; multi-LLM-provide
 3. What does the communicator surface (final consensus only, or mid-deliberation)?
 4. What can each layer decide unilaterally (worker, orchestrator, board)?
 5. How does the orchestrator decompose work?
-6. Agent runtime hosting specifics (Modal confirmed; sub-options open).
+6. Agent runtime hosting specifics (Phala Cloud confirmed; sub-options open).
 7. State persistence backend specifics (Convex confirmed; schema details open).
 
 ## Skytale / Tally substrate context

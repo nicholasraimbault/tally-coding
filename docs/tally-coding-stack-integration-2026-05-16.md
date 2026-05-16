@@ -1,7 +1,7 @@
 # Tally Coding — Stack Integration
 
 **Date:** 2026-05-16
-**Purpose:** Concrete integration architecture across OpenHands SDK, Skytale, Tally, and Maple AI. The "how it all fits together" reference for implementation. Grounded in source-of-truth research across the Skytale repo, Tally repo, and OpenHands SDK docs.
+**Purpose:** Concrete integration architecture across OpenHands SDK, Skytale, Tally, and Phala Cloud (Redpill). The "how it all fits together" reference for implementation. Grounded in source-of-truth research across the Skytale repo, Tally repo, and OpenHands SDK docs.
 
 ## Stack layers
 
@@ -19,13 +19,13 @@ Convex (reactive backend)                            ← State + real-time sync
    │  - Reactive subscriptions push events to browser
    │
    ▼
-Modal-hosted Python agents                           ← Agent runtime
+Phala Cloud-hosted Python agents                           ← Agent runtime
    │  - OpenHands SDK (LLM + Tool + Conversation + Workspace)
    │  - Custom tools wrap Skytale + Tally primitives
-   │  - Modal Sandbox containers for worker code execution
+   │  - Phala CVM containers for worker code execution
    │
-   ├─ LLM inference ──► Maple AI (TEE-attested) via Maple Proxy
-   │                     ("https://enclave.trymaple.ai/v1", OpenAI-compatible)
+   ├─ LLM inference ──► Phala Cloud (Redpill) (TEE-attested) via Phala Redpill API
+   │                     ("https://api.redpill.ai/v1", OpenAI-compatible)
    │
    ├─ Inter-agent channels ──► Skytale relay (MLS-encrypted)
    │                            relay.skytale.sh:5000 (QUIC/gRPC)
@@ -41,7 +41,7 @@ Modal-hosted Python agents                           ← Agent runtime
 ```
 
 Two cryptographic privacy guarantees compose the platform's privacy story:
-1. **LLM inference is TEE-attested** — Maple AI's Trusted Execution Environments; LLM provider sees only attested calls.
+1. **LLM inference is TEE-attested** — Phala Cloud (Redpill)'s Trusted Execution Environments; LLM provider sees only attested calls.
 2. **Inter-agent messaging is E2E encrypted** — Skytale's MLS RFC 9420 channels; the Skytale relay sees only ciphertext.
 
 ## Resource model
@@ -53,9 +53,9 @@ The platform operates one shared Skytale account (operator-owned) and partitions
 | Resource | Where stored |
 |---|---|
 | Platform Skytale account | Skytale (via `api.skytale.sh`) |
-| Platform Skytale API key (`sk_live_...`) | Modal secret + Convex secret (encrypted) |
+| Platform Skytale API key (`sk_live_...`) | Phala Cloud secret + Convex secret (encrypted) |
 | Platform GitHub App (for repo OAuth) | GitHub App config + secrets |
-| Platform Maple AI subscription | Maple AI plan (operator pays wholesale) |
+| Platform Phala Cloud (Redpill) subscription | Phala Cloud (Redpill) plan (operator pays wholesale) |
 
 **Per-platform-user (provisioned at signup):**
 
@@ -68,7 +68,7 @@ The platform operates one shared Skytale account (operator-owned) and partitions
 | Tally Workers handler registrations | N per user (one per agent context) | Tally DO storage |
 | Skytale channel(s) | 1+ per user (v0.1: one shared deliberation channel) | Skytale relay (platform's account) |
 | GitHub OAuth token (per-user, repo scope) | 1 per platform user | Convex secret (encrypted) |
-| Modal workspace volumes | Per active conversation | Modal volume mounts |
+| Phala CVM persistent storage | Per active conversation | Phala CVM persistent storage mounts |
 
 ## Provisioning flow on signup
 
@@ -78,7 +78,7 @@ User clicks "Sign up with GitHub" (Clerk)
     ▼
 Convex action: bootstrap_user_team(clerk_user_id)
     │  (Uses the platform's existing Skytale API key + GitHub App —
-    │   already configured in Modal/Convex secrets — to provision
+    │   already configured in Phala Cloud/Convex secrets — to provision
     │   per-user resources within the platform's account)
     │
     ├─► Create Convex `users` record
@@ -410,15 +410,24 @@ Each Action, Observation, and LLM message flows through `convex_event_callback`.
 
 ## Conversation persistence pattern
 
-OpenHands SDK has built-in persistence; the platform points `persistence_dir` at a Modal volume.
+OpenHands SDK has built-in persistence; the platform points `persistence_dir` at a path inside the Phala CVM that maps to persistent storage.
+
+```yaml
+# Phala CVM docker-compose.yml (illustrative; verify CLI/API in week 1)
+services:
+  tally-agent:
+    image: tally-coding/agent:latest
+    volumes:
+      - conversations:/data/conversations
+    environment:
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+volumes:
+  conversations:
+    driver: local
+```
 
 ```python
-# In a Modal function:
-import modal
-
-volume = modal.Volume.from_name("pronoic-conversations", create_if_missing=True)
-
-@app.function(volumes={"/data/conversations": volume})
+# Inside the CVM container — agent code
 def run_agent(user_id: str, conversation_id: str, message: str):
     persistence_dir = f"/data/conversations/{user_id}/{conversation_id}"
 
@@ -431,7 +440,6 @@ def run_agent(user_id: str, conversation_id: str, message: str):
     )
     conversation.send_message(message)
     conversation.run()
-    volume.commit()  # Persist to durable storage
 
 # Later: resume after process restart
 @app.function(volumes={"/data/conversations": volume})
@@ -470,8 +478,8 @@ The v0.1 → v1.0 transition is incremental: SkytaleTeam wraps SkytaleChannelMan
 ## Open implementation decisions
 
 **Workspace mode** (decide week 1 day 2 spike):
-- (a) Modal Sandbox direct — agents run as Modal functions, `workspace=os.getcwd()` inside Modal container. Simpler infra. Loses OpenHands' built-in WebSocket event endpoint (but callback pipeline + Convex covers it).
-- (b) OpenHands Agent Server on Modal — wrap Agent Server in Modal function; orchestrator uses `RemoteWorkspace(remote_url=modal_endpoint, api_key=...)`. Gets WebSocket event streaming free. More OpenHands-native; more infra layers.
+- (a) Phala CVM direct — agents run as Phala CVMs, `workspace=os.getcwd()` inside Phala CVM. Simpler infra. Loses OpenHands' built-in WebSocket event endpoint (but callback pipeline + Convex covers it).
+- (b) OpenHands Agent Server on Phala Cloud — wrap Agent Server in Phala CVM; orchestrator uses `RemoteWorkspace(remote_url=cvm_endpoint, api_key=...)`. Gets WebSocket event streaming free. More OpenHands-native; more infra layers.
 
 **Recommendation:** start with (a) for v0.1. Migrate to (b) for v1.0 if event streaming becomes load-bearing for cross-agent observation.
 

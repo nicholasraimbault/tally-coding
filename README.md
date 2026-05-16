@@ -1,6 +1,6 @@
 # Tally Coding
 
-> **Your AI coding team lives in the cloud. Native apps everywhere.** End-to-end encrypted team chat with AI coding teammates. Your team is a roster of mixed members — AI agents in the cloud (always working, even when your laptop is off), AI agents on your local desktop (opt-in local execution within the desktop app), and human teammates. Access them from native apps on macOS, Linux, Windows, iOS, Android. Coordinate through encrypted channels (board deliberation, orchestrator dispatch, worker reports), execute coding work (clone repos, edit code, run tests, open PRs), and chat with each other (humans + AI in the same conversation). Differentiator: cryptographically-attested privacy — TEE-attested LLM inference (Maple AI) + E2E-encrypted messaging for AI ↔ AI, AI ↔ human, and human ↔ human (Skytale MLS). Even the platform operator cannot read messages.
+> **Your AI coding team lives in the cloud. Native apps everywhere.** End-to-end encrypted team chat with AI coding teammates. Your team is a roster of mixed members — AI agents in the cloud (always working, even when your laptop is off), AI agents on your local desktop (opt-in local execution within the desktop app), and human teammates. Access them from native apps on macOS, Linux, Windows, iOS, Android. Coordinate through encrypted channels (board deliberation, orchestrator dispatch, worker reports), execute coding work (clone repos, edit code, run tests, open PRs), and chat with each other (humans + AI in the same conversation). Differentiator: cryptographically-attested privacy — TEE-attested LLM inference (Phala Cloud (Redpill)) + E2E-encrypted messaging for AI ↔ AI, AI ↔ human, and human ↔ human (Skytale MLS). Even the platform operator cannot read messages.
 
 ## Stack
 
@@ -10,16 +10,16 @@
 - **Marketing site (Next.js or static)** — `tally.codes`; signup-to-download flow
 
 **Cloud (always-on; agents continue when devices are off):**
-- **OpenHands SDK** — agent runtime (Python; MIT; `pip install openhands-ai`). Runs in Modal cloud functions; also embeddable in the desktop app for opt-in local execution.
-- **Maple AI via Maple Proxy** — TEE-attested LLM inference (OpenAI-compatible API)
+- **OpenHands SDK** — agent runtime (Python; MIT; `pip install openhands-ai`). Runs in Phala CVMs; also embeddable in the desktop app for opt-in local execution.
+- **Phala Redpill (Phala Cloud Confidential AI)** — TEE-attested LLM inference (OpenAI-compatible API)
 - **Skytale SDK + relay** — E2E encrypted MLS channels for ALL messaging (AI ↔ AI, AI ↔ human, human ↔ human). Relay at `relay.skytale.sh`; zero-knowledge.
 - **Tally Workers** — Cloudflare-hosted Stoa `WakeRouter` for orchestrator-to-worker dispatch
-- **Modal** — serverless Python host + sandbox for cloud agent execution
+- **Phala Cloud CVM** — serverless Python host + sandbox for cloud agent execution
 - **Convex** — reactive backend (state, multi-device sync)
 - **Clerk** — auth with GitHub OAuth (browser flow during signup; Flutter resumes after)
 - **Stripe** — billing (Phase 2)
 
-Privacy is structural — two cryptographic guarantees: LLM inference is TEE-attested (Maple); all messaging is E2E MLS-encrypted (Skytale). The Skytale relay sees only ciphertext; the LLM provider sees only TEE-attested calls.
+Privacy is structural — two cryptographic guarantees: LLM inference is TEE-attested (Phala); all messaging is E2E MLS-encrypted (Skytale). The Skytale relay sees only ciphertext; the LLM provider sees only TEE-attested calls.
 
 Skytale and Tally Workers are **peer infrastructure** owned by the same operator, consumed as platform-internal subsystems. See [`docs/tally-coding-stack-integration-2026-05-16.md`](docs/tally-coding-stack-integration-2026-05-16.md) and [`docs/tally-coding-human-collaboration-2026-05-16.md`](docs/tally-coding-human-collaboration-2026-05-16.md).
 
@@ -30,7 +30,7 @@ A coordination platform for **people who direct AI agents to write, review, test
 Coding is the primary use case. Every layer is shaped around it:
 - **OpenHands SDK** provides production-grade code-writing tools out of the box: `FileEditorTool`, `TerminalTool`, `TaskTrackerTool`, `BrowserTool`. Workers don't need custom tools for basic coding — those exist.
 - **Skytale's OrchestrationAgent** has message types built for coding workflows: `StatusData` (files_modified, tests_passing, tests_failing, branch), `PrUpdateData` (PR number, status, CI, additions, deletions), `BlockData` / `UnblockData` for dependency blockers.
-- **Worker sandboxing** = Modal Sandbox containers with Git, build tools, Node.js, Python. Containers are destroyed after each task.
+- **Worker sandboxing** = Phala CVM containers with Git, build tools, Node.js, Python. Containers are destroyed after each task.
 - **GitHub OAuth** is the auth bridge; the platform reads/writes user repos with explicit permission.
 
 Key product properties:
@@ -67,7 +67,7 @@ platform/
 **If you're starting work:**
 1. [`ROADMAP.md`](ROADMAP.md) — stack summary, critical path, decision-point timeline
 2. [`docs/tally-coding-week-1-scope-2026-05-15.md`](docs/tally-coding-week-1-scope-2026-05-15.md) — day-by-day for week 1
-3. [`docs/gaps-and-open-questions.md`](docs/gaps-and-open-questions.md) — pre-week-1 cleanup checklist (account pre-staging, SDK version pin, Modal runtime verification, Maple topology decision, Skytale version-pin policy)
+3. [`docs/gaps-and-open-questions.md`](docs/gaps-and-open-questions.md) — pre-week-1 cleanup checklist (account pre-staging, SDK version pin, Phala CVM runtime verification, Phala Redpill topology decision, Skytale version-pin policy)
 
 **If you're a future collaborator or AI assistant on this codebase:**
 1. Start with this README

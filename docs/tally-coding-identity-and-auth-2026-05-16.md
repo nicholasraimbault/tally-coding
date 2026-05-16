@@ -12,7 +12,7 @@ The platform composes three identity layers:
 | Layer | What it identifies | Provided by | Stored where |
 |---|---|---|---|
 | **Platform user** | The human signing into Tally | Clerk (GitHub OAuth) | Clerk + Convex `users.clerk_user_id` |
-| **Platform Skytale account** | The operator's Skytale account (one for the whole platform) | Skytale API key (`sk_live_...`) | Modal secret + Convex secret (encrypted) — platform-wide, not per-user |
+| **Platform Skytale account** | The operator's Skytale account (one for the whole platform) | Skytale API key (`sk_live_...`) | Phala Cloud secret + Convex secret (encrypted) — platform-wide, not per-user |
 | **Agent identity** | A specific agent within a user's cloud team | Ed25519 keypair + `did:key:z6Mk...` | Convex secrets (encrypted private key); public key + DID in `agents` table |
 
 The platform Skytale account is shared infrastructure. Per-user partitioning happens via:
@@ -79,7 +79,7 @@ A single keypair backs both auth layers.
    ▼
 4. Convex action: bootstrap_user_team(clerk_user_id)
    │   (Uses the platform's existing Skytale account — already configured
-   │    in Modal env / Convex secrets — to provision per-user resources)
+   │    in Phala Cloud env / Convex secrets — to provision per-user resources)
    │
    ├─► 4a. Create Convex `users` record:
    │       { clerk_user_id, email, created_at, status="provisioning" }
@@ -136,12 +136,12 @@ Context IDs are namespace-prefixed strings; meaningful only to the platform's di
 |---|---|---|
 | Clerk session token | Browser cookie (httponly) | Clerk SDK |
 | GitHub OAuth token (for repo access) | Convex secret (encrypted at rest) | Server-side only |
-| Skytale API key (`sk_live_...`) | Modal secret + Convex secret | Modal: env var injection; Convex: server-side only |
-| Agent Ed25519 private keys | Convex secrets (encrypted; per-agent) | Modal: pulled at agent spawn; never logged |
+| Skytale API key (`sk_live_...`) | Phala Cloud secret + Convex secret | Phala CVM: env var injection; Convex: server-side only |
+| Agent Ed25519 private keys | Convex secrets (encrypted; per-agent) | Phala CVM: pulled at agent spawn; never logged |
 | Convex deploy key | Vercel env var | Build time |
-| Modal token | Vercel env var (server only) | Server actions |
+| Phala Cloud API token | Vercel env var (server only) | Server actions |
 
-**Discipline:** Skytale API key and agent private keys are NEVER exposed to the browser. The browser interacts only with Convex; Convex relays to Modal; Modal pulls secrets at function-spawn time.
+**Discipline:** Skytale API key and agent private keys are NEVER exposed to the browser. The browser interacts only with Convex; Convex relays to Phala Cloud; Phala CVM pulls secrets at function-spawn time.
 
 ## Auth flow on agent dispatch (orchestrator → worker)
 
@@ -177,7 +177,7 @@ Context IDs are namespace-prefixed strings; meaningful only to the platform's di
    │
    ▼
 6. Worker receives the wake; decrypts payload using its private key
-   (which was loaded from Convex/Modal secret at spawn time)
+   (which was loaded from Convex/Phala Cloud secret at spawn time)
    │
    ▼
 7. Worker executes task; constructs encrypted response
@@ -211,7 +211,7 @@ Convex doesn't ship a built-in encrypted-secrets primitive — the platform must
 # Platform-side encryption wrapper
 from cryptography.fernet import Fernet
 
-# Master key in Modal secret + Vercel env var
+# Master key in Phala Cloud secret + Vercel env var
 master_key = os.environ["PRONOIC_MASTER_KEY"]
 fernet = Fernet(master_key)
 
@@ -230,10 +230,10 @@ Master key rotation: out of scope for v0.1; document as v1.0 design task.
 
 For the v0.1 internal demo (single user = Nick):
 
-- Convex secrets: just Modal env vars (no encryption wrapper)
+- Convex secrets: just Phala Cloud secrets (no encryption wrapper)
 - Agent private keys: stored in Convex as plaintext for now (acceptable for a single-user demo)
 - Tally team_id: hardcoded for the demo user
-- All bootstrapping done manually via a one-off Modal script, not Convex action
+- All bootstrapping done manually via a one-off Phala Cloud script, not Convex action
 
 The platform's Skytale account is used as-is (no per-user partitioning ceremony yet; channel names just include the user_id prefix as the de-facto namespace).
 
@@ -242,7 +242,7 @@ Production-grade auth bridging (encryption at rest, key rotation, master key in 
 ## v1.0 hardening
 
 - Encrypted-at-rest agent private keys in Convex (Fernet or libsodium-via-PyNaCl)
-- Master key in dedicated KMS (AWS KMS, GCP KMS, or HashiCorp Vault) — not Modal env var
+- Master key in dedicated KMS (AWS KMS, GCP KMS, or HashiCorp Vault) — not Phala Cloud secret
 - Agent key rotation flow (UI + Convex action)
 - Audit log of provisioning events (using Skytale's `AuditLog` primitive)
 - Compliance export: per-user identity records for GDPR data subject access
@@ -250,7 +250,7 @@ Production-grade auth bridging (encryption at rest, key rotation, master key in 
 
 ## Open decisions
 
-1. **Master key custodianship**: Modal env var (v0.1) vs dedicated KMS (v1.0) — when to migrate?
+1. **Master key custodianship**: Phala Cloud secret (v0.1) vs dedicated KMS (v1.0) — when to migrate?
 2. **Tally Workers `team_id` derivation**: deterministic from `user_id` (UUID-namespace), or randomly generated and stored?
 3. **Agent key rotation UX**: surfaced in UI? Automatic on suspicion? Time-based rotation?
 4. **Did-web option for enterprise users**: Skytale supports `did:web:domain`; should the platform offer this as an opt-in identity mode for enterprise customers?

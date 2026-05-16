@@ -25,11 +25,11 @@ User devices (Flutter native apps; one Dart codebase, 5 targets)
 │                                                                   │
 │  Convex ────────► state, multi-device sync, agent metadata        │
 │   │                                                               │
-│   │ Convex actions dispatch wakes / spawn Modal functions         │
+│   │ Convex actions dispatch wakes / spawn Phala CVMs         │
 │   ▼                                                               │
-│  Modal (Python OpenHands SDK; cloud agents)                       │
+│  Phala Cloud CVM (Python OpenHands SDK; cloud agents)                       │
 │   │   │                                                           │
-│   │   └── LLM inference ──► Maple AI (TEE) via Maple Proxy        │
+│   │   └── LLM inference ──► Phala Cloud (Redpill) (TEE) via Phala Redpill API        │
 │   │                                                               │
 │   ├── Encrypted channels ──► Skytale relay (relay.skytale.sh;     │
 │   │                          QUIC/gRPC; MLS RFC 9420; zero-       │
@@ -42,25 +42,25 @@ User devices (Flutter native apps; one Dart codebase, 5 targets)
 │                          WakeRouter; 8 routes; ULID wake IDs)     │
 └───────────────────────────────────────────────────────────────────┘
 
-Workers execute in Modal Sandbox containers (cloud) or in the desktop
+Workers execute in Phala CVM containers (cloud) or in the desktop
 Flutter app's embedded Python subprocess (opt-in local execution).
 ```
 
 Data flow:
 1. User opens Flutter app on any device (signed in via Clerk OAuth on first install)
 2. App subscribes to Convex `users.{me}` for state + agent roster + conversation events
-3. User dispatches a task from the app — Flutter calls Convex action → Convex calls Tally Workers to dispatch a wake to the orchestrator's cloud Modal function
-4. Cloud orchestrator (Modal function): receives wake, deliberates with board via Skytale-encrypted channels, dispatches workers via Tally Workers
-5. Cloud workers (Modal Sandbox containers): clone GitHub repo, edit code via OpenHands `FileEditorTool`/`TerminalTool`, run tests, commit, push, open PR via `gh pr create`
+3. User dispatches a task from the app — Flutter calls Convex action → Convex calls Tally Workers to dispatch a wake to the orchestrator's cloud Phala CVM
+4. Cloud orchestrator (Phala CVM): receives wake, deliberates with board via Skytale-encrypted channels, dispatches workers via Tally Workers
+5. Cloud workers (Phala CVM containers): clone GitHub repo, edit code via OpenHands `FileEditorTool`/`TerminalTool`, run tests, commit, push, open PR via `gh pr create`
 6. All agent activity flows through Skytale channels (E2E encrypted); also persisted as encrypted-metadata events in Convex (message content stays encrypted)
 7. Native app on any device subscribes to Convex + Skytale; renders the unified team view; user can close one device and continue from another
-8. Optional: if user enables "local execution" in the desktop app, the app embeds a Python OpenHands subprocess that registers as a worker agent. Same dispatch flow; just targets the local machine instead of Modal.
+8. Optional: if user enables "local execution" in the desktop app, the app embeds a Python OpenHands subprocess that registers as a worker agent. Same dispatch flow; just targets the local machine instead of Phala Cloud CVM.
 
 See [`tally-coding-stack-integration-2026-05-16.md`](tally-coding-stack-integration-2026-05-16.md) for concrete integration shapes, [`tally-coding-human-collaboration-2026-05-16.md`](tally-coding-human-collaboration-2026-05-16.md) for multi-runtime + human-collaboration details, and [`tally-coding-identity-and-auth-2026-05-16.md`](tally-coding-identity-and-auth-2026-05-16.md) for per-user provisioning.
 
 ## Component decisions
 
-### Agent runtime: OpenHands SDK on Modal
+### Agent runtime: OpenHands SDK on Phala Cloud
 
 Package: openhands-ai (PyPI; MIT; Python 3.12+)
 Repo: github.com/OpenHands/software-agent-sdk
@@ -74,19 +74,17 @@ Paper: arXiv 2511.03690 (MLSys 2026)
 
 Plus `Conversation` with built-in event streaming, persistent state via `persistence_dir`, stuck-detection, and remote workspace primitives. The platform inherits these and adds custom tools for inter-agent coordination (Skytale + Tally wrappers).
 
-Hosting on Modal because: Python-native serverless; long-running function support (24h); per-second billing; Docker sandboxing for workers; persistent volumes for conversation state; faster cold-start than Lambda.
+Hosting on Phala Cloud because: Python-native serverless; long-running function support (24h); per-second billing; Docker sandboxing for workers; persistent volumes for conversation state; faster cold-start than Lambda.
 
 Rejected: E2B (less production-mature for full agent processes), Fly Machines (more operational complexity), AWS Lambda (15-min limit incompatible), custom Docker on VPS (too much operational overhead for solo founder), Cloudflare Workers (Python support constrained).
 
-### LLM inference: Maple Proxy → Maple AI
+### LLM inference: Phala Redpill (Phala Cloud Confidential AI)
 
-Maple AI via Maple Proxy (github.com/opensecretcloud/maple-proxy) as OpenAI-compatible inference endpoint.
+Phala's hosted TEE-attested LLM inference endpoint at `api.redpill.ai/v1`. OpenAI-compatible API. Runs on Phala's GPU TEE (NVIDIA H100/H200/B300 with Confidential Computing). Per-token billing — `$0.04/M input, $0.10/M output` for a typical model; up to ~$1+/M for top-end models like Kimi K2.6. Strong coding model catalog including Qwen Coder Next, GLM 5.1, MoonshotAI Kimi K2.6.
 
-Privacy as infrastructure via TEE. Cryptographic attestation; zero data retention. OpenAI-compatible API integrates via LiteLLM (which OpenHands uses). $20/mo Pro plan.
+Privacy as infrastructure via TEE. Cryptographic attestation per request via `/v1/attestation` endpoints. OpenAI-compatible API integrates via LiteLLM (which OpenHands uses).
 
-Configuration deferred to first-week implementation: hosted endpoint vs self-hosted sidecar (trial both).
-
-Trade-off: model quality lower than frontier Claude/GPT for hardest coding tasks; acceptable for v1.0; Phase 2 may add "BYO-LLM" option.
+Trade-off: model quality is open-source models (strong but not frontier Claude/GPT). Acceptable for v1.0 — Kimi K2.6 benchmarks competitively with frontier models on coding. Phase 2 may add "BYO-LLM" option for users who want to bring their own API keys.
 
 ### Inter-agent comms: Skytale channels + Tally wakes (two layers)
 
@@ -143,9 +141,9 @@ Drop-in Next.js integration; GitHub OAuth built in (critical for repo integratio
 
 Rejected: Supabase Auth (pairs with Supabase better), Auth.js (more setup), custom JWT, Stack Auth (newer, less proven).
 
-### Sandboxed execution: OpenHands + Modal Sandbox (coding-specific)
+### Sandboxed execution: OpenHands + Phala CVM (coding-specific)
 
-Workers run in Modal Sandbox containers per coding task. The container image includes: Git, build tools, Node.js, Python, common language toolchains (Rust, Go, Java), gh CLI for PR operations. Workers can:
+Workers run in Phala CVM containers per coding task. The container image includes: Git, build tools, Node.js, Python, common language toolchains (Rust, Go, Java), gh CLI for PR operations. Workers can:
 - Clone the user's GitHub repo (via per-user OAuth scope)
 - Edit code via OpenHands `FileEditorTool`
 - Run tests via `TerminalTool` (`pytest`, `npm test`, `cargo test`, etc.)
@@ -165,8 +163,8 @@ Tally Coding pays for its full stack; Skytale + Tally Workers are operator-owned
 - Marketing site hosting (Vercel or Cloudflare Pages): $0-20/mo (low traffic; static-ish)
 - Convex: $25/mo (fixed; scales with usage)
 - Clerk: free → $25/mo (fixed)
-- Modal: $50-200/mo (variable; per-agent-second + sandbox compute)
-- Maple AI: $20-60/mo per active platform user (variable; one platform Maple subscription, internally attributed per user)
+- Phala Cloud (CVM + Redpill): $50-200/mo (variable; per-agent-second + sandbox compute)
+- Phala Cloud (Redpill): $20-60/mo per active platform user (variable; one platform Phala Redpill subscription, internally attributed per user)
 - Tally Workers: ~$5/mo (Cloudflare Paid; operator-owned infrastructure)
 - Skytale relay: operator-owned (Apache 2.0 self-host); cost = compute hosting + bandwidth, not a per-user subscription
 - Skytale API: operator-owned (Axum + Postgres self-host)
@@ -174,7 +172,7 @@ Tally Coding pays for its full stack; Skytale + Tally Workers are operator-owned
 - App store + code signing: Apple Developer Program ($99/year), Apple notarization, Microsoft Store ($19 once), Google Play Console ($25 once)
 - Misc: ~$10/mo
 
-Fixed (operator overhead, regardless of user count): ~$150-250/mo + ~$200/year (app stores, signing). Variable per active user: ~$50-200/mo (dominated by Maple LLM costs + Modal agent runtime).
+Fixed (operator overhead, regardless of user count): ~$150-250/mo + ~$200/year (app stores, signing). Variable per active user: ~$50-200/mo (dominated by Phala Cloud (Redpill LLM + CVM agent runtime)).
 
 No Vercel hosting cost for the application UI — Flutter apps distribute via app stores + direct download. Saves a small recurring cost vs the web-app architecture.
 
@@ -189,7 +187,7 @@ Each agent has:
 - Role (board:architect, board:reviewer, board:communicator, orchestrator, worker:executor, worker:tester, worker:documenter)
 - System prompt (stored in Convex; editable by user)
 - Long-term memory (event-sourced; stored in Convex)
-- Active workspace (Modal container; ephemeral per task)
+- Active workspace (Phala CVM; ephemeral per task)
 
 ### Escalation classification (v1.0)
 
@@ -208,7 +206,7 @@ OpenHands SDK Action/Observation events. Tally Coding extends: all inter-agent m
 
 ## Decisions deferred to implementation
 
-1. Modal vs Modal+Maple-sidecar topology (trial in week 1)
+1. Phala Cloud CVM topology (single CVM-per-task vs pooled) (trial in week 1)
 2. Convex schema migrations (design as you go)
 3. Specific OpenHands tools per agent role (experimentation)
 4. WebSocket message format (Convex standard pattern initially)
@@ -217,9 +215,9 @@ OpenHands SDK Action/Observation events. Tally Coding extends: all inter-agent m
 
 ## Risk register
 
-1. Modal cold starts (2-10s; acceptable for v1.0)
+1. Phala CVM cold starts (2-10s; acceptable for v1.0)
 2. Convex pricing scaling (predictable; not load-bearing). Also: Convex from Flutter (Dart) is less first-class than from TypeScript — verify the integration during week 5.
-3. Maple AI dependency (mitigation: OpenAI-compatibility means swap to alternative TEE provider possible)
+3. Phala Cloud (Redpill) dependency (mitigation: OpenAI-compatibility means swap to alternative TEE provider possible)
 4. OpenHands SDK breaking changes (pin to version; upgrade deliberately)
 5. Skytale SDK breaking changes (pin version; OrchestrationAgent is currently in `_orchestration.py` — underscore-prefixed; treat as semi-public API and pin specific Skytale SDK release)
 6. Cloudflare Workers limits on Tally Workers (current usage well within Paid tier)

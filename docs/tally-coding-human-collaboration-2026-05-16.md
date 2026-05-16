@@ -32,11 +32,11 @@ The platform's web app surfaces these as a unified roster. Engineering distingui
 ```
 Tally Coding "Team" (per user / per project)
 │
-├── Cloud agents (Modal Sandbox)
-│   ├── board:architect    ← Modal function instance
-│   ├── board:reviewer     ← Modal function instance
-│   ├── board:communicator ← Modal function instance
-│   └── board:orchestrator ← Modal function instance
+├── Cloud agents (Phala CVM)
+│   ├── board:architect    ← Phala CVM instance
+│   ├── board:reviewer     ← Phala CVM instance
+│   ├── board:communicator ← Phala CVM instance
+│   └── board:orchestrator ← Phala CVM instance
 │
 ├── Local-daemon agents (tally-cli serve)
 │   ├── worker:nick-macbook  ← daemon polling Tally inbox from Nick's MacBook
@@ -50,9 +50,9 @@ Tally Coding "Team" (per user / per project)
 
 All three layers post events to the same Skytale channels. Convex subscribes; the web app renders them as one unified activity stream.
 
-## Layer 1 — Cloud agents (Modal Sandbox)
+## Layer 1 — Cloud agents (Phala CVM)
 
-Already covered in `tally-coding-stack-integration-2026-05-16.md`. Modal functions running OpenHands SDK; workspace inside the Modal container; spawns Modal Sandbox per task. The default path for v0.1.
+Already covered in `tally-coding-stack-integration-2026-05-16.md`. Phala CVMs running OpenHands SDK; workspace inside the Phala CVM; spawns Phala CVM per task. The default path for v0.1.
 
 ## Layer 2 — Local-daemon agents (tally-cli serve)
 
@@ -98,7 +98,7 @@ while True:
         task_spec = skytale.decrypt(my_private_key, wake.payload_b64)
 
         # Build OpenHands agent with tools pointing at LOCAL filesystem
-        llm = LLM(model=MAPLE_MODEL, base_url=MAPLE_PROXY_URL, api_key=MAPLE_KEY)
+        llm = LLM(model=REDPILL_MODEL, base_url=REDPILL_API_URL, api_key=REDPILL_KEY)
         agent = Agent(llm=llm, tools=build_coding_agent_tools(
             role="worker:local",
             orchestration_agent=orch,
@@ -137,7 +137,7 @@ The daemon runs LLM-driven commands on the user's machine. This is a powerful ag
 1. **First-time tool grants** — on initial daemon install, user explicitly approves which tools the daemon can run (e.g., "allow `bash` execution: yes/no"; "allow Git operations: yes/no")
 2. **Pre-execution prompts** for sensitive operations (configurable). Examples: `rm`-prefixed commands, `sudo` invocations, network-modifying commands (`iptables`, `pf`), package installations
 3. **Audit log of every action** — written to a local file AND emitted as a Skytale channel event for the user to review later
-4. **Sandboxing where possible** — daemon optionally runs the OpenHands Conversation inside a local Docker container (similar to Modal Sandbox but local). This is a v1.5+ polish; v1.0 ships with native execution + user-approved tool grants
+4. **Sandboxing where possible** — daemon optionally runs the OpenHands Conversation inside a local Docker container (similar to Phala CVM but local). This is a v1.5+ polish; v1.0 ships with native execution + user-approved tool grants
 5. **Cryptographic provenance** — every action emitted to the audit log is signed by the daemon's agent identity. Tampering is detectable.
 
 ## Layer 3 — Human team members
@@ -364,7 +364,7 @@ Presence tracking: the daemon emits a heartbeat to a Skytale channel every 30s. 
 
 | Layer | What's encrypted | What server sees | What the user sees |
 |---|---|---|---|
-| Cloud agent (Modal Sandbox) | LLM calls TEE-attested; inter-agent comms E2E | Encrypted bytes flowing; runtime metadata (which agent dispatched what wake) | Full plaintext on their browser |
+| Cloud agent (Phala CVM) | LLM calls TEE-attested; inter-agent comms E2E | Encrypted bytes flowing; runtime metadata (which agent dispatched what wake) | Full plaintext on their browser |
 | Local daemon | LLM calls TEE-attested; agent code runs locally; inter-agent comms E2E | NO local file access; no code visibility; only encrypted wake metadata | Full plaintext on their machine |
 | Human in browser | All channel messages E2E encrypted | Channel membership + message metadata (sender, timestamp, recipient list); NOT message content | Decrypted messages in their browser only |
 | Human-to-human DMs | E2E encrypted between participants | Channel membership; message metadata | Both participants see plaintext |
@@ -374,7 +374,7 @@ Operator (platform team) can prove they cannot read anything by audit: master ke
 ## v1.0 scope vs v1.5 polish
 
 ### v1.0 (commercial launch)
-- Cloud agents (Modal Sandbox) — existing
+- Cloud agents (Phala CVM) — existing
 - `tally-cli serve` daemon for local execution (Option A: poll-based)
 - First-time tool grants + per-execution approval prompts
 - Humans as team members (web app participation; browser-side AgentIdentity)
@@ -394,7 +394,7 @@ Operator (platform team) can prove they cannot read anything by audit: master ke
 - Full-text search (client-side incremental index)
 - Mobile push notifications (iOS / Android apps; or PWA push)
 - OpenHands Agent Server adapter (alternative daemon for power users)
-- Local sandboxing via Docker (daemon-side sandbox like Modal Sandbox)
+- Local sandboxing via Docker (daemon-side sandbox like Phala CVM)
 
 ## Provenance
 

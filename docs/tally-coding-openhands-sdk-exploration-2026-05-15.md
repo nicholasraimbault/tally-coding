@@ -31,12 +31,12 @@ llm = LLM(
 )
 ```
 
-For Maple integration:
+For Phala Redpill integration:
 ```python
 llm = LLM(
-    model="openai/gpt-oss-120b",  # or other Maple model
-    api_key=os.getenv("MAPLE_API_KEY"),
-    base_url="https://enclave.trymaple.ai/v1",
+    model="openai/gpt-oss-120b",  # or other Phala Redpill model
+    api_key=os.getenv("REDPILL_API_KEY"),
+    base_url="https://api.redpill.ai/v1",
 )
 ```
 
@@ -111,7 +111,7 @@ Each agent role has custom tools for messages it can send.
 
 OpenHands Agent Server: Docker-managed workspaces. Documented in examples/02_remote_agent_server/.
 
-Decision: probably simpler to run workers directly on Modal with Modal Sandbox than nest Agent Server inside Modal. Re-evaluate week 6.
+Decision: probably simpler to run workers directly on Phala Cloud with Phala CVM than nest Agent Server inside Phala CVM. Re-evaluate week 6.
 
 ### Event streaming to UI
 
@@ -124,44 +124,67 @@ Convex reactive subscriptions push events to client UI.
 
 ## Integration points
 
-### LiteLLM → Maple Proxy
+### LiteLLM → Phala Redpill API
 
 OpenAI-compatible. Configure base_url:
 ```python
 LLM(
     model="openai/",
     api_key="",
-    base_url="https://enclave.trymaple.ai/v1",
+    base_url="https://api.redpill.ai/v1",
 )
 ```
 
-### Modal hosting
+### Phala Cloud hosting
+
+Phala CVMs use Docker Compose. The agent image bundles OpenHands SDK + Python; the CVM provides TEE-attested execution.
+
+```yaml
+# docker-compose.yml inside the CVM
+services:
+  tally-agent:
+    image: tally-coding/agent:latest
+    environment:
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+      - AGENT_ROLE=${AGENT_ROLE}
+    command: python -m tally_agent.run_agent
+```
 
 ```python
-import modal
+# Inside the CVM container — agent code
+from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.terminal import TerminalTool
 
-app = modal.App("pronoic-agent")
-image = modal.Image.debian_slim().pip_install("openhands-ai")
-
-@app.function(image=image, secrets=[modal.Secret.from_name("maple-keys")])
 def run_agent(task: str, agent_config: dict):
-    llm = LLM(...)
-    agent = Agent(llm=llm, tools=[...])
-    conversation = Conversation(agent=agent, workspace="/tmp/workspace")
+    llm = LLM(
+        model="moonshotai/kimi-k2-6",
+        api_key=os.environ["REDPILL_API_KEY"],
+        base_url="https://api.redpill.ai/v1",
+    )
+    agent = Agent(
+        llm=llm,
+        tools=[Tool(name=TerminalTool.name), Tool(name=FileEditorTool.name)],
+    )
+    conversation = Conversation(agent=agent, workspace="/workspace")
     conversation.send_message(task)
     conversation.run()
     return conversation.events
 ```
 
-### Sandboxing via Modal
+### Sandboxing via Phala Cloud
 
-```python
-@app.function(image=image)
-def run_worker(task: str):
-    with modal.Sandbox.create(image=worker_image) as sandbox:
-        # Worker agent in sandbox; destroyed on exit
-        pass
+Phala CVMs are themselves the sandbox (Intel TDX-attested isolation). For per-task ephemerality, spawn a fresh CVM via the Phala Cloud CLI/API per worker task; tear down on completion.
+
+```bash
+# Spawn worker CVM (illustrative; precise CLI in week 1 spike)
+phala cvm create --name worker-${TASK_ID} \
+  --compose docker-compose.worker.yml \
+  --env REDPILL_API_KEY=${REDPILL_API_KEY} \
+  --env TASK_ID=${TASK_ID}
 ```
+
+Inside the CVM: OpenHands runs with TerminalTool + FileEditorTool in `/workspace` (which is the CVM's filesystem; isolated from host).
 
 ## Open SDK questions
 
@@ -287,7 +310,7 @@ Platform's `board:reviewer` / `board:architect` / etc. role packs can be express
 
 Considered:
 - Goose (Block): less production-mature for SDK use; Apache 2.0
-- Claude Agent SDK: doesn't support Maple/privacy positioning
+- Claude Agent SDK: doesn't support Phala/privacy positioning
 - Cline / Roo Code: VS Code extensions; wrong shape
 - Aider: terminal-based; wrong shape
 - SWE-agent: research-grade

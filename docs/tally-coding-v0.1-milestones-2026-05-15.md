@@ -13,19 +13,19 @@
 
 - Solo founder
 - Realistic dev time: 15-25 hours/week
-- Cloud agents in Modal handle the always-on execution; native app handles UX
+- Cloud agents in Phala Cloud handle the always-on execution; native app handles UX
 - Skytale Dart SDK is built by operator (you) as part of v0.1 since Skytale is operator-owned
 
 ## v0.1 weeks (~12 weeks)
 
-### Week 1: Foundation + OpenHands/Maple spike (cloud-side)
-- Pre-stage all accounts: Maple AI Pro, Modal, Convex, Clerk, Cloudflare, GitHub App, custom domain
+### Week 1: Foundation + OpenHands/Phala spike (cloud-side)
+- Pre-stage all accounts: Phala Cloud (CVM + Redpill), Convex, Clerk, Cloudflare, GitHub App, custom domain
 - Pin OpenHands SDK + Skytale SDK + Flutter SDK versions
-- "Hello agent" spike: OpenHands SDK locally; LLM via Maple Proxy; deploy single agent to Modal
+- "Hello agent" spike: OpenHands SDK locally; LLM via Phala Redpill API; deploy single agent to Phala Cloud
 - Generate first `AgentIdentity` via Skytale Python SDK to validate `did:key` shape
-- Deploy a simple cloud agent that runs a real coding task in Modal Sandbox (clones small repo, edits a file, runs pytest, commits)
+- Deploy a simple cloud agent that runs a real coding task in Phala CVM (clones small repo, edits a file, runs pytest, commits)
 
-Output: Cloud agent runs a real coding task in Modal using Maple TEE inference.
+Output: Cloud agent runs a real coding task in Phala Cloud using Phala TEE inference.
 
 ### Week 2: Skytale Dart SDK foundation
 - Choose binding strategy: `dart:ffi` to Rust skytale-sdk, OR Dart wrapper around Skytale REST + gRPC
@@ -37,7 +37,7 @@ Output: Skytale Dart SDK alpha — can generate identities, encrypt/decrypt mess
 
 ### Week 3: Tally Workers Dart client + Cloud agent + Dart agent round-trip
 - Implement Tally Workers HTTP client in Dart (8 routes; URL-safe-base64 helpers; ULID parsing)
-- Cloud-side: agent in Modal dispatches a wake to a target identity
+- Cloud-side: agent in Phala Cloud dispatches a wake to a target identity
 - Dart-side (in a test harness, not yet Flutter UI): receive the wake via Tally Workers inbox poll; decrypt with Skytale Dart SDK; respond via Tally complete
 - Verify end-to-end: cloud agent ↔ Dart client roundtrip works
 
@@ -63,14 +63,14 @@ Output: Flutter shows the user's 7 cloud agents in a roster after signup.
 - Flutter UI: chat surface for the user's main channel (`{user_id}/main`)
 - Subscribe to Skytale channel via Dart SDK; render messages
 - "Send message" button dispatches user input as a chat message; cloud orchestrator receives it
-- Cloud orchestrator (Modal function): subscribes to the channel; on user input, dispatches board agents to deliberate
+- Cloud orchestrator (Phala CVM): subscribes to the channel; on user input, dispatches board agents to deliberate
 - Board agents post status/decision_request messages back; Flutter UI shows them in real-time
 
 Output: User can describe a task in Flutter; sees board deliberating in real time.
 
-### Week 7: Workers in Modal Sandbox + GitHub integration
-- Cloud orchestrator dispatches a wake to a cloud worker (Modal function)
-- Worker spins up a Modal Sandbox container with Git, Node, Python, build tools
+### Week 7: Workers in Phala CVM + GitHub integration
+- Cloud orchestrator dispatches a wake to a cloud worker (Phala CVM)
+- Worker spins up a Phala CVM container with Git, Node, Python, build tools
 - Worker authenticates to user's GitHub via stored OAuth token
 - Worker clones the user's selected repo, uses `FileEditorTool`/`TerminalTool` to make changes, runs tests, commits, opens PR via `gh pr create`
 - Worker posts `StatusData` + `PrUpdateData` messages back to the channel
@@ -87,7 +87,7 @@ Output: Full end-to-end coding loop: user → board → orchestrator → cloud w
 Output: Desktop app can be both UI and local agent. User picks per-task: cloud or local.
 
 ### Week 9: Conversation persistence + multi-device sync
-- OpenHands `persistence_dir` for cloud workers on Modal volumes
+- OpenHands `persistence_dir` for cloud workers on Phala CVM persistent storages
 - Convex syncs conversation events across user's devices
 - User can close laptop; agents continue in cloud; user opens phone (Flutter mobile) and sees current state
 - Tested: dispatch task on laptop, monitor on phone, approve from phone, see PR open from anywhere
@@ -98,7 +98,7 @@ Output: True multi-device experience: agents persist; UI catches up on any devic
 - Workers ↔ orchestrator escalation via Tally wakes (block/unblock messages)
 - Orchestrator ↔ board escalation
 - Board ↔ user escalation (decision_request surfaces as UI banner on user's devices)
-- Error handling: agent failures, Modal failures, LLM errors, test failures
+- Error handling: agent failures, Phala Cloud failures, LLM errors, test failures
 - Per-language test coverage spike: Python pytest, Node.js npm test, Rust cargo test
 
 Output: Reliable enough for real coding work; full escalation hierarchy works.
@@ -132,7 +132,7 @@ Output: Mobile app shows the same team view as desktop; cloud agents respond to 
 ### Week 15: User isolation + production hardening
 - Multi-user Convex schema (one team per user; isolation rules)
 - Encryption-at-rest for agent private keys (server-side; Fernet/libsodium)
-- Master key in dedicated KMS (or Modal env for v0.1; KMS migration v1.0)
+- Master key in dedicated KMS (or Phala Cloud secret for v0.1; KMS migration v1.0)
 - Quota tracking per user against platform's Skytale account
 
 ### Week 16: Humans as team members + DM channels
@@ -193,7 +193,7 @@ Realistic ranges (vs optimistic estimates above):
 - Total: 6-8 months for v1.0
 
 Slowdown factors:
-- Third-party service issues (Modal, Convex, Maple, Cloudflare outages)
+- Third-party service issues (Phala Cloud, Convex, Cloudflare outages)
 - Architectural assumptions that don't hold
 - Chat UI polish takes longer than expected
 - App store review cycles (Apple typically 1-3 days; can be longer for first submissions)

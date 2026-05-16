@@ -9,10 +9,10 @@ Technical meta-analysis; not strategic content. Many gaps from the original synt
 
 All A-class inconsistencies from the original synthesis have been resolved in the source documents. Remaining item:
 
-### A.1 — Maple Proxy hosting topology
+### A.1 — Phala Redpill API hosting topology
 
 - **Architecture**: "Configuration deferred to first-week implementation: hosted endpoint vs self-hosted sidecar (trial both)"
-- **Week 1 scope** (day 2): Recommends hosted endpoint via `https://enclave.trymaple.ai`
+- **Week 1 scope** (day 2): Recommends hosted endpoint via `https://api.redpill.ai`
 
 Week-1 recommendation is a starting trial decision; operator can switch. Confirm during week 1 day 2.
 
@@ -22,7 +22,7 @@ Decisions surfaced during research that need answering before specific weeks.
 
 ### B.1 — Workspace mode (week 1-2)
 
-**Resolved direction (2026-05-16):** Cloud agents use Modal Sandbox direct (`workspace=os.getcwd()` inside the Modal container). Event streaming via OpenHands `callbacks=[fn]` → Convex. The desktop Flutter app's opt-in local execution mode also uses `workspace=os.getcwd()` but with cwd = user's local working directory.
+**Resolved direction (2026-05-16):** Cloud agents use Phala CVM direct (`workspace=os.getcwd()` inside the Phala CVM). Event streaming via OpenHands `callbacks=[fn]` → Convex. The desktop Flutter app's opt-in local execution mode also uses `workspace=os.getcwd()` but with cwd = user's local working directory.
 
 OpenHands Agent Server's `RemoteWorkspace` primitive is a Phase 2 / v1.5 power-user option for users who want to drive their daemon from external tools (e.g., a separate CLI talking to a long-running Agent Server on their desktop).
 
@@ -130,9 +130,9 @@ Documents say "Convex integrates via JWT verification". Worth verifying against 
 
 ### C.2 — Failure mode contingencies (Phase 2)
 
-Risk register mentions Maple AI dependency, Modal cold starts, etc., but no concrete contingency plans:
-- Maple AI shutdown — which TEE alternative? Migration time?
-- Modal price spike — where do agents run?
+Risk register mentions Phala Cloud (Redpill) dependency, Phala CVM cold starts, etc., but no concrete contingency plans:
+- Phala Cloud (Redpill) shutdown — which TEE alternative? Migration time?
+- Phala Cloud price spike — where do agents run?
 - Cloudflare deprecates DOs — where does Tally migrate?
 
 Overkill for v0.1; note for v1.0 readiness.
@@ -147,7 +147,7 @@ Overkill for v0.1; note for v1.0 readiness.
 ### C.4 — Master key custodianship (v0.1 → v1.0)
 
 For encryption-at-rest of agent private keys in Convex:
-- v0.1: Modal env var (acceptable for single-user demo)
+- v0.1: Phala Cloud secret (acceptable for single-user demo)
 - v1.0: dedicated KMS (AWS KMS, GCP KMS, HashiCorp Vault)
 
 Decide migration timing during weeks 11-12 hardening.
@@ -163,8 +163,8 @@ Open implementation question for Phase 2 (when user count scales): if many users
 ### D.1 — Account setup pre-staging (pre-week-1)
 
 Pre-stage all v0.1 + v1.0 accounts in one ~30-min session before week 1:
-- Maple AI Pro plan
-- Modal
+- Phala Cloud (Redpill) Pro plan
+- Phala Cloud (CVM + Redpill)
 - Convex
 - Clerk
 - Vercel
@@ -185,15 +185,15 @@ Decide before commercial launch.
 
 Pin specific OpenHands SDK version. Upgrade deliberately; never on auto-update.
 
-### D.4 — Modal long-running function support (week 1 day 2)
+### D.4 — Phala CVM long-running function support (week 1 day 2)
 
-Verify 24h function-runtime claim against current Modal docs. What happens at the limit (auto-restart? lose state?). The platform's persistence-via-Modal-volume pattern means state survives function restarts; need to confirm.
+Verify 24h function-runtime claim against current Phala Cloud docs. What happens at the limit (auto-restart? lose state?). The platform's persistence-via-Phala-CVM-storage pattern means state survives function restarts; need to confirm.
 
-### D.5 — Maple AI plan billing structure (week 13)
+### D.5 — Phala Cloud (Redpill) plan billing structure (week 13)
 
-**Resolved direction (2026-05-16):** Platform pays Maple wholesale (one platform Maple subscription / enterprise plan); customers pay Tally retail. Customers never have a Maple subscription. Same pattern as Skytale per Scenario B.
+**Resolved direction (2026-05-16):** Platform pays Phala wholesale (one platform Phala Redpill subscription / enterprise plan); customers pay Tally retail. Customers never have a Phala Redpill subscription. Same pattern as Skytale per Scenario B.
 
-Open question: at what scale does the platform need to move from Pro plan ($20/mo) to a Maple enterprise plan? Plus the cost-attribution piece — how does the platform internally track per-user LLM spend to inform pricing? Both decide by week 13 (billing) or earlier if costs scale.
+Open question: at what scale does the platform need to move from Pro plan ($20/mo) to a Phala enterprise plan? Plus the cost-attribution piece — how does the platform internally track per-user LLM spend to inform pricing? Both decide by week 13 (billing) or earlier if costs scale.
 
 ## Resolved during research (no longer open)
 
@@ -215,14 +215,14 @@ Items to resolve before week 1 day 1 begins:
 1. Pre-stage accounts (D.1) — Convex, Clerk, Vercel, Stripe (long lead time), Sentry, custom domain
 2. Pin OpenHands SDK version (D.3) — lock to specific release
 3. Pin Skytale SDK version (C.3) — lock to specific release
-4. Verify Modal function runtime limits (D.4)
-5. Decide Maple Proxy topology (A.1)
+4. Verify Phala CVM runtime limits (D.4)
+5. Decide Phala Redpill API topology (A.1)
 
 ## Summary table: gaps by week
 
 | Gap | Type | Decide before | Affects |
 |---|---|---|---|
-| Maple Proxy topology (A.1) | Inconsistency | Week 1 day 2 | LLM integration |
+| Phala Redpill API topology (A.1) | Inconsistency | Week 1 day 2 | LLM integration |
 | Workspace mode (B.1) | Under-specified | Week 1-2 | Agent hosting topology |
 | Board deliberation format (B.2) | Under-specified | Week 5 | UX of "go" flow |
 | Communicator surface (B.3) | Under-specified | Week 5 | UX |
@@ -241,8 +241,8 @@ Items to resolve before week 1 day 1 begins:
 | Account setup pre-staging (D.1) | Critical-path | Week 1 day 1 | Per-week blockers |
 | Tally production deployment (D.2) | Critical-path | Week 19 | Commercial launch |
 | OpenHands SDK version pin (D.3) | Critical-path | Week 1 day 1 | API stability |
-| Modal function runtime limits (D.4) | Critical-path | Week 1 day 2 | Long-running agents |
-| Maple plan billing structure (D.5) | Critical-path | Week 13 | Pricing model |
+| Phala CVM runtime limits (D.4) | Critical-path | Week 1 day 2 | Long-running agents |
+| Phala Redpill plan billing structure (D.5) | Critical-path | Week 13 | Pricing model |
 
 ## Provenance
 
