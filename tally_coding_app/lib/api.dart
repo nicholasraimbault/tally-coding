@@ -81,11 +81,9 @@ class TallyOrchClient {
     return raw.cast<Map<String, dynamic>>();
   }
 
-  /// Server-Sent Events stream of task events. Yields the same dicts that
-  /// [listEvents] returns. The stream stays open until the task terminates or
-  /// the consumer cancels it. Parses SSE frames manually (one less dep than
-  /// pulling in a package that pins an older `http`).
-  Stream<Map<String, dynamic>> streamEvents(String taskId, {int sinceSeq = -1}) async* {
+  /// Server-Sent Events stream of frames (task_event + status_change). Each
+  /// yielded record is `(name, data)` so the consumer can route by event name.
+  Stream<({String name, Map<String, dynamic> data})> streamFrames(String taskId, {int sinceSeq = -1}) async* {
     final req = http.Request('GET', baseUrl.resolve('/tasks/$taskId/stream?since_seq=$sinceSeq'))
       ..headers['accept'] = 'text/event-stream'
       ..headers['cache-control'] = 'no-cache';
@@ -106,11 +104,11 @@ class TallyOrchClient {
         buffer = buffer.substring(nl + 1);
         if (line.endsWith('\r')) line = line.substring(0, line.length - 1);
         if (line.isEmpty) {
-          // End of one SSE message. Emit if it's a task_event with data.
-          if (currentEventName == 'task_event' && dataLines.isNotEmpty) {
+          // End of one SSE message. Emit any frame with a name + data.
+          if (currentEventName != null && dataLines.isNotEmpty) {
             final data = dataLines.join('\n');
             try {
-              yield jsonDecode(data) as Map<String, dynamic>;
+              yield (name: currentEventName, data: jsonDecode(data) as Map<String, dynamic>);
             } catch (_) {
               // Malformed; skip.
             }
@@ -124,9 +122,36 @@ class TallyOrchClient {
         } else if (line.startsWith('data:')) {
           dataLines.add(line.substring(5).trimLeft());
         }
-        // Other field names (id:, retry:) ignored for our minimal use.
       }
     }
+  }
+
+  /// Workspace file listing for a completed (or running) task. Returns
+  /// {"entries": [{"path", "size", "is_dir"}, ...]}.
+  Future<List<Map<String, dynamic>>> listFiles(String taskId) async {
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files'));
+    if (resp.statusCode != 200) {
+      throw Exception('list files failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return (body['entries'] as List).cast<Map<String, dynamic>>();
+  }
+
+  /// Read a single file from a task's workspace. Returns the decoded body
+  /// (server delivers base64; we decode to UTF-8 string here for the viewer).
+  Future<({String content, int size, bool truncated})> readFile(String taskId, String path) async {
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files/$path'));
+    if (resp.statusCode != 200) {
+      throw Exception('read file failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final bytes = base64.decode(body['content_b64'] as String);
+    final text = utf8.decode(bytes, allowMalformed: true);
+    return (
+      content: text,
+      size: (body['size'] as num).toInt(),
+      truncated: body['truncated'] as bool? ?? false,
+    );
   }
 
   void close() => _http.close();

@@ -42,6 +42,9 @@ from tally_coding_core.tally_workers import TallyWorkersClient
 BOOTSTRAP_CONTEXT_ID = "mls:bootstrap"
 TASK_CONTEXT_ID = "task:start"
 EVENT_CONTEXT_ID = "task:event"
+FS_LIST_CONTEXT_ID = "task:fs:list"
+FS_READ_CONTEXT_ID = "task:fs:read"
+MAX_FILE_READ_BYTES = 256 * 1024  # 256 KiB safety cap on workspace reads
 
 # Sentinel pushed on the event queue to tell the emitter thread to exit.
 _EMITTER_SHUTDOWN = object()
@@ -225,6 +228,61 @@ def perform_task(
     return {"success": True, "files_created": files_created}
 
 
+def handle_fs_list_wake(session: MlsSession, payload: bytes, workspace_root: Path) -> bytes:
+    """List files in a task's workspace. Payload: {"task_id": "..."}
+    Response: {"entries": [{"path": "...", "size": N, "is_dir": bool}, ...]}"""
+    plaintext = session.decrypt(payload).decode("utf-8")
+    req = json.loads(plaintext)
+    task_id = req["task_id"]
+    root = workspace_root / f"task-{task_id[:12]}"
+    if not root.exists():
+        resp = {"error": f"workspace not found for task {task_id[:8]}"}
+    else:
+        entries = []
+        for p in sorted(root.rglob("*")):
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            entries.append({
+                "path": str(rel),
+                "size": p.stat().st_size if p.is_file() else 0,
+                "is_dir": p.is_dir(),
+            })
+        resp = {"task_id": task_id, "entries": entries}
+    return session.encrypt(json.dumps(resp).encode("utf-8"))
+
+
+def handle_fs_read_wake(session: MlsSession, payload: bytes, workspace_root: Path) -> bytes:
+    """Read a single file from a task's workspace. Payload:
+    {"task_id": "...", "path": "..."}. Path is relative to the task workspace
+    and rejected if it tries to escape via '..'. Response: {"content_b64": ...}
+    or {"error": "..."}. Files larger than MAX_FILE_READ_BYTES are truncated."""
+    plaintext = session.decrypt(payload).decode("utf-8")
+    req = json.loads(plaintext)
+    task_id = req["task_id"]
+    rel_path = req["path"]
+    root = (workspace_root / f"task-{task_id[:12]}").resolve()
+    target = (root / rel_path).resolve()
+    # Refuse paths that try to escape the task workspace.
+    if not str(target).startswith(str(root) + "/") and target != root:
+        resp = {"error": "path traversal blocked"}
+    elif not target.exists():
+        resp = {"error": f"not found: {rel_path}"}
+    elif target.is_dir():
+        resp = {"error": f"is a directory: {rel_path}"}
+    else:
+        data = target.read_bytes()[:MAX_FILE_READ_BYTES]
+        resp = {
+            "task_id": task_id,
+            "path": rel_path,
+            "content_b64": base64.b64encode(data).decode("ascii"),
+            "size": target.stat().st_size,
+            "truncated": target.stat().st_size > MAX_FILE_READ_BYTES,
+        }
+    return session.encrypt(json.dumps(resp).encode("utf-8"))
+
+
 def handle_bootstrap_wake(session: MlsSession, payload: bytes) -> tuple[bytes, bool]:
     msg = json.loads(payload.decode("utf-8"))
     phase = msg.get("phase")
@@ -257,7 +315,9 @@ def handle_task_wake(
     task_id = task_spec.get("task_id", wake_id)
     orchestrator_bearer = task_spec.get("orchestrator_bearer")
     print(f"[worker] task {task_id[:8]} (decrypted): {task_description[:80]}...", flush=True)
-    task_workspace = workspace_root / f"task-{wake_id[:12]}"
+    # Workspace dir keyed by task_id (not wake_id) so fs:list/fs:read can find
+    # it later by the same task_id the orchestrator + UI use.
+    task_workspace = workspace_root / f"task-{task_id[:12]}"
     task_workspace.mkdir(parents=True, exist_ok=True)
 
     event_queue: queue.Queue = queue.Queue()
@@ -352,9 +412,11 @@ def main() -> int:
             if context_id == BOOTSTRAP_CONTEXT_ID:
                 response_bytes, bootstrapped_now = handle_bootstrap_wake(session, payload)
                 if bootstrapped_now and not task_handler_registered:
-                    client.register(team_id, bearer, bearer=bearer, context_id=TASK_CONTEXT_ID)
+                    # Register all per-task contexts (task work + fs browse) at once.
+                    for ctx in (TASK_CONTEXT_ID, FS_LIST_CONTEXT_ID, FS_READ_CONTEXT_ID):
+                        client.register(team_id, bearer, bearer=bearer, context_id=ctx)
                     task_handler_registered = True
-                    print("[worker] registered task:start handler post-bootstrap", flush=True)
+                    print("[worker] registered task + fs handlers post-bootstrap", flush=True)
             elif context_id == TASK_CONTEXT_ID:
                 if not session.bootstrapped:
                     raise RuntimeError("task wake received before MLS bootstrap")
@@ -367,6 +429,10 @@ def main() -> int:
                     workspace_root=workspace,
                     wake_id=wake_id,
                 )
+            elif context_id == FS_LIST_CONTEXT_ID:
+                response_bytes = handle_fs_list_wake(session, payload, workspace)
+            elif context_id == FS_READ_CONTEXT_ID:
+                response_bytes = handle_fs_read_wake(session, payload, workspace)
             else:
                 raise RuntimeError(f"unknown context_id: {context_id}")
         except Exception as exc:

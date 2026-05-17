@@ -50,65 +50,97 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
   final List<Map<String, dynamic>> _events = [];
   int _lastSeq = -1;
   String? _error;
-  Timer? _statusTimer;
-  StreamSubscription<Map<String, dynamic>>? _eventsSub;
+  StreamSubscription? _framesSub;
 
   @override
   void initState() {
     super.initState();
-    _pollStatus();
-    // Status changes slowly (pending → running → terminal); a slow poll is fine.
-    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (_task?.isTerminal == true) {
-        _statusTimer?.cancel();
-        return;
-      }
-      _pollStatus();
-    });
-    _connectEventStream();
+    // One-shot initial fetch so we have description + initial status to render
+    // before the SSE stream connects.
+    _fetchInitial();
+    _connectStream();
+    // Optional deep-link: open a file viewer on first frame (dev / screenshot use).
+    const autoOpenFile = String.fromEnvironment('TALLY_AUTO_OPEN_FILE');
+    if (autoOpenFile.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openFileViewer(autoOpenFile);
+      });
+    }
   }
 
   @override
   void dispose() {
-    _statusTimer?.cancel();
-    _eventsSub?.cancel();
+    _framesSub?.cancel();
     super.dispose();
   }
 
-  void _connectEventStream() {
-    _eventsSub?.cancel();
-    _eventsSub = widget.client.streamEvents(widget.taskId, sinceSeq: _lastSeq).listen(
-      (ev) {
+  Future<void> _fetchInitial() async {
+    try {
+      final t = await widget.client.getTask(widget.taskId);
+      if (!mounted) return;
+      setState(() => _task = t);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
+  void _connectStream() {
+    _framesSub?.cancel();
+    _framesSub = widget.client.streamFrames(widget.taskId, sinceSeq: _lastSeq).listen(
+      (frame) {
         if (!mounted) return;
         setState(() {
-          _events.add(ev);
-          _lastSeq = ev['seq'] as int;
+          if (frame.name == 'task_event') {
+            _events.add(frame.data);
+            _lastSeq = frame.data['seq'] as int;
+          } else if (frame.name == 'status_change') {
+            // Splice the new status into our local Task. The server's first
+            // post-connect status_change is a snapshot so we always converge.
+            final t = _task;
+            final newStatus = frame.data['status'] as String;
+            final ts = (frame.data['ts'] as num?)?.toDouble() ?? DateTime.now().millisecondsSinceEpoch / 1000.0;
+            if (t != null) {
+              _task = Task(
+                id: t.id,
+                description: t.description,
+                status: newStatus,
+                result: t.result,
+                error: t.error,
+                createdAt: t.createdAt,
+                updatedAt: ts,
+              );
+            }
+            // If transitioning to terminal, refetch once to pick up result/error.
+            if (newStatus == 'completed' || newStatus == 'failed') {
+              _fetchInitial();
+            }
+          }
+          _error = null;
         });
       },
       onError: (e) {
         if (!mounted) return;
-        setState(() => _error = 'event stream: $e');
-        // Reconnect after a short pause.
+        setState(() => _error = 'stream: $e');
         Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) _connectEventStream();
+          if (mounted) _connectStream();
         });
       },
       cancelOnError: true,
     );
   }
 
-  Future<void> _pollStatus() async {
-    try {
-      final t = await widget.client.getTask(widget.taskId);
-      if (!mounted) return;
-      setState(() {
-        _task = t;
-        _error = null;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
-    }
+  Future<void> _openFileViewer(String path) async {
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        insetPadding: const EdgeInsets.all(32),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 800, maxHeight: 600),
+          child: _FileViewerDialog(client: widget.client, taskId: widget.taskId, path: path),
+        ),
+      ),
+    );
   }
 
   Widget _statusChip(Task t) {
@@ -237,7 +269,7 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text('Task ${widget.taskId.substring(0, 8)}'),
-        actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _pollStatus)],
+        actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _fetchInitial)],
       ),
       body: t == null
           ? Center(
@@ -299,16 +331,21 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                     if (t.result?['files_created'] is List) ...[
                       const SizedBox(height: 12),
                       Text(
-                        'Files created (${(t.result!['files_created'] as List).length})',
+                        'Files created (${(t.result!['files_created'] as List).length}) — tap to view',
                         style: Theme.of(context).textTheme.titleSmall,
                       ),
                       const SizedBox(height: 4),
                       Wrap(
                         spacing: 6,
                         runSpacing: 6,
-                        children: (t.result!['files_created'] as List)
-                            .map((f) => Chip(label: Text(f.toString(), style: const TextStyle(fontSize: 12))))
-                            .toList(),
+                        children: (t.result!['files_created'] as List).map((f) {
+                          final path = f.toString();
+                          return ActionChip(
+                            label: Text(path, style: const TextStyle(fontSize: 12)),
+                            avatar: const Icon(Icons.description, size: 14),
+                            onPressed: () => _openFileViewer(path),
+                          );
+                        }).toList(),
                       ),
                     ],
                   ],
@@ -326,6 +363,82 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                 ],
               ),
             ),
+    );
+  }
+}
+
+class _FileViewerDialog extends StatefulWidget {
+  final TallyOrchClient client;
+  final String taskId;
+  final String path;
+  const _FileViewerDialog({required this.client, required this.taskId, required this.path});
+
+  @override
+  State<_FileViewerDialog> createState() => _FileViewerDialogState();
+}
+
+class _FileViewerDialogState extends State<_FileViewerDialog> {
+  String? _content;
+  int? _size;
+  bool _truncated = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final r = await widget.client.readFile(widget.taskId, widget.path);
+      if (!mounted) return;
+      setState(() {
+        _content = r.content;
+        _size = r.size;
+        _truncated = r.truncated;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.description, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(widget.path, style: const TextStyle(fontFamily: 'monospace')),
+              ),
+              if (_size != null)
+                Text('$_size bytes${_truncated ? " (truncated)" : ""}',
+                    style: Theme.of(context).textTheme.bodySmall),
+              IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.of(context).pop()),
+            ],
+          ),
+          const Divider(),
+          Expanded(
+            child: _error != null
+                ? Center(child: Text('Error: $_error'))
+                : _content == null
+                    ? const Center(child: CircularProgressIndicator())
+                    : SingleChildScrollView(
+                        child: SelectableText(
+                          _content!,
+                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.4),
+                        ),
+                      ),
+          ),
+        ],
+      ),
     );
   }
 }

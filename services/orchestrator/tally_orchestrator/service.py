@@ -50,6 +50,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 BOOTSTRAP_CONTEXT_ID = "mls:bootstrap"
 TASK_CONTEXT_ID = "task:start"
 EVENT_CONTEXT_ID = "task:event"
+FS_LIST_CONTEXT_ID = "task:fs:list"
+FS_READ_CONTEXT_ID = "task:fs:read"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id           TEXT PRIMARY KEY,
@@ -297,10 +299,19 @@ class Orchestrator:
         )
         return b64url_decode(result["response"])
 
+    async def _publish_status(self, task_id: str, status: str, extra: dict | None = None) -> None:
+        """Publish a status_change marker to the bus so SSE subscribers learn
+        about task transitions without needing to poll /tasks/{id}."""
+        payload = {"task_id": task_id, "status": status, "ts": time.time()}
+        if extra:
+            payload.update(extra)
+        await self.event_bus.publish(task_id, {"_kind": "status_change", **payload})
+
     async def process_task(self, task: dict) -> None:
-        """Encrypt task, dispatch, decrypt response, update db."""
+        """Encrypt task, dispatch, decrypt response, update db, push status events."""
         async with self._dispatch_lock:
             self.db.mark_running(task["id"])
+            await self._publish_status(task["id"], "running")
             logger.info("running task %s: %s", task["id"][:8], task["description"][:80])
             try:
                 payload_obj = {
@@ -319,10 +330,38 @@ class Orchestrator:
                 response_plain = self.session.decrypt(response_bytes).decode("utf-8")
                 result = json.loads(response_plain)
                 self.db.mark_completed(task["id"], result)
+                await self._publish_status(task["id"], "completed", {"success": result.get("success")})
                 logger.info("task %s completed: success=%s", task["id"][:8], result.get("success"))
             except Exception as exc:
                 logger.exception("task %s failed", task["id"][:8])
                 self.db.mark_failed(task["id"], str(exc))
+                await self._publish_status(task["id"], "failed", {"error": str(exc)})
+
+    async def list_workspace(self, task_id: str) -> dict:
+        """Dispatch a fs:list wake and return the decrypted response dict."""
+        async with self._dispatch_lock:
+            payload = json.dumps({"task_id": task_id}).encode("utf-8")
+            ciphertext = self.session.encrypt(payload)
+            resp = await asyncio.to_thread(
+                self._dispatch_blocking,
+                context_id=FS_LIST_CONTEXT_ID,
+                payload=ciphertext,
+                timeout_seconds=30,
+            )
+            return json.loads(self.session.decrypt(resp).decode("utf-8"))
+
+    async def read_workspace_file(self, task_id: str, path: str) -> dict:
+        """Dispatch a fs:read wake and return the decrypted response dict."""
+        async with self._dispatch_lock:
+            payload = json.dumps({"task_id": task_id, "path": path}).encode("utf-8")
+            ciphertext = self.session.encrypt(payload)
+            resp = await asyncio.to_thread(
+                self._dispatch_blocking,
+                context_id=FS_READ_CONTEXT_ID,
+                payload=ciphertext,
+                timeout_seconds=30,
+            )
+            return json.loads(self.session.decrypt(resp).decode("utf-8"))
 
     async def run_processor_loop(self) -> None:
         while True:
@@ -480,11 +519,20 @@ async def stream_task_events(task_id: str, request: Request, since_seq: int = -1
         raise HTTPException(404, f"task {task_id} not found")
 
     async def event_source():
-        # Replay everything we already have.
+        # Replay historical task events first so reconnects don't lose any.
+        # Status changes are not persisted — clients get them live or via
+        # GET /tasks/{id} for current snapshot.
         last_seq = since_seq
         for ev in db.list_events(task_id, since_seq=since_seq):
             yield {"event": "task_event", "data": json.dumps(ev)}
             last_seq = ev["seq"]
+        # Also send the current status snapshot so the client doesn't have to
+        # hit a second endpoint right after connecting.
+        snap = db.get_task(task_id)
+        if snap:
+            yield {"event": "status_change", "data": json.dumps({
+                "task_id": task_id, "status": snap["status"], "ts": snap["updated_at"],
+            })}
         # Subscribe + stream live events.
         queue = await bus.subscribe(task_id)
         try:
@@ -493,20 +541,49 @@ async def stream_task_events(task_id: str, request: Request, since_seq: int = -1
                     break
                 try:
                     ev = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    # Skip events we already replayed (race when subscribing after
-                    # the poller publishes but before we walked the DB).
-                    if ev["seq"] <= last_seq:
-                        continue
-                    yield {"event": "task_event", "data": json.dumps(ev)}
-                    last_seq = ev["seq"]
+                    if ev.get("_kind") == "status_change":
+                        out = {k: v for k, v in ev.items() if k != "_kind"}
+                        yield {"event": "status_change", "data": json.dumps(out)}
+                    else:
+                        # Task event from the worker. Skip seqs we already replayed.
+                        if ev["seq"] <= last_seq:
+                            continue
+                        yield {"event": "task_event", "data": json.dumps(ev)}
+                        last_seq = ev["seq"]
                 except asyncio.TimeoutError:
-                    # Heartbeat keeps idle connections from being killed by
-                    # intermediaries (proxies, load balancers).
                     yield {"event": "heartbeat", "data": ""}
         finally:
             await bus.unsubscribe(task_id, queue)
 
     return EventSourceResponse(event_source())
+
+
+@app.get("/tasks/{task_id}/files")
+async def list_task_files(task_id: str) -> dict:
+    """List files in the worker's per-task workspace. Dispatches a fs:list
+    wake to the worker over MLS; returns the decrypted entry list."""
+    task = state["db"].get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"task {task_id} not found")
+    orch: Orchestrator = state["orchestrator"]
+    resp = await orch.list_workspace(task_id)
+    if "error" in resp:
+        raise HTTPException(404, resp["error"])
+    return resp
+
+
+@app.get("/tasks/{task_id}/files/{path:path}")
+async def read_task_file(task_id: str, path: str) -> dict:
+    """Read one file from the worker's per-task workspace. Path is forwarded
+    to the worker which validates against path traversal."""
+    task = state["db"].get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"task {task_id} not found")
+    orch: Orchestrator = state["orchestrator"]
+    resp = await orch.read_workspace_file(task_id, path)
+    if "error" in resp:
+        raise HTTPException(404, resp["error"])
+    return resp
 
 
 def main() -> None:
