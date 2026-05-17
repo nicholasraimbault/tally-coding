@@ -1,4 +1,4 @@
-"""Day 4 / Sprint 2 worker — receives MLS-encrypted task wakes via Tally Workers.
+"""Worker — receives MLS-encrypted task wakes; streams events back to orchestrator.
 
 Bootstrap dance (plaintext, public MLS artifacts only):
   1. Orchestrator dispatches mls:bootstrap with phase=request_kp
@@ -7,9 +7,14 @@ Bootstrap dance (plaintext, public MLS artifacts only):
   4. Worker calls MlsSession.join(welcome), registers for task:start
 
 Task delivery (MLS-encrypted):
-  5. Orchestrator dispatches task:start with payload = MLS-encrypted {"task": "..."}
-  6. Worker decrypts via MlsSession, runs OpenHands, encrypts response
-  7. Worker completes the wake with the encrypted response
+  5. Orchestrator dispatches task:start with payload =
+     MLS-encrypted {"task": "...", "task_id": "...", "orchestrator_bearer": "..."}
+  6. Worker decrypts via MlsSession, spins up an event-emitter thread, then runs
+     OpenHands. The Conversation callback pushes each event onto a queue; the
+     emitter thread MLS-encrypts and dispatches them to the orchestrator's
+     bearer as context_id=task:event.
+  7. After conversation.run() returns, worker shuts down the emitter and
+     completes the original wake with the encrypted final result.
 """
 
 from __future__ import annotations
@@ -17,8 +22,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import queue
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 from openhands.sdk import LLM, Agent, Conversation, Tool
 from openhands.tools.terminal import TerminalTool
@@ -32,6 +41,10 @@ from tally_coding_core.tally_workers import TallyWorkersClient
 
 BOOTSTRAP_CONTEXT_ID = "mls:bootstrap"
 TASK_CONTEXT_ID = "task:start"
+EVENT_CONTEXT_ID = "task:event"
+
+# Sentinel pushed on the event queue to tell the emitter thread to exit.
+_EMITTER_SHUTDOWN = object()
 
 
 def b64url_no_pad(data: bytes) -> str:
@@ -52,7 +65,78 @@ def build_llm() -> LLM:
     return LLM(model=f"openai/{model_name}", api_key=api_key, base_url=base_url)
 
 
-def perform_task(task_description: str, workspace: Path) -> dict:
+def event_summary(event: Any) -> dict:
+    """Reduce a verbose OpenHands event to a UI-friendly dict.
+
+    Keeps the wake payload small and avoids leaking full LLM completion bodies
+    over the wire. Truncates content fields at 500 chars.
+    """
+    summary: dict[str, Any] = {"type": type(event).__name__, "ts": time.time()}
+    # Plain message
+    if hasattr(event, "content") and not hasattr(event, "action") and not hasattr(event, "observation"):
+        summary["content"] = str(event.content)[:500]
+    # Action event (agent did something)
+    if hasattr(event, "action"):
+        action = event.action
+        summary["action_type"] = type(action).__name__
+        for attr in ("command", "path", "message", "thought", "file_text"):
+            if hasattr(action, attr):
+                val = getattr(action, attr)
+                if val:
+                    summary[attr] = str(val)[:500]
+    # Observation event (tool returned something)
+    if hasattr(event, "observation"):
+        obs = event.observation
+        summary["observation_type"] = type(obs).__name__
+        for attr in ("content", "output", "exit_code"):
+            if hasattr(obs, attr):
+                val = getattr(obs, attr)
+                if val is not None:
+                    summary[attr] = str(val)[:500]
+    return summary
+
+
+def run_event_emitter(
+    *,
+    event_queue: queue.Queue,
+    session: MlsSession,
+    client: TallyWorkersClient,
+    team_id: str,
+    bearer: str,
+    target_identity: str,
+    task_id: str,
+) -> None:
+    """Background thread: pulls events off the queue, MLS-encrypts each one,
+    dispatches as a task:event wake to the orchestrator's bearer."""
+    seq = 0
+    while True:
+        item = event_queue.get()
+        if item is _EMITTER_SHUTDOWN:
+            return
+        try:
+            payload = json.dumps({"task_id": task_id, "seq": seq, "event": item}).encode("utf-8")
+            ciphertext = session.encrypt(payload)
+            client.dispatch_wake(
+                team_id=team_id,
+                target_identity=target_identity,
+                context_id=EVENT_CONTEXT_ID,
+                payload=b64url_no_pad(ciphertext),
+                timeout_seconds=60,
+                bearer=bearer,
+            )
+            seq += 1
+        except Exception as exc:
+            print(f"[worker] event emit failed seq={seq}: {exc}", flush=True)
+
+
+def perform_task(
+    *,
+    task_description: str,
+    workspace: Path,
+    event_callback,
+) -> dict:
+    """Run OpenHands agent in workspace with an event callback that streams
+    each event to the orchestrator via the emitter thread."""
     llm = build_llm()
     agent = Agent(
         llm=llm,
@@ -62,7 +146,11 @@ def perform_task(task_description: str, workspace: Path) -> dict:
             Tool(name=TaskTrackerTool.name),
         ],
     )
-    conversation = Conversation(agent=agent, workspace=str(workspace))
+    conversation = Conversation(
+        agent=agent,
+        workspace=str(workspace),
+        callbacks=[event_callback],
+    )
     conversation.send_message(task_description)
     conversation.run()
     files_created = sorted(
@@ -72,7 +160,6 @@ def perform_task(task_description: str, workspace: Path) -> dict:
 
 
 def handle_bootstrap_wake(session: MlsSession, payload: bytes) -> tuple[bytes, bool]:
-    """Returns (response_bytes, bootstrapped_now). response_bytes is plaintext JSON."""
     msg = json.loads(payload.decode("utf-8"))
     phase = msg.get("phase")
     if phase == "request_kp":
@@ -88,15 +175,61 @@ def handle_bootstrap_wake(session: MlsSession, payload: bytes) -> tuple[bytes, b
         return json.dumps({"error": f"unknown phase: {phase}"}).encode("utf-8"), False
 
 
-def handle_task_wake(session: MlsSession, payload: bytes, workspace_root: Path, wake_id: str) -> bytes:
-    """Decrypt payload, run task in a fresh per-task workspace, return ciphertext."""
+def handle_task_wake(
+    *,
+    session: MlsSession,
+    client: TallyWorkersClient,
+    team_id: str,
+    bearer: str,
+    payload: bytes,
+    workspace_root: Path,
+    wake_id: str,
+) -> bytes:
     plaintext_json = session.decrypt(payload).decode("utf-8")
     task_spec = json.loads(plaintext_json)
     task_description = task_spec["task"]
-    print(f"[worker] task (decrypted): {task_description[:80]}...", flush=True)
+    task_id = task_spec.get("task_id", wake_id)
+    orchestrator_bearer = task_spec.get("orchestrator_bearer")
+    print(f"[worker] task {task_id[:8]} (decrypted): {task_description[:80]}...", flush=True)
     task_workspace = workspace_root / f"task-{wake_id[:12]}"
     task_workspace.mkdir(parents=True, exist_ok=True)
-    result = perform_task(task_description, task_workspace)
+
+    event_queue: queue.Queue = queue.Queue()
+    emitter_thread = None
+    if orchestrator_bearer:
+        emitter_thread = threading.Thread(
+            target=run_event_emitter,
+            kwargs={
+                "event_queue": event_queue,
+                "session": session,
+                "client": client,
+                "team_id": team_id,
+                "bearer": bearer,
+                "target_identity": orchestrator_bearer,
+                "task_id": task_id,
+            },
+            daemon=True,
+            name="event-emitter",
+        )
+        emitter_thread.start()
+        print(f"[worker] streaming events to {orchestrator_bearer[:12]}...", flush=True)
+
+    def on_event(event):
+        try:
+            event_queue.put_nowait(event_summary(event))
+        except Exception as exc:
+            print(f"[worker] event callback failed: {exc}", flush=True)
+
+    try:
+        result = perform_task(
+            task_description=task_description,
+            workspace=task_workspace,
+            event_callback=on_event,
+        )
+    finally:
+        if emitter_thread is not None:
+            event_queue.put(_EMITTER_SHUTDOWN)
+            emitter_thread.join(timeout=10)
     return session.encrypt(json.dumps(result).encode("utf-8"))
 
 
@@ -118,7 +251,6 @@ def main() -> int:
     client.register(team_id, bearer, bearer=bearer, context_id=BOOTSTRAP_CONTEXT_ID)
     print(f"[worker] ready; team={team_id}; identity={bearer}", flush=True)
 
-    # group_id will be replaced when we join via Welcome; placeholder for now.
     session = MlsSession(
         data_dir=mls_state_dir,
         identity=pubkey,
@@ -149,7 +281,15 @@ def main() -> int:
             elif context_id == TASK_CONTEXT_ID:
                 if not session.bootstrapped:
                     raise RuntimeError("task wake received before MLS bootstrap")
-                response_bytes = handle_task_wake(session, payload, workspace, wake_id)
+                response_bytes = handle_task_wake(
+                    session=session,
+                    client=client,
+                    team_id=team_id,
+                    bearer=bearer,
+                    payload=payload,
+                    workspace_root=workspace,
+                    wake_id=wake_id,
+                )
             else:
                 raise RuntimeError(f"unknown context_id: {context_id}")
         except Exception as exc:
@@ -158,7 +298,6 @@ def main() -> int:
 
         client.complete_wake(team_id, wake_id, b64url_no_pad(response_bytes), bearer=bearer)
         print(f"[worker] completed wake_id={wake_id[:8]}", flush=True)
-        # Long-lived: keep polling. Container exits on signal (SIGTERM/SIGINT).
 
 
 if __name__ == "__main__":

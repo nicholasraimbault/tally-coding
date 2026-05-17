@@ -16,6 +16,8 @@ class TaskDetailScreen extends StatefulWidget {
 
 class _TaskDetailScreenState extends State<TaskDetailScreen> {
   Task? _task;
+  final List<Map<String, dynamic>> _events = [];
+  int _lastSeq = -1;
   String? _error;
   Timer? _pollTimer;
 
@@ -24,7 +26,7 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
     super.initState();
     _poll();
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (_task?.isTerminal == true) {
+      if (_task?.isTerminal == true && _events.isNotEmpty) {
         _pollTimer?.cancel();
         return;
       }
@@ -40,10 +42,19 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
 
   Future<void> _poll() async {
     try {
-      final t = await widget.client.getTask(widget.taskId);
+      final results = await Future.wait([
+        widget.client.getTask(widget.taskId),
+        widget.client.listEvents(widget.taskId, sinceSeq: _lastSeq),
+      ]);
       if (!mounted) return;
+      final t = results[0] as Task;
+      final newEvents = results[1] as List<Map<String, dynamic>>;
       setState(() {
         _task = t;
+        if (newEvents.isNotEmpty) {
+          _events.addAll(newEvents);
+          _lastSeq = newEvents.last['seq'] as int;
+        }
         _error = null;
       });
     } catch (e) {
@@ -64,6 +75,42 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
       avatar: Icon(icon, color: color, size: 18),
       label: Text(t.status),
       backgroundColor: color.withValues(alpha: 0.1),
+    );
+  }
+
+  Widget _eventTile(Map<String, dynamic> ev) {
+    final type = ev['type'] as String? ?? '?';
+    final actionType = ev['action_type'] as String?;
+    final obsType = ev['observation_type'] as String?;
+    final command = ev['command'] as String?;
+    final path = ev['path'] as String?;
+    final content = ev['content'] as String?;
+    final output = ev['output'] as String?;
+    final message = ev['message'] as String?;
+
+    String label = type;
+    if (actionType != null) label = '$type · $actionType';
+    if (obsType != null) label = '$type · $obsType';
+
+    String? body = command ?? path ?? content ?? output ?? message;
+    if (body != null && body.length > 200) body = '${body.substring(0, 200)}…';
+
+    final (icon, color) = switch (type) {
+      'ActionEvent' => (Icons.play_arrow, Theme.of(context).colorScheme.primary),
+      'ObservationEvent' => (Icons.visibility, Theme.of(context).colorScheme.secondary),
+      'MessageEvent' => (Icons.message, Theme.of(context).colorScheme.tertiary),
+      'AgentErrorEvent' => (Icons.error, Theme.of(context).colorScheme.error),
+      _ => (Icons.circle_outlined, Theme.of(context).colorScheme.onSurfaceVariant),
+    };
+
+    return ListTile(
+      dense: true,
+      leading: Icon(icon, color: color, size: 18),
+      title: Text(label, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
+      subtitle: body != null
+          ? Text(body, style: const TextStyle(fontFamily: 'monospace', fontSize: 11), maxLines: 4, overflow: TextOverflow.ellipsis)
+          : null,
+      trailing: Text('#${ev['seq']}', style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 11)),
     );
   }
 
@@ -101,6 +148,25 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                           : 'Running in TEE worker via MLS-encrypted wake…',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
+                    const SizedBox(height: 16),
+                  ],
+                  if (_events.isNotEmpty) ...[
+                    Row(
+                      children: [
+                        Text('Agent activity', style: Theme.of(context).textTheme.titleSmall),
+                        const SizedBox(width: 8),
+                        Text('(${_events.length})', style: Theme.of(context).textTheme.bodySmall),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Card(
+                      child: Column(
+                        children: [
+                          for (final ev in _events) _eventTile(ev),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 24),
                   ],
                   if (t.status == 'completed' && t.result != null) ...[
                     Text('Result', style: Theme.of(context).textTheme.titleSmall),

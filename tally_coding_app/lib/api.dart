@@ -70,5 +70,15 @@ class TallyOrchClient {
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// Fetch events emitted by the worker for this task, with seq > sinceSeq.
+  Future<List<Map<String, dynamic>>> listEvents(String taskId, {int sinceSeq = -1}) async {
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'));
+    if (resp.statusCode != 200) {
+      throw Exception('list events failed: ${resp.statusCode} ${resp.body}');
+    }
+    final List<dynamic> raw = jsonDecode(resp.body);
+    return raw.cast<Map<String, dynamic>>();
+  }
+
   void close() => _http.close();
 }

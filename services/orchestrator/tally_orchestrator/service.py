@@ -48,6 +48,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 
 BOOTSTRAP_CONTEXT_ID = "mls:bootstrap"
 TASK_CONTEXT_ID = "task:start"
+EVENT_CONTEXT_ID = "task:event"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id           TEXT PRIMARY KEY,
@@ -59,6 +60,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+CREATE TABLE IF NOT EXISTS events (
+    task_id      TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    event_json   TEXT NOT NULL,
+    received_at  REAL NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, received_at);
 """
 
 
@@ -141,6 +151,24 @@ class Db:
             (error, time.time(), task_id),
         )
 
+    def insert_event(self, task_id: str, seq: int, event: dict) -> None:
+        """Insert a streaming event from the worker. Idempotent on (task_id, seq)."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO events (task_id, seq, event_json, received_at) VALUES (?, ?, ?, ?)",
+            (task_id, seq, json.dumps(event), time.time()),
+        )
+
+    def list_events(self, task_id: str, since_seq: int = -1) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT seq, event_json, received_at FROM events "
+            "WHERE task_id = ? AND seq > ? ORDER BY seq",
+            (task_id, since_seq),
+        ).fetchall()
+        return [
+            {"seq": r[0], "received_at": r[2], **json.loads(r[1])}
+            for r in rows
+        ]
+
     @staticmethod
     def _row_to_dict(row: tuple) -> dict:
         return {
@@ -181,8 +209,12 @@ class Orchestrator:
         self._dispatch_lock = asyncio.Lock()
 
     def bootstrap(self) -> None:
-        """3-wake bootstrap: request_kp → create_and_add → welcome."""
+        """3-wake bootstrap: request_kp → create_and_add → welcome.
+        Also registers task:event handler so the worker can stream events back."""
         self.client.team_init(self.team_id, bearer=self.bearer)
+        self.client.register(
+            self.team_id, self.bearer, bearer=self.bearer, context_id=EVENT_CONTEXT_ID
+        )
         logger.info("bootstrap step 1: requesting worker key package")
         kp_resp = self._dispatch_blocking(
             context_id=BOOTSTRAP_CONTEXT_ID,
@@ -234,10 +266,13 @@ class Orchestrator:
             self.db.mark_running(task["id"])
             logger.info("running task %s: %s", task["id"][:8], task["description"][:80])
             try:
-                plaintext = json.dumps({"task": task["description"]}).encode("utf-8")
-                ciphertext = self.session.encrypt(plaintext)
+                payload_obj = {
+                    "task": task["description"],
+                    "task_id": task["id"],
+                    "orchestrator_bearer": self.bearer,
+                }
+                ciphertext = self.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
                 logger.info("dispatching task %s (%d bytes ciphertext)", task["id"][:8], len(ciphertext))
-                # dispatch_wake is sync; offload to thread pool so we don't block the event loop
                 response_bytes = await asyncio.to_thread(
                     self._dispatch_blocking,
                     context_id=TASK_CONTEXT_ID,
@@ -259,6 +294,49 @@ class Orchestrator:
                 await asyncio.sleep(1.0)
                 continue
             await self.process_task(task)
+
+    async def run_event_poller_loop(self) -> None:
+        """Long-poll the orchestrator inbox for task:event wakes from the worker;
+        decrypt + persist each one. Events come in MLS-encrypted; the session
+        handles both directions since it's the same group."""
+        while True:
+            try:
+                # Long-poll with a short wait so a stuck worker doesn't tie us up.
+                resp = await asyncio.to_thread(
+                    self.client.read_inbox,
+                    self.team_id,
+                    self.bearer,
+                    bearer=self.bearer,
+                    wait_seconds=15,
+                )
+            except Exception as exc:
+                logger.warning("inbox poll error: %s; sleeping 2s", exc)
+                await asyncio.sleep(2)
+                continue
+            wakes = resp.get("wakes", [])
+            for wake in wakes:
+                wake_id = wake["wake_id"]
+                context_id = wake.get("context_id", "?")
+                if context_id != EVENT_CONTEXT_ID:
+                    logger.warning("unexpected wake context %s; ignoring", context_id)
+                    # Complete it anyway so it doesn't sit in the inbox forever.
+                    await asyncio.to_thread(
+                        self.client.complete_wake,
+                        self.team_id, wake_id, b64url_no_pad(b"{}"), bearer=self.bearer,
+                    )
+                    continue
+                try:
+                    ciphertext = b64url_decode(wake["payload"])
+                    plaintext = self.session.decrypt(ciphertext).decode("utf-8")
+                    msg = json.loads(plaintext)
+                    self.db.insert_event(msg["task_id"], msg["seq"], msg["event"])
+                except Exception as exc:
+                    logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
+                # Always ack the wake (worker doesn't read the body anyway).
+                await asyncio.to_thread(
+                    self.client.complete_wake,
+                    self.team_id, wake_id, b64url_no_pad(b"{}"), bearer=self.bearer,
+                )
 
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
@@ -290,16 +368,19 @@ async def lifespan(app: FastAPI):
     state["orchestrator"] = orchestrator
     state["db"] = db
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
+    event_task = asyncio.create_task(orchestrator.run_event_poller_loop())
     state["processor_task"] = processor_task
-    logger.info("ready; processor loop started")
+    state["event_task"] = event_task
+    logger.info("ready; processor + event-poller loops started")
     try:
         yield
     finally:
-        processor_task.cancel()
-        try:
-            await processor_task
-        except asyncio.CancelledError:
-            pass
+        for t in (processor_task, event_task):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Tally Orchestrator", lifespan=lifespan)
@@ -328,6 +409,16 @@ async def get_task(task_id: str) -> TaskResponse:
 @app.get("/tasks", response_model=list[TaskResponse])
 async def list_tasks(limit: int = 100) -> list[TaskResponse]:
     return [TaskResponse(**t) for t in state["db"].list_tasks(limit=limit)]
+
+
+@app.get("/tasks/{task_id}/events")
+async def get_task_events(task_id: str, since_seq: int = -1) -> list[dict]:
+    """Return events with seq > since_seq, in order. Used by the Flutter UI
+    to render a live timeline; the client passes the last seq it has seen."""
+    task = state["db"].get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"task {task_id} not found")
+    return state["db"].list_events(task_id, since_seq=since_seq)
 
 
 def main() -> None:
