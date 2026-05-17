@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare tunnel for tally.pronoic.dev → localhost:8080
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/cloudflared tunnel run tally-dev
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

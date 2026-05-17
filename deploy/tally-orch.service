@@ -1,0 +1,16 @@
+[Unit]
+Description=Tally Coding orchestration service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/Projects/pronoic/tally-coding/services/orchestrator
+EnvironmentFile=%h/.config/tally-orch/env
+ExecStart=%h/.local/bin/uv run tally-orch
+Restart=on-failure
+RestartSec=3
+# Keep stdout/stderr in the journal — `journalctl --user -u tally-orch -f`.
+
+[Install]
+WantedBy=default.target
