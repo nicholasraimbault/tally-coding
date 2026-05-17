@@ -36,8 +36,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from tally_coding_core.identity import bearer_from_pubkey, load_or_create_identity
 from tally_coding_core.mls import MlsSession
@@ -182,6 +183,40 @@ class Db:
         }
 
 
+class EventBus:
+    """In-memory per-task subscriber lists, used to push events to SSE clients
+    the moment they're persisted (instead of forcing the client to poll the DB).
+    Subscriptions die when the asyncio Queue is GC'd or the endpoint cleans up
+    explicitly in its finally block."""
+
+    def __init__(self) -> None:
+        self._subs: dict[str, list[asyncio.Queue]] = {}
+        self._lock = asyncio.Lock()
+
+    async def subscribe(self, task_id: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        async with self._lock:
+            self._subs.setdefault(task_id, []).append(q)
+        return q
+
+    async def unsubscribe(self, task_id: str, q: asyncio.Queue) -> None:
+        async with self._lock:
+            if task_id in self._subs:
+                self._subs[task_id] = [x for x in self._subs[task_id] if x is not q]
+                if not self._subs[task_id]:
+                    del self._subs[task_id]
+
+    async def publish(self, task_id: str, event: dict) -> None:
+        async with self._lock:
+            queues = list(self._subs.get(task_id, []))
+        for q in queues:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                # Slow subscriber; drop to keep the bus responsive.
+                logger.warning("dropped event for task %s subscriber (queue full)", task_id[:8])
+
+
 class Orchestrator:
     """Holds the MLS session with the worker; dispatches encrypted task wakes."""
 
@@ -194,11 +229,13 @@ class Orchestrator:
         identity_path: str,
         mls_state_dir: str,
         db: Db,
+        event_bus: EventBus,
     ) -> None:
         self.tally_url = tally_url
         self.team_id = team_id
         self.worker_identity = worker_identity
         self.db = db
+        self.event_bus = event_bus
         Path(mls_state_dir).mkdir(parents=True, exist_ok=True)
         _privkey, pubkey = load_or_create_identity(identity_path)
         self.pubkey = pubkey
@@ -330,6 +367,12 @@ class Orchestrator:
                     plaintext = self.session.decrypt(ciphertext).decode("utf-8")
                     msg = json.loads(plaintext)
                     self.db.insert_event(msg["task_id"], msg["seq"], msg["event"])
+                    # Push to any live SSE subscribers for this task. Format mirrors
+                    # the GET /events response: includes seq + received_at + event fields.
+                    await self.event_bus.publish(
+                        msg["task_id"],
+                        {"seq": msg["seq"], "received_at": time.time(), **msg["event"]},
+                    )
                 except Exception as exc:
                     logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
                 # Always ack the wake (worker doesn't read the body anyway).
@@ -355,6 +398,7 @@ async def lifespan(app: FastAPI):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     db = Db(db_path)
+    event_bus = EventBus()
     orchestrator = Orchestrator(
         tally_url=tally_url,
         team_id=team_id,
@@ -362,11 +406,13 @@ async def lifespan(app: FastAPI):
         identity_path=identity_path,
         mls_state_dir=mls_state_dir,
         db=db,
+        event_bus=event_bus,
     )
     logger.info("bootstrapping MLS session with worker %s", worker_identity[:12])
     await asyncio.to_thread(orchestrator.bootstrap)
     state["orchestrator"] = orchestrator
     state["db"] = db
+    state["event_bus"] = event_bus
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
     event_task = asyncio.create_task(orchestrator.run_event_poller_loop())
     state["processor_task"] = processor_task
@@ -413,12 +459,54 @@ async def list_tasks(limit: int = 100) -> list[TaskResponse]:
 
 @app.get("/tasks/{task_id}/events")
 async def get_task_events(task_id: str, since_seq: int = -1) -> list[dict]:
-    """Return events with seq > since_seq, in order. Used by the Flutter UI
-    to render a live timeline; the client passes the last seq it has seen."""
+    """Return events with seq > since_seq, in order. One-shot read (used by
+    clients that don't speak SSE). Live clients should use /stream instead."""
     task = state["db"].get_task(task_id)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     return state["db"].list_events(task_id, since_seq=since_seq)
+
+
+@app.get("/tasks/{task_id}/stream")
+async def stream_task_events(task_id: str, request: Request, since_seq: int = -1):
+    """Server-Sent Events stream. Emits historical events with seq > since_seq
+    first (so reconnects don't lose anything), then live events as they arrive
+    via the EventBus. sse_starlette handles client-disconnect detection +
+    keep-alive comments."""
+    db: Db = state["db"]
+    bus: EventBus = state["event_bus"]
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"task {task_id} not found")
+
+    async def event_source():
+        # Replay everything we already have.
+        last_seq = since_seq
+        for ev in db.list_events(task_id, since_seq=since_seq):
+            yield {"event": "task_event", "data": json.dumps(ev)}
+            last_seq = ev["seq"]
+        # Subscribe + stream live events.
+        queue = await bus.subscribe(task_id)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    # Skip events we already replayed (race when subscribing after
+                    # the poller publishes but before we walked the DB).
+                    if ev["seq"] <= last_seq:
+                        continue
+                    yield {"event": "task_event", "data": json.dumps(ev)}
+                    last_seq = ev["seq"]
+                except asyncio.TimeoutError:
+                    # Heartbeat keeps idle connections from being killed by
+                    # intermediaries (proxies, load balancers).
+                    yield {"event": "heartbeat", "data": ""}
+        finally:
+            await bus.unsubscribe(task_id, queue)
+
+    return EventSourceResponse(event_source())
 
 
 def main() -> None:

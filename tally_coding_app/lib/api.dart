@@ -70,7 +70,8 @@ class TallyOrchClient {
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  /// Fetch events emitted by the worker for this task, with seq > sinceSeq.
+  /// One-shot fetch of events with seq > sinceSeq. Used as a fallback when SSE
+  /// is unavailable; live clients should prefer [streamEvents].
   Future<List<Map<String, dynamic>>> listEvents(String taskId, {int sinceSeq = -1}) async {
     final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'));
     if (resp.statusCode != 200) {
@@ -78,6 +79,54 @@ class TallyOrchClient {
     }
     final List<dynamic> raw = jsonDecode(resp.body);
     return raw.cast<Map<String, dynamic>>();
+  }
+
+  /// Server-Sent Events stream of task events. Yields the same dicts that
+  /// [listEvents] returns. The stream stays open until the task terminates or
+  /// the consumer cancels it. Parses SSE frames manually (one less dep than
+  /// pulling in a package that pins an older `http`).
+  Stream<Map<String, dynamic>> streamEvents(String taskId, {int sinceSeq = -1}) async* {
+    final req = http.Request('GET', baseUrl.resolve('/tasks/$taskId/stream?since_seq=$sinceSeq'))
+      ..headers['accept'] = 'text/event-stream'
+      ..headers['cache-control'] = 'no-cache';
+    final resp = await _http.send(req);
+    if (resp.statusCode != 200) {
+      throw Exception('stream connect failed: ${resp.statusCode}');
+    }
+    String buffer = '';
+    String? currentEventName;
+    final dataLines = <String>[];
+
+    await for (final chunk in resp.stream.transform(utf8.decoder)) {
+      buffer += chunk;
+      while (true) {
+        final nl = buffer.indexOf('\n');
+        if (nl < 0) break;
+        var line = buffer.substring(0, nl);
+        buffer = buffer.substring(nl + 1);
+        if (line.endsWith('\r')) line = line.substring(0, line.length - 1);
+        if (line.isEmpty) {
+          // End of one SSE message. Emit if it's a task_event with data.
+          if (currentEventName == 'task_event' && dataLines.isNotEmpty) {
+            final data = dataLines.join('\n');
+            try {
+              yield jsonDecode(data) as Map<String, dynamic>;
+            } catch (_) {
+              // Malformed; skip.
+            }
+          }
+          currentEventName = null;
+          dataLines.clear();
+        } else if (line.startsWith(':')) {
+          // Comment / keepalive — ignore.
+        } else if (line.startsWith('event:')) {
+          currentEventName = line.substring(6).trimLeft();
+        } else if (line.startsWith('data:')) {
+          dataLines.add(line.substring(5).trimLeft());
+        }
+        // Other field names (id:, retry:) ignored for our minimal use.
+      }
+    }
   }
 
   void close() => _http.close();

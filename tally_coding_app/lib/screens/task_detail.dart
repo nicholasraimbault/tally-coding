@@ -50,42 +50,59 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
   final List<Map<String, dynamic>> _events = [];
   int _lastSeq = -1;
   String? _error;
-  Timer? _pollTimer;
+  Timer? _statusTimer;
+  StreamSubscription<Map<String, dynamic>>? _eventsSub;
 
   @override
   void initState() {
     super.initState();
-    _poll();
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (_task?.isTerminal == true && _events.isNotEmpty) {
-        _pollTimer?.cancel();
+    _pollStatus();
+    // Status changes slowly (pending → running → terminal); a slow poll is fine.
+    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_task?.isTerminal == true) {
+        _statusTimer?.cancel();
         return;
       }
-      _poll();
+      _pollStatus();
     });
+    _connectEventStream();
   }
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    _statusTimer?.cancel();
+    _eventsSub?.cancel();
     super.dispose();
   }
 
-  Future<void> _poll() async {
+  void _connectEventStream() {
+    _eventsSub?.cancel();
+    _eventsSub = widget.client.streamEvents(widget.taskId, sinceSeq: _lastSeq).listen(
+      (ev) {
+        if (!mounted) return;
+        setState(() {
+          _events.add(ev);
+          _lastSeq = ev['seq'] as int;
+        });
+      },
+      onError: (e) {
+        if (!mounted) return;
+        setState(() => _error = 'event stream: $e');
+        // Reconnect after a short pause.
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) _connectEventStream();
+        });
+      },
+      cancelOnError: true,
+    );
+  }
+
+  Future<void> _pollStatus() async {
     try {
-      final results = await Future.wait([
-        widget.client.getTask(widget.taskId),
-        widget.client.listEvents(widget.taskId, sinceSeq: _lastSeq),
-      ]);
+      final t = await widget.client.getTask(widget.taskId);
       if (!mounted) return;
-      final t = results[0] as Task;
-      final newEvents = results[1] as List<Map<String, dynamic>>;
       setState(() {
         _task = t;
-        if (newEvents.isNotEmpty) {
-          _events.addAll(newEvents);
-          _lastSeq = newEvents.last['seq'] as int;
-        }
         _error = null;
       });
     } catch (e) {
@@ -220,7 +237,7 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text('Task ${widget.taskId.substring(0, 8)}'),
-        actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _poll)],
+        actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _pollStatus)],
       ),
       body: t == null
           ? Center(
