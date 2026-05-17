@@ -296,6 +296,12 @@ class Orchestrator:
         group_id = f"orch-worker-{team_id}".encode("utf-8")
         self.session = MlsSession(data_dir=mls_state_dir, identity=pubkey, group_id=group_id)
         self._dispatch_lock = asyncio.Lock()
+        # Sprint 13: runtime auto-rotation. Track consecutive task failures so
+        # we can detect a dead worker and trigger a rotate. Threshold tunable
+        # via TALLY_AUTO_ROTATE_THRESHOLD for shorter test cycles.
+        self._consecutive_failures = 0
+        self._auto_rotate_threshold = int(os.environ.get("TALLY_AUTO_ROTATE_THRESHOLD", "3"))
+        self._rotating = False
 
     def bootstrap(self) -> None:
         """3-wake bootstrap: request_kp → create_and_add → welcome.
@@ -375,17 +381,29 @@ class Orchestrator:
                     self._dispatch_blocking,
                     context_id=TASK_CONTEXT_ID,
                     payload=ciphertext,
-                    timeout_seconds=300,
+                    timeout_seconds=int(os.environ.get("TALLY_TASK_DISPATCH_TIMEOUT", "300")),
                 )
                 response_plain = self.session.decrypt(response_bytes).decode("utf-8")
                 result = json.loads(response_plain)
                 self.db.mark_completed(task["id"], result)
                 await self._publish_status(task["id"], "completed", {"success": result.get("success")})
                 logger.info("task %s completed: success=%s", task["id"][:8], result.get("success"))
+                self._consecutive_failures = 0
             except Exception as exc:
                 logger.exception("task %s failed", task["id"][:8])
                 self.db.mark_failed(task["id"], str(exc))
                 await self._publish_status(task["id"], "failed", {"error": str(exc)})
+                self._consecutive_failures += 1
+                if (
+                    self._consecutive_failures >= self._auto_rotate_threshold
+                    and not self._rotating
+                ):
+                    logger.warning(
+                        "auto-rotating worker after %d consecutive task failures",
+                        self._consecutive_failures,
+                    )
+                    self._rotating = True
+                    asyncio.create_task(self._trigger_auto_rotate())
 
     async def list_workspace(self, task_id: str) -> dict:
         """Dispatch a fs:list wake and return the decrypted response dict."""
@@ -412,6 +430,32 @@ class Orchestrator:
                 timeout_seconds=30,
             )
             return json.loads(self.session.decrypt(resp).decode("utf-8"))
+
+    async def _trigger_auto_rotate(self) -> None:
+        """Triggered when consecutive task failures hit threshold. Provision a
+        fresh worker, persist as active (retires prior), schedule background
+        CVM delete, exit non-zero so systemd respawns into clean state."""
+        pool: WorkerPool | None = state.get("worker_pool")
+        if pool is None:
+            logger.error("auto-rotate requested but worker pool not initialised")
+            return
+        try:
+            current = self.db.get_active_worker()
+            logger.info("auto-rotate: provisioning new worker")
+            new = await asyncio.to_thread(pool.provision)
+            assert new.identity is not None
+            self.db.upsert_active_worker(
+                cvm_id=new.cvm_id, app_id=new.app_id,
+                team_id=new.team_id, identity=new.identity,
+            )
+            if current:
+                asyncio.create_task(asyncio.to_thread(pool.delete, current["cvm_id"]))
+            logger.info("auto-rotate: new worker %s persisted; exiting for respawn", new.cvm_id[:8])
+            await asyncio.sleep(2)
+            os._exit(1)
+        except Exception:
+            logger.exception("auto-rotate failed; clearing flag so a later attempt can fire")
+            self._rotating = False
 
     async def run_processor_loop(self) -> None:
         while True:
@@ -553,19 +597,47 @@ async def lifespan(app: FastAPI):
     state["db"] = db
     state["event_bus"] = event_bus
 
-    team_id, worker_identity = await _resolve_worker(db, pool)
-
-    orchestrator = Orchestrator(
-        tally_url=tally_url,
-        team_id=team_id,
-        worker_identity=worker_identity,
-        identity_path=identity_path,
-        mls_state_dir=mls_state_dir,
-        db=db,
-        event_bus=event_bus,
-    )
-    logger.info("bootstrapping MLS session with worker %s", worker_identity[:12])
-    await asyncio.to_thread(orchestrator.bootstrap)
+    # Bootstrap with up to 3 attempts. A failure here usually means the worker
+    # CVM stored in the DB is dead (deleted out-of-band, crashed, network
+    # partitioned). Retire it and let the next attempt fall through to
+    # auto-provisioning. Each MLS state file is per-team — wipe the dir between
+    # attempts so a stale group on disk doesn't poison the new bootstrap.
+    orchestrator: Orchestrator | None = None
+    for attempt in range(1, 4):
+        team_id, worker_identity = await _resolve_worker(db, pool)
+        if attempt > 1:
+            try:
+                import shutil
+                shutil.rmtree(mls_state_dir, ignore_errors=True)
+                Path(mls_state_dir).mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                logger.warning("could not wipe MLS state dir: %s", exc)
+        orchestrator = Orchestrator(
+            tally_url=tally_url,
+            team_id=team_id,
+            worker_identity=worker_identity,
+            identity_path=identity_path,
+            mls_state_dir=mls_state_dir,
+            db=db,
+            event_bus=event_bus,
+        )
+        logger.info(
+            "bootstrap attempt %d/3 with worker %s",
+            attempt, worker_identity[:12],
+        )
+        try:
+            await asyncio.to_thread(orchestrator.bootstrap)
+            break
+        except Exception as exc:
+            logger.warning("bootstrap attempt %d/3 failed: %s", attempt, exc)
+            stale = db.get_active_worker()
+            if stale:
+                db.retire_worker(stale["cvm_id"])
+                asyncio.create_task(asyncio.to_thread(pool.delete, stale["cvm_id"]))
+                logger.warning("retired stale worker %s; will re-resolve", stale["cvm_id"][:8])
+            if attempt == 3:
+                raise
+    assert orchestrator is not None
     state["orchestrator"] = orchestrator
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
     event_task = asyncio.create_task(orchestrator.run_event_poller_loop())
