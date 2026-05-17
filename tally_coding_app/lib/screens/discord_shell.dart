@@ -1,0 +1,640 @@
+/// Sprint 25: Discord-shaped top-level UI.
+///
+///   ┌───┬──────────┬──────────────────────────┬──────────┐
+///   │ S │ #general │  agent timeline / chat   │ MEMBERS  │
+///   │ E │ #task-1  │                          │          │
+///   │ R │ #task-2  │                          │ ✨ Tally │
+///   │ V │          │                          │ 📋 Pl... │
+///   │ E │          │                          │ 👤 Co... │
+///   │ R │          │                          │          │
+///   └───┴──────────┴──────────────────────────┴──────────┘
+///     ↑      ↑                  ↑                  ↑
+///   teams  channels       channel content      members
+///
+/// One team for now ("My Team"). The selected channel drives both the
+/// main pane and the members sidebar.
+library;
+
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import '../agent_roles.dart';
+import '../api.dart';
+import '../main.dart';
+import 'general_channel.dart';
+import 'task_channel.dart';
+
+/// The channel selection in the shell. `general` is the sentinel for
+/// the architect chat; otherwise it's a task ID.
+sealed class ChannelSelection {
+  const ChannelSelection();
+}
+
+class GeneralSelected extends ChannelSelection {
+  const GeneralSelected();
+}
+
+class TaskSelected extends ChannelSelection {
+  final String taskId;
+  const TaskSelected(this.taskId);
+}
+
+class DiscordShellScreen extends StatefulWidget {
+  final TallyOrchClient client;
+  /// Optional: when set, the shell opens with this task channel selected
+  /// instead of #general. Used by the dev/screenshot deep-link.
+  final String? initialTaskId;
+  const DiscordShellScreen({super.key, required this.client, this.initialTaskId});
+
+  @override
+  State<DiscordShellScreen> createState() => _DiscordShellScreenState();
+}
+
+class _DiscordShellScreenState extends State<DiscordShellScreen> {
+  List<Task> _tasks = const [];
+  bool _loading = true;
+  String? _error;
+  Timer? _refresh;
+  late ChannelSelection _selected;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = widget.initialTaskId != null
+        ? TaskSelected(widget.initialTaskId!)
+        : const GeneralSelected();
+    _fetch();
+    _refresh = Timer.periodic(const Duration(seconds: 4), (_) => _fetch());
+  }
+
+  @override
+  void dispose() {
+    _refresh?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _fetch() async {
+    try {
+      final tasks = await widget.client.listTasks(limit: 200);
+      if (!mounted) return;
+      setState(() {
+        _tasks = _sortForChannelList(tasks);
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  /// Active first (running > pending > recovering), then completed/failed
+  /// in reverse-chronological order — matches the locked UX memo
+  /// ("completed below active").
+  List<Task> _sortForChannelList(List<Task> tasks) {
+    int statusRank(String s) => switch (s) {
+          'running' => 0,
+          'pending' => 1,
+          'recovering' => 2,
+          _ => 3,
+        };
+    final sorted = [...tasks];
+    sorted.sort((a, b) {
+      final r = statusRank(a.status).compareTo(statusRank(b.status));
+      if (r != 0) return r;
+      return b.createdAt.compareTo(a.createdAt);
+    });
+    return sorted;
+  }
+
+  /// Called by GeneralChannelScreen after the user submits a task and
+  /// the architect responds. Refresh + jump to the new channel.
+  Future<void> _onTaskSubmitted(Task t) async {
+    await _fetch();
+    if (!mounted) return;
+    setState(() => _selected = TaskSelected(t.id));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: Row(
+        children: [
+          _ServerRail(onSignOut: () => resetTallyConfig(context)),
+          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+          _ChannelList(
+            tasks: _tasks,
+            selected: _selected,
+            loading: _loading && _tasks.isEmpty,
+            error: _error,
+            onSelect: (sel) => setState(() => _selected = sel),
+            onRetry: _fetch,
+          ),
+          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+          Expanded(child: _mainPane()),
+          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+          _MembersPanel(selected: _selected, tasks: _tasks),
+        ],
+      ),
+    );
+  }
+
+  Widget _mainPane() {
+    return switch (_selected) {
+      GeneralSelected() => GeneralChannelScreen(
+          client: widget.client,
+          recentTasks: _tasks,
+          onTaskSubmitted: _onTaskSubmitted,
+        ),
+      TaskSelected(taskId: final id) => TaskChannelScreen(
+          key: ValueKey(id),
+          client: widget.client,
+          taskId: id,
+        ),
+    };
+  }
+}
+
+/// Leftmost narrow rail. One server (this team) + a settings button.
+class _ServerRail extends StatelessWidget {
+  final VoidCallback onSignOut;
+  const _ServerRail({required this.onSignOut});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 72,
+      color: const Color(0xFF1E1F22),
+      child: Column(
+        children: [
+          const SizedBox(height: 12),
+          _ServerTile(
+            label: 'T',
+            tooltip: 'My Team',
+            selected: true,
+            background: const Color(0xFF7C5CFC),
+          ),
+          const SizedBox(height: 8),
+          const Divider(color: Color(0xFF2B2D31), thickness: 2, indent: 16, endIndent: 16),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Sign out / reconnect',
+            icon: const Icon(Icons.logout, color: Color(0xFF99AAB5)),
+            onPressed: onSignOut,
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+}
+
+class _ServerTile extends StatelessWidget {
+  final String label;
+  final String tooltip;
+  final bool selected;
+  final Color background;
+  const _ServerTile({
+    required this.label,
+    required this.tooltip,
+    required this.selected,
+    required this.background,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          color: background,
+          borderRadius: BorderRadius.circular(selected ? 14 : 24),
+        ),
+        alignment: Alignment.center,
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 18,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Channel list (column 2).
+class _ChannelList extends StatelessWidget {
+  final List<Task> tasks;
+  final ChannelSelection selected;
+  final bool loading;
+  final String? error;
+  final ValueChanged<ChannelSelection> onSelect;
+  final VoidCallback onRetry;
+  const _ChannelList({
+    required this.tasks,
+    required this.selected,
+    required this.loading,
+    required this.error,
+    required this.onSelect,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 240,
+      color: const Color(0xFF2B2D31),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Text(
+                  'My Team',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+                const Spacer(),
+                if (loading)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+          ),
+          Container(height: 1, color: const Color(0xFF1E1F22)),
+          const SizedBox(height: 8),
+          _ChannelTile(
+            icon: const Text('✨', style: TextStyle(fontSize: 16)),
+            label: 'general',
+            selected: selected is GeneralSelected,
+            onTap: () => onSelect(const GeneralSelected()),
+          ),
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+            child: Text(
+              'TASKS',
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: const Color(0xFF8E9297),
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+            ),
+          ),
+          Expanded(child: _taskListBody(context)),
+        ],
+      ),
+    );
+  }
+
+  Widget _taskListBody(BuildContext context) {
+    if (error != null && tasks.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            const Icon(Icons.cloud_off, color: Color(0xFF99AAB5)),
+            const SizedBox(height: 8),
+            Text(error!, style: const TextStyle(color: Color(0xFF99AAB5), fontSize: 11)),
+            const SizedBox(height: 8),
+            OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
+          ],
+        ),
+      );
+    }
+    if (tasks.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Text(
+          'No tasks yet.\nType in #general to start one.',
+          style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+        ),
+      );
+    }
+    return ListView.builder(
+      itemCount: tasks.length,
+      itemBuilder: (context, i) {
+        final t = tasks[i];
+        return _ChannelTile(
+          icon: _statusGlyph(t.status),
+          label: t.channelTitle,
+          subtitle: '#${t.id.substring(0, 8)} · ${t.status}',
+          selected: selected is TaskSelected && (selected as TaskSelected).taskId == t.id,
+          onTap: () => onSelect(TaskSelected(t.id)),
+        );
+      },
+    );
+  }
+
+  Widget _statusGlyph(String status) {
+    final (icon, color) = switch (status) {
+      'running' => (Icons.play_arrow, Color(0xFF5865F2)),
+      'pending' => (Icons.schedule, Color(0xFFFEE75C)),
+      'recovering' => (Icons.refresh, Color(0xFFFAA61A)),
+      'completed' => (Icons.check_circle, Color(0xFF57F287)),
+      'failed' => (Icons.error, Color(0xFFED4245)),
+      _ => (Icons.tag, Color(0xFF8E9297)),
+    };
+    return Icon(icon, color: color, size: 14);
+  }
+}
+
+class _ChannelTile extends StatelessWidget {
+  final Widget icon;
+  final String label;
+  final String? subtitle;
+  final bool selected;
+  final VoidCallback onTap;
+  const _ChannelTile({
+    required this.icon,
+    required this.label,
+    this.subtitle,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Material(
+        color: selected ? const Color(0xFF404249) : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(
+              children: [
+                SizedBox(width: 20, child: Center(child: icon)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: selected ? Colors.white : const Color(0xFFC4C9CE),
+                          fontSize: 13,
+                          fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                        ),
+                      ),
+                      if (subtitle != null)
+                        Text(
+                          subtitle!,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xFF8E9297),
+                            fontSize: 10,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Rightmost members panel.
+class _MembersPanel extends StatelessWidget {
+  final ChannelSelection selected;
+  final List<Task> tasks;
+  const _MembersPanel({required this.selected, required this.tasks});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 240,
+      color: const Color(0xFF2B2D31),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Text(
+              switch (selected) {
+                GeneralSelected() => 'MEMBERS',
+                TaskSelected() => 'AGENTS',
+              },
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: const Color(0xFF8E9297),
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+            ),
+          ),
+          Expanded(child: _body(context)),
+        ],
+      ),
+    );
+  }
+
+  Widget _body(BuildContext context) {
+    if (selected is GeneralSelected) {
+      return ListView(
+        children: const [
+          _MemberTile(
+            role: tallyMember,
+            status: 'online',
+            statusColor: Color(0xFF57F287),
+          ),
+        ],
+      );
+    }
+    final taskId = (selected as TaskSelected).taskId;
+    final task = tasks.where((t) => t.id == taskId).cast<Task?>().firstOrNull;
+    final agents = _agentListFor(task);
+    if (agents.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Text(
+          'Tally is still picking the team.',
+          style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+        ),
+      );
+    }
+    return ListView.builder(
+      itemCount: agents.length,
+      itemBuilder: (context, i) {
+        final a = agents[i];
+        return _MemberTile(
+          role: agentRoleOf(a.roleName),
+          status: a.status,
+          statusColor: switch (a.status) {
+            'working' => const Color(0xFF5865F2),
+            'done' => const Color(0xFF57F287),
+            'failed' => const Color(0xFFED4245),
+            _ => const Color(0xFF8E9297),
+          },
+          model: a.model,
+        );
+      },
+    );
+  }
+
+  /// Derive an "agent in this team" list from the task's team_spec +
+  /// the result's per-agent rollup. Sprint 25 builds the list from
+  /// `team_spec.agents[]` (the architect's plan); status is overlaid
+  /// from `result.agents[i]` when the task has finished a step.
+  List<_AgentRow> _agentListFor(Task? task) {
+    if (task == null) return const [];
+    final spec = task.teamSpec;
+    final rollup = task.result?['agents'] as List<dynamic>?;
+    final completedRoles = <int, bool>{
+      for (final r in rollup ?? const []) (r as Map<String, dynamic>)['agent_idx'] as int: true,
+    };
+    final modelByIdx = <int, String>{
+      for (final r in rollup ?? const [])
+        (r as Map<String, dynamic>)['agent_idx'] as int: r['model'] as String? ?? '',
+    };
+
+    final planned = (spec?['agents'] as List<dynamic>?) ?? const [];
+    if (planned.isNotEmpty) {
+      return [
+        for (var i = 0; i < planned.length; i++)
+          _AgentRow(
+            roleName: (planned[i] as Map<String, dynamic>)['role'] as String,
+            model: (planned[i] as Map<String, dynamic>)['model'] as String?
+                ?? modelByIdx[i] ?? '',
+            status: _statusFor(i, task.status, completedRoles, planned.length),
+          ),
+      ];
+    }
+    // Fallback: derive from result.agents (terminal tasks without a team_spec).
+    return [
+      for (final r in rollup ?? const [])
+        _AgentRow(
+          roleName: (r as Map<String, dynamic>)['role'] as String? ?? '?',
+          model: r['model'] as String? ?? '',
+          status: (r['result'] as Map<String, dynamic>?)?['success'] == true ? 'done' : 'failed',
+        ),
+    ];
+  }
+
+  String _statusFor(int idx, String taskStatus, Map<int, bool> done, int total) {
+    if (done[idx] == true) return 'done';
+    if (taskStatus == 'completed') return 'done';
+    if (taskStatus == 'failed') return idx == done.length ? 'failed' : 'idle';
+    if (taskStatus == 'running' && idx == done.length) return 'working';
+    return 'idle';
+  }
+}
+
+class _AgentRow {
+  final String roleName;
+  final String model;
+  final String status;
+  _AgentRow({required this.roleName, required this.model, required this.status});
+}
+
+class _MemberTile extends StatelessWidget {
+  final AgentRole role;
+  final String status;
+  final Color statusColor;
+  final String? model;
+  const _MemberTile({
+    required this.role,
+    required this.status,
+    required this.statusColor,
+    this.model,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () {}, // future: @-mention insert
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(
+              children: [
+                Stack(
+                  alignment: Alignment.bottomRight,
+                  children: [
+                    Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: role.tint.withValues(alpha: 0.18),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      alignment: Alignment.center,
+                      child: Text(role.glyph, style: const TextStyle(fontSize: 16)),
+                    ),
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: statusColor,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: const Color(0xFF2B2D31), width: 2),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        role.name,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Text(
+                        model?.isNotEmpty == true
+                            ? model!.split('/').last
+                            : role.tagline,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFF8E9297),
+                          fontSize: 10,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -16,6 +16,10 @@ class Task {
   final String? error;
   final double createdAt;
   final double updatedAt;
+  /// Sprint 25: the architect-picked team for this task (null on legacy
+  /// single-agent submissions). Shape:
+  /// `{agents: [{role, model, spec, agent_idx}], workflow, reasoning}`.
+  final Map<String, dynamic>? teamSpec;
 
   Task({
     required this.id,
@@ -25,6 +29,7 @@ class Task {
     this.error,
     required this.createdAt,
     required this.updatedAt,
+    this.teamSpec,
   });
 
   factory Task.fromJson(Map<String, dynamic> j) => Task(
@@ -35,9 +40,19 @@ class Task {
         error: j['error'] as String?,
         createdAt: (j['created_at'] as num).toDouble(),
         updatedAt: (j['updated_at'] as num).toDouble(),
+        teamSpec: j['team_spec'] as Map<String, dynamic>?,
       );
 
   bool get isTerminal => status == 'completed' || status == 'failed';
+
+  /// One-line title for use in the channel list. First sentence of the
+  /// description, capped at ~50 chars, with `…` if truncated.
+  String get channelTitle {
+    final firstLine = description.split(RegExp(r'[\n.]')).first.trim();
+    final t = firstLine.isEmpty ? description.trim() : firstLine;
+    if (t.length <= 50) return t;
+    return '${t.substring(0, 50)}…';
+  }
 }
 
 class TallyOrchClient {

@@ -147,6 +147,9 @@ class TaskResponse(BaseModel):
     error: str | None = None
     created_at: float
     updated_at: float
+    # Sprint 25: Discord-shaped UI needs the architect's team spec to render
+    # the members sidebar. Null for legacy single-agent tasks.
+    team_spec: dict | None = None
 
 
 class Db:
@@ -257,7 +260,7 @@ class Db:
                 (name, desc, model, json.dumps(tools), prompt),
             )
 
-    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity"
+    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity, team_spec"
 
     def create_task(self, description: str, team_spec: dict | None = None) -> str:
         """Sprint 23: team_spec can be set atomically with task creation so
@@ -561,6 +564,7 @@ class Db:
             "created_at": row[5],
             "updated_at": row[6],
             "worker_identity": row[7] if len(row) > 7 else None,
+            "team_spec": json.loads(row[8]) if len(row) > 8 and row[8] else None,
         }
 
 

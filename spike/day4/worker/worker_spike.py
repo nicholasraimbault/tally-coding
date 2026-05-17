@@ -114,9 +114,16 @@ def run_event_emitter(
     bearer: str,
     target_identity: str,
     task_id: str,
+    agent_idx: int | None = None,
+    agent_role: str | None = None,
+    agent_model: str | None = None,
 ) -> None:
     """Background thread: pulls events off the queue, MLS-encrypts each one,
     dispatches as a task:event wake to the orchestrator's bearer.
+
+    Sprint 25: each event gets stamped with agent_idx / agent_role / agent_model
+    so the Flutter UI can group the timeline by which agent emitted what.
+    Single-agent legacy tasks emit `None` for all three.
 
     Wire envelope (sprint 14): plaintext JSON wrapper around the MLS ciphertext
     so an orchestrator with N>1 worker sessions can route incoming events to
@@ -129,6 +136,14 @@ def run_event_emitter(
         if item is _EMITTER_SHUTDOWN:
             return
         try:
+            # Sprint 25: per-event agent attribution.
+            if agent_idx is not None:
+                item = {
+                    **item,
+                    "agent_idx": agent_idx,
+                    "agent_role": agent_role,
+                    "agent_model": agent_model,
+                }
             inner = json.dumps({"task_id": task_id, "seq": seq, "event": item}).encode("utf-8")
             ciphertext = session.encrypt(inner)
             envelope = {
@@ -423,6 +438,11 @@ def handle_task_wake(
                 "bearer": bearer,
                 "target_identity": orchestrator_bearer,
                 "task_id": task_id,
+                # Sprint 25: stamp every event so the Flutter timeline
+                # can group by agent.  None on legacy single-agent runs.
+                "agent_idx": agent_idx,
+                "agent_role": (agent_spec or {}).get("role"),
+                "agent_model": (agent_spec or {}).get("model"),
             },
             daemon=True,
             name="event-emitter",
