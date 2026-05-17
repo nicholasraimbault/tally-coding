@@ -47,6 +47,8 @@ from tally_coding_core.identity import bearer_from_pubkey, load_or_create_identi
 from tally_coding_core.mls import MlsSession
 from tally_coding_core.tally_workers import TallyWorkersClient
 
+from .worker_pool import WorkerInfo, WorkerPool
+
 logger = logging.getLogger("tally.orchestrator")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -75,6 +77,17 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (task_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, received_at);
+
+CREATE TABLE IF NOT EXISTS workers (
+    cvm_id      TEXT PRIMARY KEY,
+    app_id      TEXT,
+    team_id     TEXT NOT NULL,
+    identity    TEXT NOT NULL,
+    status      TEXT NOT NULL,   -- 'active' or 'retired'
+    created_at  REAL NOT NULL,
+    retired_at  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
 """
 
 
@@ -162,6 +175,40 @@ class Db:
         self._conn.execute(
             "INSERT OR IGNORE INTO events (task_id, seq, event_json, received_at) VALUES (?, ?, ?, ?)",
             (task_id, seq, json.dumps(event), time.time()),
+        )
+
+    # ── worker pool state ──────────────────────────────────────────────────
+
+    def upsert_active_worker(
+        self, *, cvm_id: str, app_id: str | None, team_id: str, identity: str
+    ) -> None:
+        # Only one 'active' worker at a time; demote any prior one first.
+        self._conn.execute(
+            "UPDATE workers SET status='retired', retired_at=? WHERE status='active'",
+            (time.time(),),
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO workers (cvm_id, app_id, team_id, identity, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?)",
+            (cvm_id, app_id, team_id, identity, time.time()),
+        )
+
+    def get_active_worker(self) -> dict | None:
+        row = self._conn.execute(
+            "SELECT cvm_id, app_id, team_id, identity, status, created_at, retired_at "
+            "FROM workers WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "cvm_id": row[0], "app_id": row[1], "team_id": row[2], "identity": row[3],
+            "status": row[4], "created_at": row[5], "retired_at": row[6],
+        }
+
+    def retire_worker(self, cvm_id: str) -> None:
+        self._conn.execute(
+            "UPDATE workers SET status='retired', retired_at=? WHERE cvm_id=?",
+            (time.time(), cvm_id),
         )
 
     def list_events(self, task_id: str, since_seq: int = -1) -> list[dict]:
@@ -460,19 +507,54 @@ async def require_token(
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 
+async def _resolve_worker(db: Db, pool: WorkerPool) -> tuple[str, str]:
+    """Decide which worker to bootstrap MLS with.
+
+    Order: explicit env override (TEAM_ID + WORKER_IDENTITY_B64) → previously
+    persisted active worker in the DB → auto-provision a new one. The
+    auto-provision path takes ~3-5 min (CVM cold-start), which is why we cache
+    in the DB across orchestrator restarts.
+    """
+    env_team = os.environ.get("TEAM_ID", "").strip()
+    env_id = os.environ.get("WORKER_IDENTITY_B64", "").strip()
+    if env_team and env_id:
+        logger.info("using worker from env: team=%s identity=%s...", env_team, env_id[:12])
+        return env_team, env_id
+
+    existing = db.get_active_worker()
+    if existing:
+        logger.info("reusing active worker %s from DB", existing["cvm_id"][:8])
+        return existing["team_id"], existing["identity"]
+
+    logger.info("no worker configured — auto-provisioning via phala CLI (may take ~3-5min)")
+    info = await asyncio.to_thread(pool.provision)
+    assert info.identity is not None
+    db.upsert_active_worker(
+        cvm_id=info.cvm_id, app_id=info.app_id,
+        team_id=info.team_id, identity=info.identity,
+    )
+    return info.team_id, info.identity
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tally_url = os.environ.get("TALLY_WORKERS_URL", "https://tally.nraimbault16.workers.dev")
-    team_id = os.environ["TEAM_ID"]
-    worker_identity = os.environ["WORKER_IDENTITY_B64"]
     identity_path = os.environ.get("ORCH_IDENTITY_PATH", "/tmp/tally-orch/orchestrator.key")
     mls_state_dir = os.environ.get("ORCH_MLS_STATE_DIR", "/tmp/tally-orch/mls-state")
     db_path = os.environ.get("ORCH_DB_PATH", "/tmp/tally-orch/tasks.db")
+    scripts_env = os.environ.get("SCRIPTS_ENV_PATH", str(Path(__file__).resolve().parents[3] / "scripts" / ".env"))
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     db = Db(db_path)
     state["api_token"] = _resolve_token(Path(db_path).parent)
     event_bus = EventBus()
+    pool = WorkerPool(scripts_env_path=scripts_env)
+    state["worker_pool"] = pool
+    state["db"] = db
+    state["event_bus"] = event_bus
+
+    team_id, worker_identity = await _resolve_worker(db, pool)
+
     orchestrator = Orchestrator(
         tally_url=tally_url,
         team_id=team_id,
@@ -485,8 +567,6 @@ async def lifespan(app: FastAPI):
     logger.info("bootstrapping MLS session with worker %s", worker_identity[:12])
     await asyncio.to_thread(orchestrator.bootstrap)
     state["orchestrator"] = orchestrator
-    state["db"] = db
-    state["event_bus"] = event_bus
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
     event_task = asyncio.create_task(orchestrator.run_event_poller_loop())
     state["processor_task"] = processor_task
@@ -619,6 +699,56 @@ async def read_task_file(task_id: str, path: str) -> dict:
     if "error" in resp:
         raise HTTPException(404, resp["error"])
     return resp
+
+
+@app.get("/admin/pool/status", dependencies=[Depends(require_token)])
+async def pool_status() -> dict:
+    """Return the active worker's metadata + uptime. Returns null if none."""
+    info = state["db"].get_active_worker()
+    if info is None:
+        return {"worker": None}
+    return {"worker": {**info, "uptime_seconds": time.time() - info["created_at"]}}
+
+
+@app.post("/admin/pool/rotate", dependencies=[Depends(require_token)])
+async def pool_rotate() -> dict:
+    """Provision a fresh worker, persist it as the active worker, delete the
+    old CVM, and exit non-zero so systemd respawns the orchestrator (which
+    then bootstraps MLS against the new worker on startup).
+
+    Returns 200 with the new worker info; the service exits ~2 s later. The
+    client should expect a connection reset shortly after this response."""
+    db: Db = state["db"]
+    pool: WorkerPool = state["worker_pool"]
+    current = db.get_active_worker()
+    logger.info("rotate: provisioning new worker (current=%s)",
+                current["cvm_id"][:8] if current else "none")
+    new = await asyncio.to_thread(pool.provision)
+    assert new.identity is not None
+    db.upsert_active_worker(
+        cvm_id=new.cvm_id, app_id=new.app_id,
+        team_id=new.team_id, identity=new.identity,
+    )
+    if current:
+        # Best-effort tear down of the prior CVM. Don't block the response on it.
+        asyncio.create_task(asyncio.to_thread(pool.delete, current["cvm_id"]))
+
+    # Schedule a non-zero exit so systemd respawns the service with the new
+    # worker on next bootstrap.
+    async def _exit_soon():
+        await asyncio.sleep(2)
+        logger.info("rotate: exiting for systemd respawn")
+        os._exit(1)
+    asyncio.create_task(_exit_soon())
+    return {
+        "new_worker": {
+            "cvm_id": new.cvm_id,
+            "team_id": new.team_id,
+            "identity": new.identity,
+        },
+        "old_worker": current,
+        "respawn_in_seconds": 2,
+    }
 
 
 def main() -> None:

@@ -92,6 +92,45 @@ def cmd_tail(args: argparse.Namespace) -> int:
     return tail_task(args, args.id)
 
 
+def cmd_pool_status(args: argparse.Namespace) -> int:
+    with _client(args) as c:
+        r = c.get("/admin/pool/status")
+    _handle_resp(r)
+    body = r.json()
+    w = body.get("worker")
+    if not w:
+        print("no active worker")
+        return 1
+    uptime = int(w.get("uptime_seconds", 0))
+    print(f"active worker:")
+    print(f"  cvm_id:   {w['cvm_id']}")
+    print(f"  team_id:  {w['team_id']}")
+    print(f"  identity: {w['identity'][:12]}...")
+    print(f"  uptime:   {uptime // 60}m {uptime % 60}s")
+    return 0
+
+
+def cmd_pool_rotate(args: argparse.Namespace) -> int:
+    print("provisioning new worker (this takes ~3-5 min)...")
+    # The service exits after responding, so this request may time out at the
+    # transport layer; we still want to read the body if it came through first.
+    try:
+        with _client(args) as c:
+            r = c.post("/admin/pool/rotate", timeout=600)
+    except Exception as e:
+        print(f"warning: connection reset (expected — service restarting): {e}")
+        return 0
+    _handle_resp(r)
+    body = r.json()
+    new = body["new_worker"]
+    print(f"new worker provisioned:")
+    print(f"  cvm_id:   {new['cvm_id']}")
+    print(f"  team_id:  {new['team_id']}")
+    print(f"  identity: {new['identity'][:12]}...")
+    print(f"service exiting in {body.get('respawn_in_seconds', 2)}s; systemd will respawn.")
+    return 0
+
+
 def tail_task(args: argparse.Namespace, task_id: str, poll_seconds: float = 2.0) -> int:
     last_status = None
     with _client(args) as c:
@@ -140,6 +179,13 @@ def main() -> int:
     tail = task_sub.add_parser("tail", help="follow a task until completion")
     tail.add_argument("id")
     tail.set_defaults(func=cmd_tail)
+
+    pool = sub.add_parser("pool", help="worker pool operations")
+    pool_sub = pool.add_subparsers(dest="pool_cmd", required=True)
+    pool_status = pool_sub.add_parser("status", help="show the active worker")
+    pool_status.set_defaults(func=cmd_pool_status)
+    pool_rotate = pool_sub.add_parser("rotate", help="provision a new worker; service will respawn")
+    pool_rotate.set_defaults(func=cmd_pool_rotate)
 
     args = parser.parse_args()
     return args.func(args)
