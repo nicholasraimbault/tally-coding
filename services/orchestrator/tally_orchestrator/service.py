@@ -427,6 +427,11 @@ class Orchestrator:
         self._auto_rotate_threshold = int(os.environ.get("TALLY_AUTO_ROTATE_THRESHOLD", "3"))
         self._rotating: set[str] = set()  # identities currently being rotated
         self._inflight_task_ids: set[str] = set()  # task IDs currently dispatched
+        # Sprint 21: surfaced via /admin/status for the dashboard CLI.
+        self._started_at: float = time.time()
+        self._sweep_last_at: float | None = None
+        self._sweep_last_demoted: int = 0
+        self._sweep_total_demoted: int = 0
 
     # ── handle lifecycle ──────────────────────────────────────────────────
 
@@ -796,6 +801,9 @@ class Orchestrator:
                     older_than_seconds=timeout_s,
                     error=f"no result event arrived within {int(timeout_s)}s",
                 )
+                self._sweep_last_at = time.time()
+                self._sweep_last_demoted = len(demoted)
+                self._sweep_total_demoted += len(demoted)
                 if demoted:
                     logger.warning(
                         "recovery sweeper demoted %d stale recovering task(s) to failed",
@@ -1285,6 +1293,40 @@ class PoolScaleBody(BaseModel):
 class PoolGcBody(BaseModel):
     dry_run: bool = True
     older_than_hours: float = 1.0
+
+
+@app.get("/admin/status", dependencies=[Depends(require_token)])
+async def admin_status(task_limit: int = 10) -> dict:
+    """One-shot operator snapshot: pool, recent tasks, sweeper state,
+    orchestrator uptime. Powers Sprint 21's `tally status` CLI."""
+    db: Db = state["db"]
+    orch: Orchestrator = state["orchestrator"]
+    now = time.time()
+    workers = []
+    for w in db.list_active_workers():
+        handle = orch.handles.get(w["identity"])
+        workers.append({
+            **w,
+            "uptime_seconds": now - w["created_at"],
+            "present": handle is not None,
+            "busy": (handle.lock.locked() or handle.in_flight_task is not None) if handle else None,
+            "in_flight_task": handle.in_flight_task if handle else None,
+            "failures": handle.failures if handle else None,
+        })
+    tasks = db.list_tasks(limit=task_limit)
+    return {
+        "orchestrator": {
+            "uptime_seconds": now - orch._started_at,
+            "pool_size": len(orch.handles),
+            "sweep_last_at": orch._sweep_last_at,
+            "sweep_last_demoted": orch._sweep_last_demoted,
+            "sweep_total_demoted": orch._sweep_total_demoted,
+            "recovery_timeout_seconds": float(os.environ.get("TALLY_RECOVERY_TIMEOUT", "300")),
+            "auto_rotate_threshold": orch._auto_rotate_threshold,
+        },
+        "workers": workers,
+        "tasks": tasks,
+    }
 
 
 @app.get("/admin/pool/status", dependencies=[Depends(require_token)])

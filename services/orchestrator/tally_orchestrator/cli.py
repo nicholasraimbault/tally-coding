@@ -92,6 +92,110 @@ def cmd_tail(args: argparse.Namespace) -> int:
     return tail_task(args, args.id)
 
 
+def _fmt_age(seconds: float | None) -> str:
+    """Compact age string: 5s, 4m12s, 2h34m, 3d4h."""
+    if seconds is None:
+        return "-"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def _systemd_memory() -> str | None:
+    """Read tally-orch.service's current memory + cap from systemd.
+    Returns None if systemctl isn't reachable (e.g., running on a host
+    that doesn't use the tracked unit)."""
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", "tally-orch.service",
+             "--property=MemoryCurrent,MemoryPeak,MemoryHigh,MemoryMax"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if res.returncode != 0:
+        return None
+    fields = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            fields[k] = v.strip()
+    def mb(s: str) -> str:
+        try:
+            n = int(s)
+            if n == 0 or n >= 2**62:  # infinity
+                return "∞"
+            return f"{n / 1024 / 1024:.0f}M"
+        except (ValueError, TypeError):
+            return "?"
+    cur = mb(fields.get("MemoryCurrent", ""))
+    peak = mb(fields.get("MemoryPeak", ""))
+    high = mb(fields.get("MemoryHigh", ""))
+    mx = mb(fields.get("MemoryMax", ""))
+    return f"{cur} (peak {peak}, cap {high}/{mx})"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """One-screen operator snapshot — pool, recent tasks, sweeper, mem."""
+    with _client(args) as c:
+        r = c.get("/admin/status", params={"task_limit": args.task_limit})
+    _handle_resp(r)
+    body = r.json()
+    orch = body.get("orchestrator", {})
+    workers = body.get("workers", [])
+    tasks = body.get("tasks", [])
+    now = time.time()
+
+    print(f"tally status — {args.url}")
+    print("─" * 70)
+    busy_workers = sum(1 for w in workers if w.get("busy"))
+    print(f"pool: {orch.get('pool_size', 0)} worker(s), {busy_workers} busy"
+          f"  uptime={_fmt_age(orch.get('uptime_seconds'))}")
+    if workers:
+        print(f"  {'cvm':<10} {'identity':<14} {'team suffix':<28} {'up':<8} {'busy':<5} {'fails'}")
+        for w in workers:
+            busy = "yes" if w.get("busy") else "no" if w.get("present") else "?"
+            fails = w.get("failures")
+            # team_id format is "tally-auto-<epoch>-<6-char-suffix>" — the
+            # epoch+suffix is what's distinctive, so strip the prefix.
+            team = (w["team_id"] or "?")
+            team_short = team.removeprefix("tally-auto-")
+            print(f"  {(w['cvm_id'] or '?')[:8]:<10} "
+                  f"{(w['identity'] or '?')[:12]:<14} "
+                  f"{team_short[:26]:<28} "
+                  f"{_fmt_age(w.get('uptime_seconds')):<8} "
+                  f"{busy:<5} "
+                  f"{fails if fails is not None else '-'}")
+    print()
+    print(f"recent tasks ({len(tasks)}):")
+    if tasks:
+        print(f"  {'id':<10} {'status':<14} {'worker':<14} {'elapsed':<8} description")
+        for t in tasks:
+            elapsed = (t.get("updated_at") or now) - (t.get("created_at") or now)
+            desc = (t.get("description") or "")[:40]
+            wid = (t.get("worker_identity") or "-")[:12]
+            print(f"  {t['id'][:8]:<10} {fmt_status(t['status']):<14} {wid:<14} "
+                  f"{_fmt_age(elapsed):<8} {desc}")
+    else:
+        print("  (none)")
+    print()
+    print("orchestrator:")
+    print(f"  recovery sweeper: last={_fmt_age(now - orch['sweep_last_at']) if orch.get('sweep_last_at') else 'never'}"
+          f"  demoted-last={orch.get('sweep_last_demoted', 0)}"
+          f"  demoted-total={orch.get('sweep_total_demoted', 0)}"
+          f"  timeout={int(orch.get('recovery_timeout_seconds') or 0)}s")
+    mem = _systemd_memory()
+    if mem:
+        print(f"  memory: {mem}")
+    return 0
+
+
 def cmd_pool_status(args: argparse.Namespace) -> int:
     with _client(args) as c:
         r = c.get("/admin/pool/status")
@@ -209,6 +313,10 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help=f"orchestrator service URL (default: {DEFAULT_URL})")
     parser.add_argument("--token", default="", help="bearer token (or env TALLY_API_TOKEN)")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    status = sub.add_parser("status", help="one-screen operator dashboard")
+    status.add_argument("--task-limit", type=int, default=10, help="how many recent tasks to show (default 10)")
+    status.set_defaults(func=cmd_status)
 
     task = sub.add_parser("task", help="task operations")
     task_sub = task.add_subparsers(dest="task_cmd", required=True)
