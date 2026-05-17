@@ -1,10 +1,9 @@
-# Stage 1: build the skytale-sdk Python wheel from the feat/py-mls-engine
-# branch (PR #470). Once that PR merges to skytale master, swap the branch
-# to a tag/master ref. Until then, the wheel has to be built from source
-# because PyMlsEngine isn't in any released wheel yet.
+# Stage 1: build the skytale-sdk Python wheel from skytale master. PR #470
+# (PyMlsEngine) is merged; the wheel still has to be built from source
+# because PyMlsEngine isn't in any published binary release yet.
 FROM python:3.12-slim AS skytale-builder
 
-ARG SKYTALE_BRANCH=feat/py-mls-engine
+ARG SKYTALE_BRANCH=master
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates pkg-config libssl-dev build-essential \

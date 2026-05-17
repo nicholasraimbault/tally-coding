@@ -44,7 +44,7 @@ def fmt_ts(ts: float) -> str:
 
 
 def fmt_status(s: str) -> str:
-    icons = {"pending": "·", "running": "▸", "completed": "✓", "failed": "✗"}
+    icons = {"pending": "·", "running": "▸", "recovering": "↻", "completed": "✓", "failed": "✗"}
     return f"{icons.get(s, '?')} {s}"
 
 

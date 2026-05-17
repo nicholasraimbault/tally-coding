@@ -366,6 +366,7 @@ def handle_task_wake(
         except Exception as exc:
             print(f"[worker] event callback failed: {exc}", flush=True)
 
+    result: dict = {"success": False, "error": "task did not return a result"}
     try:
         result = perform_task(
             task_description=task_description,
@@ -373,12 +374,28 @@ def handle_task_wake(
             event_callback=on_event,
             token_callback=batcher.on_chunk if batcher is not None else None,
         )
+    except Exception as exc:
+        result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+        print(f"[worker] perform_task raised: {exc}", flush=True)
     finally:
         if batcher is not None:
             batcher.stop()
-        if emitter_thread is not None:
+        # Sprint 18: push the final result onto the event queue (in
+        # addition to returning it via complete_wake) so an orchestrator
+        # that crashes between task:start dispatch and result-receipt can
+        # recover the result from its persisted inbox on next startup.
+        # tally-workers retains undelivered wakes at-least-once until the
+        # orchestrator acks them via complete_wake, so the result event
+        # survives an arbitrarily long orchestrator downtime.
+        if emitter_thread is not None and orchestrator_bearer:
+            try:
+                # Note: send the result event BEFORE the shutdown sentinel
+                # so the emitter has a chance to dispatch it.
+                event_queue.put({"kind": "result", "task_id": task_id, "result": result})
+            except Exception as exc:
+                print(f"[worker] failed to enqueue result event: {exc}", flush=True)
             event_queue.put(_EMITTER_SHUTDOWN)
-            emitter_thread.join(timeout=10)
+            emitter_thread.join(timeout=15)
     return session.encrypt(json.dumps(result).encode("utf-8"))
 
 

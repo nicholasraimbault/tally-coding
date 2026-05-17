@@ -187,22 +187,56 @@ class Db:
             (error, time.time(), task_id),
         )
 
-    def recover_stuck_running(self, error: str) -> int:
-        """Demote every status='running' row to status='failed' with the
-        given error message. Called once at orchestrator startup to clear
-        orphans left behind by a crash, OOM, or hard restart — the
-        processor loop only considers status='pending' rows, so without
-        this step the orphans would sit forever, invisible.
+    def recover_stuck_running(self, _error_unused: str = "") -> int:
+        """Move every status='running' row to status='recovering' so the
+        Sprint 18 result-event recovery path can pick them up.
 
-        Returns the number of rows demoted. Marking them failed rather
-        than re-pending is intentional: a still-running worker on the
-        other side might be mid-task; demoting to pending would cause
-        a duplicate dispatch that races for the same `/workspace`. Users
-        can resubmit explicitly if they want a retry."""
+        Sprint 15 demoted these to `failed` immediately. Sprint 18 keeps
+        them in a transient `recovering` state because the worker on the
+        other side might still be in-flight, and on completion will push
+        the result as a `kind=result` event wake to the orchestrator's
+        inbox (which tally-workers retained while the orchestrator was
+        down). The recovery-sweeper background task demotes `recovering`
+        rows to `failed` after `TALLY_RECOVERY_TIMEOUT` seconds if no
+        result event arrives.
+
+        Returns the number of rows transitioned. Caller signature kept
+        for back-compat with Sprint 15 callers — the error argument is
+        ignored (the eventual `failed` transition writes its own
+        timeout error)."""
         now = time.time()
         cursor = self._conn.execute(
-            "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE status='running'",
-            (error, now),
+            "UPDATE tasks SET status='recovering', updated_at=? WHERE status='running'",
+            (now,),
+        )
+        return cursor.rowcount or 0
+
+    def mark_recovered(self, task_id: str, result: dict) -> bool:
+        """Transition a task from 'recovering' (or 'running' as a no-op
+        guard) to 'completed' with the given result. Returns True if a
+        row was updated; False if the task isn't in a recoverable state
+        (already completed, failed, or unknown id). Used by the event
+        poller's `kind=result` handler — idempotent across duplicate
+        event deliveries."""
+        cursor = self._conn.execute(
+            "UPDATE tasks SET status='completed', result_json=?, updated_at=? "
+            "WHERE id=? AND status IN ('recovering','running')",
+            (json.dumps(result), time.time(), task_id),
+        )
+        return (cursor.rowcount or 0) > 0
+
+    def sweep_recovering(self, older_than_seconds: float, error: str) -> int:
+        """Demote any `recovering` row older than `older_than_seconds`
+        to `failed` with the given error message. Returns the count.
+
+        Called periodically by `Orchestrator.run_recovery_sweeper`. The
+        threshold guards against demoting a task whose result event is
+        in flight; a typical OpenHands task is ~30s so 5min is plenty."""
+        cutoff = time.time() - older_than_seconds
+        cursor = self._conn.execute(
+            "UPDATE tasks SET status='failed', error=?, updated_at=? "
+            "WHERE status='recovering' AND updated_at < ?",
+            (error, time.time(), cutoff),
         )
         return cursor.rowcount or 0
 
@@ -400,15 +434,29 @@ class Orchestrator:
 
     def bootstrap_handle(self, handle: WorkerHandle) -> None:
         """3-wake handshake against handle's worker. Also registers the
-        orchestrator's bearer as the task:event handler in the worker's team
-        so events route back through tally-workers correctly."""
+        orchestrator's bearer as the task:event handler in the worker's
+        team so events route back through tally-workers correctly.
+
+        Sprint 18: the handshake timeout is 240s (was 60s in earlier
+        sprints) because an orchestrator-restart-against-busy-worker is
+        a supported scenario now — the worker's main loop is single-
+        threaded and won't pop the handshake wake from its inbox until
+        any in-flight task finishes. Worst case is ~60-90s for a long
+        OpenHands run, plus a slack margin.
+
+        The second handshake creates a fresh MLS group; both sides
+        re-key cleanly. Any wakes the worker had queued for delivery
+        on the old group's ratchet position will fail to decrypt and
+        get ack-and-skipped by the Sprint 15 path. Any wakes the worker
+        sends *after* re-joining the new group decrypt fine — which is
+        what the Sprint 18 result-event recovery relies on."""
         self.client.team_init(handle.team_id, bearer=self.bearer)
         self.client.register(handle.team_id, self.bearer, bearer=self.bearer, context_id=EVENT_CONTEXT_ID)
         logger.info("bootstrap[%s]: requesting worker key package", handle.identity[:8])
         kp_resp = self._dispatch_blocking(
             handle, context_id=BOOTSTRAP_CONTEXT_ID,
             payload=json.dumps({"phase": "request_kp"}).encode("utf-8"),
-            timeout_seconds=60,
+            timeout_seconds=240,
         )
         worker_kp = b64url_decode(json.loads(kp_resp.decode("utf-8"))["key_package"])
         welcome_bytes = None
@@ -428,7 +476,7 @@ class Orchestrator:
         ack = self._dispatch_blocking(
             handle, context_id=BOOTSTRAP_CONTEXT_ID,
             payload=json.dumps({"phase": "welcome", "welcome": b64url_no_pad(welcome_bytes)}).encode("utf-8"),
-            timeout_seconds=60,
+            timeout_seconds=240,
         )
         if not json.loads(ack.decode("utf-8")).get("ok"):
             raise RuntimeError(f"worker {handle.identity[:12]} rejected welcome")
@@ -687,6 +735,29 @@ class Orchestrator:
         finally:
             self._inflight_task_ids.discard(task["id"])
 
+    async def run_recovery_sweeper(self) -> None:
+        """Sprint 18: every 60s, demote any `recovering` row older than
+        `TALLY_RECOVERY_TIMEOUT` (default 300s) to `failed`. Without this,
+        a stuck-task whose worker died too would linger as `recovering`
+        forever and lie to /tasks. The default 300s covers normal task
+        runtimes (~30s) with a 10× safety margin."""
+        timeout_s = float(os.environ.get("TALLY_RECOVERY_TIMEOUT", "300"))
+        while True:
+            try:
+                n = self.db.sweep_recovering(
+                    older_than_seconds=timeout_s,
+                    error=f"no result event arrived within {int(timeout_s)}s",
+                )
+                if n:
+                    logger.warning(
+                        "recovery sweeper demoted %d stale recovering task(s) to failed", n
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("recovery sweeper iteration failed: %s", exc)
+            await asyncio.sleep(60)
+
     def start_poller(self, handle: WorkerHandle) -> None:
         """One event-poller asyncio task per worker team. Decodes the
         plaintext envelope, routes by worker_identity to the right handle's
@@ -729,6 +800,26 @@ class Orchestrator:
                                     inner["task_id"],
                                     {"seq": inner["seq"], "received_at": time.time(), **inner["event"]},
                                 )
+                                # Sprint 18: if this event is the worker's
+                                # final result, transition any matching
+                                # `recovering` row to `completed`. The
+                                # write is idempotent: if the task is
+                                # already in a terminal state, mark_recovered
+                                # returns False and we just ack the wake.
+                                event = inner.get("event", {}) or {}
+                                if event.get("kind") == "result":
+                                    task_id = inner.get("task_id", "")
+                                    result = event.get("result", {})
+                                    recovered = self.db.mark_recovered(task_id, result)
+                                    if recovered:
+                                        logger.info(
+                                            "recovered task %s via result event from worker %s",
+                                            task_id[:8], worker_identity[:8],
+                                        )
+                                        await self._publish_status(
+                                            task_id, "completed",
+                                            {"success": result.get("success"), "recovered": True},
+                                        )
                     except Exception as exc:
                         # MLS decrypt failures are expected after an
                         # orchestrator restart: the worker's session
@@ -935,10 +1026,17 @@ async def lifespan(app: FastAPI):
     # Self-heal any tasks left mid-flight by a previous crash. They'd be
     # invisible to next_pending() and pin nothing on the new pool — but
     # they'd also lie about the worker that ran them in /tasks responses
-    # forever. Demote them to `failed` with a clear marker.
-    orphans = db.recover_stuck_running("orchestrator restarted while task was running")
+    # forever. Sprint 18: instead of immediately marking them failed,
+    # move them to `recovering` so the event poller can transition them
+    # to `completed` if/when the worker's persistent result event
+    # arrives. A separate sweeper demotes stale `recovering` rows after
+    # TALLY_RECOVERY_TIMEOUT (default 300s).
+    orphans = db.recover_stuck_running()
     if orphans:
-        logger.warning("recovered %d stuck running task(s) on startup (demoted to failed)", orphans)
+        logger.warning(
+            "transitioned %d stuck running task(s) to recovering on startup",
+            orphans,
+        )
     event_bus = EventBus()
     pool = WorkerPool(scripts_env_path=scripts_env)
     state["worker_pool"] = pool
@@ -973,17 +1071,21 @@ async def lifespan(app: FastAPI):
 
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
     state["processor_task"] = processor_task
-    logger.info("ready; pool=%d, processor loop started", len(orchestrator.handles))
+    sweeper_task = asyncio.create_task(orchestrator.run_recovery_sweeper())
+    state["sweeper_task"] = sweeper_task
+    logger.info("ready; pool=%d, processor + recovery sweeper started",
+                len(orchestrator.handles))
     try:
         yield
     finally:
         for team_id in list(orchestrator.pollers.keys()):
             orchestrator.stop_poller(team_id)
-        processor_task.cancel()
-        try:
-            await processor_task
-        except asyncio.CancelledError:
-            pass
+        for t in (processor_task, sweeper_task):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Tally Orchestrator", lifespan=lifespan)
