@@ -87,6 +87,36 @@ CREATE TABLE IF NOT EXISTS workers (
     retired_at  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
+
+-- Sprint 22: agent palette (hardcoded library of roles)
+CREATE TABLE IF NOT EXISTS agent_roles (
+    name           TEXT PRIMARY KEY,
+    description    TEXT NOT NULL,
+    default_model  TEXT NOT NULL,
+    tools_json     TEXT NOT NULL,            -- JSON list of tool names
+    system_prompt  TEXT NOT NULL
+);
+
+-- Sprint 22: per-task agent instances. team_spec on tasks holds the architect
+-- output as JSON, this table holds the resolved instances for inspection +
+-- per-agent worker/result tracking.
+CREATE TABLE IF NOT EXISTS agents (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    agent_idx       INTEGER NOT NULL,         -- ordinal position in workflow
+    role            TEXT NOT NULL,            -- references agent_roles.name
+    model           TEXT NOT NULL,            -- may override role default
+    spec            TEXT NOT NULL,            -- task-specific instructions
+    status          TEXT NOT NULL,            -- pending|running|completed|failed
+    result_json     TEXT,
+    worker_identity TEXT,                     -- which WorkerHandle ran this agent
+    started_at      REAL,
+    finished_at     REAL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (role)    REFERENCES agent_roles(name)
+);
+CREATE INDEX IF NOT EXISTS idx_agents_task     ON agents(task_id);
+CREATE INDEX IF NOT EXISTS idx_agents_status   ON agents(status);
 """
 
 
@@ -100,6 +130,12 @@ def b64url_decode(s: str) -> bytes:
 
 class TaskSubmit(BaseModel):
     description: str
+    # Sprint 22: optional pre-architected team. When omitted, the legacy
+    # single-agent path runs. When present, must match the architect
+    # output shape: {agents: [{role, model?, spec?}...], workflow: str?,
+    # reasoning: str?}. Sprint 23 wires Tally to produce this when the
+    # client doesn't supply one.
+    team_spec: dict | None = None
 
 
 class TaskResponse(BaseModel):
@@ -126,6 +162,99 @@ class Db:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN worker_identity TEXT")
         except sqlite3.OperationalError:
             pass
+        # Sprint 22: team_spec is the Tally architect's output for this task —
+        # JSON of {agents: [...], workflow: "...", reasoning: "..."}.
+        # Null for Sprint 22 if dispatched by the legacy single-agent path
+        # (which we keep as a fallback until Sprint 23 lands Tally).
+        try:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN team_spec TEXT")
+        except sqlite3.OperationalError:
+            pass
+        self._seed_agent_roles()
+
+    def _seed_agent_roles(self) -> None:
+        """Idempotent seed of the 7-role palette. INSERT OR IGNORE so
+        adding/upgrading a role's prompt requires an explicit migration
+        rather than silently overwriting operator customisation. The
+        prompt + tools here are the v1 defaults; per-task `spec` strings
+        layer task-specific instructions on top."""
+        roles = [
+            (
+                "Planner",
+                "Decomposes the task into concrete sub-tasks; writes a plan that downstream agents follow.",
+                "moonshotai/kimi-k2.6",
+                ["task_tracker", "file_editor_read"],
+                "You are a senior engineer planning the work. Read the task and produce a numbered plan "
+                "with explicit deliverables. Do not write code; do not run anything. Write your plan to "
+                "plan.md and stop.",
+            ),
+            (
+                "Coder",
+                "Writes and edits code to implement the task; may run code to verify.",
+                # Sprint 22: same Kimi-K2 the single-agent worker has used
+                # since Sprint 1. qwen3-coder-* returned upstream errors
+                # against the live Red Pill catalog during Sprint 22
+                # validation; survey + per-role tuning is a Sprint 22.5
+                # follow-up. The architect's per-task override (Sprint 23)
+                # can pick coder-specific models when they prove stable.
+                "moonshotai/kimi-k2.6",
+                ["bash", "file_editor", "terminal"],
+                "You are a senior engineer implementing the task. Write idiomatic, testable code. If a "
+                "plan.md exists in the workspace, follow it; otherwise infer scope from the task. Prefer "
+                "small, verifiable steps. Stop when the task is done.",
+            ),
+            (
+                "Reviewer",
+                "Critiques code for bugs, style, missing edge cases. Read-only.",
+                "moonshotai/kimi-k2.6",
+                ["file_editor_read", "bash_read"],
+                "You are a thorough code reviewer. Read every file the previous agent(s) produced. "
+                "Write your findings to review.md, organized as: critical issues, style issues, "
+                "suggestions. Do not modify code; only write review.md.",
+            ),
+            (
+                "Tester",
+                "Runs tests against the produced code; writes a brief report.",
+                "moonshotai/kimi-k2.6",
+                ["bash", "file_editor", "terminal"],
+                "You are a QA engineer. Identify the test runner for this project (pytest, jest, "
+                "cargo test, etc.) and run the test suite. Write the outcome to tests.md including "
+                "pass/fail counts and any failing-test output.",
+            ),
+            (
+                "DocWriter",
+                "Writes documentation for the work the team did.",
+                "meta-llama/llama-3.3-70b-instruct",
+                ["file_editor"],
+                "You are a technical writer. Read the workspace and write a README.md (or equivalent) "
+                "that explains what was built, how to run it, and any non-obvious decisions. Keep it "
+                "concise and example-driven.",
+            ),
+            (
+                "SecReviewer",
+                "Reviews for security vulnerabilities. Read-only.",
+                "deepseek/deepseek-r1-0528",
+                ["file_editor_read", "bash_read"],
+                "You are a security engineer. Read the workspace and identify any vulnerabilities — "
+                "injection, secrets in code, weak crypto, unsafe deserialization, auth gaps. Write to "
+                "security.md as: critical, high, medium, low. Cite the file:line for each finding.",
+            ),
+            (
+                "DBA",
+                "Designs database schemas; writes migrations.",
+                "deepseek/deepseek-v3.2",
+                ["file_editor", "bash"],
+                "You are a database engineer. Design the schema for the task; write migrations under "
+                "migrations/. Prefer the database engine the rest of the project uses. Annotate "
+                "non-obvious constraints in comments.",
+            ),
+        ]
+        for name, desc, model, tools, prompt in roles:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO agent_roles (name, description, default_model, tools_json, system_prompt) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, desc, model, json.dumps(tools), prompt),
+            )
 
     _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity"
 
@@ -248,6 +377,99 @@ class Db:
                 [error, time.time(), *demoted_ids],
             )
         return demoted_ids
+
+    # ── Sprint 22: agent palette + per-task agent instances ──────────────
+
+    def list_agent_roles(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT name, description, default_model, tools_json, system_prompt "
+            "FROM agent_roles ORDER BY name"
+        ).fetchall()
+        return [
+            {
+                "name": r[0], "description": r[1], "default_model": r[2],
+                "tools": json.loads(r[3]), "system_prompt": r[4],
+            }
+            for r in rows
+        ]
+
+    def get_agent_role(self, name: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT name, description, default_model, tools_json, system_prompt "
+            "FROM agent_roles WHERE name = ?", (name,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "name": row[0], "description": row[1], "default_model": row[2],
+            "tools": json.loads(row[3]), "system_prompt": row[4],
+        }
+
+    def set_task_team_spec(self, task_id: str, team_spec: dict) -> None:
+        """Persist Tally's architect output on the task. Called after the
+        architect picks a team and before dispatch starts."""
+        self._conn.execute(
+            "UPDATE tasks SET team_spec=?, updated_at=? WHERE id=?",
+            (json.dumps(team_spec), time.time(), task_id),
+        )
+
+    def get_task_team_spec(self, task_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT team_spec FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(row[0])
+
+    def insert_agent(
+        self, *, task_id: str, agent_idx: int, role: str,
+        model: str, spec: str,
+    ) -> str:
+        """Insert a per-task agent instance. Returns the new agent_id (a hex
+        ULID-ish string keyed on task_id + idx for deterministic recovery)."""
+        agent_id = uuid.uuid4().hex
+        self._conn.execute(
+            "INSERT INTO agents (id, task_id, agent_idx, role, model, spec, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (agent_id, task_id, agent_idx, role, model, spec),
+        )
+        return agent_id
+
+    def list_agents(self, task_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT id, task_id, agent_idx, role, model, spec, status, "
+            "result_json, worker_identity, started_at, finished_at "
+            "FROM agents WHERE task_id=? ORDER BY agent_idx",
+            (task_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "task_id": r[1], "agent_idx": r[2], "role": r[3],
+                "model": r[4], "spec": r[5], "status": r[6],
+                "result": json.loads(r[7]) if r[7] else None,
+                "worker_identity": r[8],
+                "started_at": r[9], "finished_at": r[10],
+            }
+            for r in rows
+        ]
+
+    def mark_agent_running(self, agent_id: str, worker_identity: str) -> None:
+        self._conn.execute(
+            "UPDATE agents SET status='running', worker_identity=?, started_at=? WHERE id=?",
+            (worker_identity, time.time(), agent_id),
+        )
+
+    def mark_agent_completed(self, agent_id: str, result: dict) -> None:
+        self._conn.execute(
+            "UPDATE agents SET status='completed', result_json=?, finished_at=? WHERE id=?",
+            (json.dumps(result), time.time(), agent_id),
+        )
+
+    def mark_agent_failed(self, agent_id: str, error: str) -> None:
+        self._conn.execute(
+            "UPDATE agents SET status='failed', result_json=?, finished_at=? WHERE id=?",
+            (json.dumps({"success": False, "error": error}), time.time(), agent_id),
+        )
 
     def insert_event(self, task_id: str, seq: int, event: dict) -> None:
         """Insert a streaming event from the worker. Idempotent on (task_id, seq)."""
@@ -554,17 +776,122 @@ class Orchestrator:
         await self.event_bus.publish(task_id, {"_kind": "status_change", **payload})
 
     async def process_task(self, task: dict) -> None:
-        """Sprint 19: fire-and-forget dispatch. We hold handle.lock just
-        long enough to encrypt the task + send the wake + decrypt the
-        worker's ack, then release. The actual task result flows back
-        asynchronously via the persistent `kind=result` event channel
-        (Sprint 18) — the event poller handles `mark_recovered` and
-        clears `handle.in_flight_task`.
+        """Sprint 19 + 22: fire-and-forget dispatch with two flavours.
 
-        Handle.in_flight_task tracks worker busyness across the gap
-        between dispatch-ack and result-event arrival. acquire_idle
-        respects it so we don't pile up multiple tasks on a worker
-        that's still chewing through its current one."""
+        - **Multi-agent** (Sprint 22): if `task.team_spec` is set, this
+          is Tally's pre-architected team. Insert per-agent rows then
+          dispatch the FIRST agent. The event poller picks up each
+          agent's result event and advances to the next agent in the
+          workflow.
+        - **Single-agent** (legacy): no team_spec → dispatch the
+          existing single OpenHands run (Sprint 19 fire-and-forget).
+        """
+        team_spec = self.db.get_task_team_spec(task["id"])
+        if team_spec:
+            await self._start_team(task, team_spec)
+        else:
+            await self._dispatch_single_agent(task)
+
+    async def _start_team(self, task: dict, team_spec: dict) -> None:
+        """Resolve role defaults, insert per-agent rows, dispatch first.
+
+        Sprint 22 workflow is sequential-only (agents run in their
+        agent_idx order). Sprint 27 adds parallel + branching.
+        """
+        agents_spec = team_spec.get("agents", []) or []
+        if not agents_spec:
+            self.db.mark_failed(task["id"], "team_spec has no agents")
+            await self._publish_status(task["id"], "failed", {"error": "team_spec has no agents"})
+            return
+        # Resolve + insert per-agent rows up front so the team's shape is
+        # visible in /admin/status before any worker dispatch starts.
+        for idx, a in enumerate(agents_spec):
+            role_name = a.get("role")
+            role = self.db.get_agent_role(role_name)
+            if not role:
+                self.db.mark_failed(task["id"], f"unknown role: {role_name}")
+                await self._publish_status(task["id"], "failed", {"error": f"unknown role: {role_name}"})
+                return
+            self.db.insert_agent(
+                task_id=task["id"], agent_idx=idx, role=role_name,
+                model=a.get("model") or role["default_model"],
+                spec=a.get("spec", ""),
+            )
+        self.db.mark_running(task["id"])
+        await self._publish_status(task["id"], "running", {"team_size": len(agents_spec)})
+        first_agent = self.db.list_agents(task["id"])[0]
+        logger.info("starting team for task %s: %d agents, first=%s",
+                    task["id"][:8], len(agents_spec), first_agent["role"])
+        await self._dispatch_agent(task, first_agent)
+
+    async def _dispatch_agent(self, task: dict, agent: dict) -> None:
+        """Encrypt + send one agent's task wake. Fire-and-forget; the
+        event poller advances to the next agent on result. Mirrors
+        `_dispatch_single_agent` but with per-agent payload."""
+        try:
+            handle = await self.acquire_idle(timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")))
+        except TimeoutError as exc:
+            logger.error("task %s agent %s: no worker available", task["id"][:8], agent["role"])
+            self.db.mark_agent_failed(agent["id"], str(exc))
+            self.db.mark_failed(task["id"], f"no worker for {agent['role']}: {exc}")
+            await self._publish_status(task["id"], "failed", {"error": str(exc)})
+            return
+        try:
+            handle.in_flight_task = task["id"]
+            self.db.set_task_worker(task["id"], handle.identity)
+            self.db.mark_agent_running(agent["id"], handle.identity)
+            role = self.db.get_agent_role(agent["role"]) or {}
+            await self._publish_status(task["id"], "running", {
+                "agent_role": agent["role"], "agent_idx": agent["agent_idx"],
+            })
+            logger.info("dispatching task %s agent %s/%s (%s) to worker %s",
+                        task["id"][:8], agent["agent_idx"], agent["role"],
+                        agent["model"], handle.identity[:8])
+            try:
+                payload_obj = {
+                    "task": task["description"],
+                    "task_id": task["id"],
+                    "orchestrator_bearer": self.bearer,
+                    "agent_idx": agent["agent_idx"],
+                    "agent_spec": {
+                        "role": agent["role"],
+                        "model": agent["model"],
+                        "spec": agent["spec"],
+                        "system_prompt": role.get("system_prompt", ""),
+                        "tools": role.get("tools", []),
+                    },
+                }
+                ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
+                ack_bytes = await asyncio.to_thread(
+                    self._dispatch_blocking, handle,
+                    context_id=TASK_CONTEXT_ID,
+                    payload=ciphertext,
+                    timeout_seconds=int(os.environ.get("TALLY_TASK_ACK_TIMEOUT", "30")),
+                )
+                ack_plain = handle.session.decrypt(ack_bytes).decode("utf-8")
+                ack = json.loads(ack_plain)
+                if not ack.get("ack"):
+                    raise RuntimeError(f"worker rejected agent task: {ack.get('error', 'unknown')}")
+                handle.failures = 0
+                logger.info("task %s agent %s acked by worker %s",
+                            task["id"][:8], agent["role"], handle.identity[:8])
+            except Exception as exc:
+                logger.exception("task %s agent %s dispatch failed", task["id"][:8], agent["role"])
+                self.db.mark_agent_failed(agent["id"], str(exc))
+                self.db.mark_failed(task["id"], f"agent {agent['role']} dispatch failed: {exc}")
+                await self._publish_status(task["id"], "failed", {"error": str(exc)})
+                handle.in_flight_task = None
+                handle.failures += 1
+                if handle.failures >= self._auto_rotate_threshold and handle.identity not in self._rotating:
+                    self._rotating.add(handle.identity)
+                    asyncio.create_task(self._rotate_handle(handle))
+        finally:
+            handle.lock.release()
+
+    async def _dispatch_single_agent(self, task: dict) -> None:
+        """Legacy single-agent dispatch path (Sprint 19 fire-and-forget).
+        Kept for tasks submitted without a team_spec — they get a default
+        one-OpenHands-run experience."""
         try:
             handle = await self.acquire_idle(timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")))
         except TimeoutError as exc:
@@ -586,10 +913,6 @@ class Orchestrator:
                     "orchestrator_bearer": self.bearer,
                 }
                 ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
-                # Short ack timeout (30s default) — the worker is expected
-                # to call complete_wake with `{ack: true}` within seconds
-                # of receiving the wake. Anything longer indicates the
-                # worker is unhealthy and this dispatch should fail.
                 ack_bytes = await asyncio.to_thread(
                     self._dispatch_blocking, handle,
                     context_id=TASK_CONTEXT_ID,
@@ -600,7 +923,7 @@ class Orchestrator:
                 ack = json.loads(ack_plain)
                 if not ack.get("ack"):
                     raise RuntimeError(f"worker rejected task: {ack.get('error', 'unknown')}")
-                handle.failures = 0  # successful dispatch
+                handle.failures = 0
                 logger.info("task %s acked by worker %s; awaiting result event",
                             task["id"][:8], handle.identity[:8])
             except Exception as exc:
@@ -608,11 +931,9 @@ class Orchestrator:
                                  task["id"][:8], handle.identity[:8])
                 self.db.mark_failed(task["id"], str(exc))
                 await self._publish_status(task["id"], "failed", {"error": str(exc)})
-                handle.in_flight_task = None  # result will never arrive; free the handle
+                handle.in_flight_task = None
                 handle.failures += 1
                 if handle.failures >= self._auto_rotate_threshold and handle.identity not in self._rotating:
-                    logger.warning("auto-rotating worker %s after %d failures",
-                                   handle.identity[:8], handle.failures)
                     self._rotating.add(handle.identity)
                     asyncio.create_task(self._rotate_handle(handle))
         finally:
@@ -782,6 +1103,92 @@ class Orchestrator:
         finally:
             self._inflight_task_ids.discard(task["id"])
 
+    async def _handle_result_event(
+        self, *, task_id: str, worker_identity: str, result: dict
+    ) -> None:
+        """Sprint 22: a `kind=result` event arrived. Either:
+
+        - Single-agent path (no agent_idx in result): mark task completed
+          (legacy Sprint 18-19 behaviour).
+        - Multi-agent path (agent_idx present): mark that agent done,
+          dispatch the next agent in sequence, or finalize the task if
+          this was the last agent.
+        """
+        agent_idx = result.get("agent_idx")
+        if agent_idx is None:
+            # Single-agent legacy path
+            completed = self.db.mark_recovered(task_id, result)
+            if completed:
+                logger.info(
+                    "task %s result event from worker %s: success=%s",
+                    task_id[:8], worker_identity[:8], result.get("success"),
+                )
+                await self._publish_status(
+                    task_id, "completed",
+                    {"success": result.get("success")},
+                )
+            return
+
+        # Multi-agent path
+        agents = self.db.list_agents(task_id)
+        target_agent = next((a for a in agents if a["agent_idx"] == agent_idx), None)
+        if target_agent is None:
+            logger.warning("result event for unknown agent_idx=%s on task %s; ignoring",
+                           agent_idx, task_id[:8])
+            return
+        if target_agent["status"] in ("completed", "failed"):
+            logger.debug("duplicate result event for task %s agent %s; ignoring",
+                         task_id[:8], target_agent["role"])
+            return
+        # Mark this agent done.
+        if result.get("success") is False:
+            self.db.mark_agent_failed(target_agent["id"], result.get("error", "agent returned failure"))
+            logger.warning("task %s agent %s (%s) failed: %s",
+                           task_id[:8], agent_idx, target_agent["role"], result.get("error", "?"))
+        else:
+            self.db.mark_agent_completed(target_agent["id"], result)
+            logger.info("task %s agent %s (%s) completed: files=%s",
+                        task_id[:8], agent_idx, target_agent["role"],
+                        len(result.get("files_created", []) or []))
+        # Did this agent fail? Short-circuit the rest of the workflow.
+        if result.get("success") is False:
+            self.db.mark_failed(task_id, f"agent {target_agent['role']} failed: {result.get('error', '?')}")
+            await self._publish_status(
+                task_id, "failed",
+                {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
+            )
+            return
+        # Find next pending agent in sequence (Sprint 22 = strictly
+        # sequential by agent_idx).
+        remaining = [a for a in agents if a["agent_idx"] > agent_idx and a["status"] == "pending"]
+        if remaining:
+            next_agent = remaining[0]
+            task = self.db.get_task(task_id)
+            if task is None:
+                logger.error("task %s gone before next agent dispatch", task_id[:8])
+                return
+            # Refresh the agent row (status changed since list_agents).
+            next_agent = next(a for a in self.db.list_agents(task_id)
+                              if a["agent_idx"] == next_agent["agent_idx"])
+            asyncio.create_task(self._dispatch_agent(task, next_agent))
+            return
+        # All agents done — task is complete. Aggregate results.
+        final_agents = self.db.list_agents(task_id)
+        aggregate = {
+            "success": all(a["status"] == "completed" for a in final_agents),
+            "agents": [
+                {"role": a["role"], "agent_idx": a["agent_idx"],
+                 "model": a["model"], "result": a["result"]}
+                for a in final_agents
+            ],
+        }
+        self.db.mark_completed(task_id, aggregate)
+        await self._publish_status(
+            task_id, "completed",
+            {"success": aggregate["success"], "agents_run": len(final_agents)},
+        )
+        logger.info("task %s team complete: %d agents", task_id[:8], len(final_agents))
+
     async def run_recovery_sweeper(self) -> None:
         """Sprint 18+19: every 60s, demote any `recovering` row older
         than `TALLY_RECOVERY_TIMEOUT` (default 300s) to `failed`, AND
@@ -873,29 +1280,25 @@ class Orchestrator:
                                     inner["task_id"],
                                     {"seq": inner["seq"], "received_at": time.time(), **inner["event"]},
                                 )
-                                # Sprint 18: kind=result events transition
-                                # the task to `completed`. Sprint 19: this
-                                # is now the *primary* result channel (no
-                                # more synchronous response from
-                                # process_task), so we also clear the
-                                # handle's `in_flight_task` marker so a
-                                # new task can dispatch to the same worker.
+                                # Sprint 18-19: kind=result events transition
+                                # the task to `completed`. Sprint 22:
+                                # multi-agent path — the result is *one
+                                # agent's* result; mark just that agent
+                                # done and advance to the next agent in
+                                # the workflow. The task only flips to
+                                # completed when the *last* agent
+                                # finishes (or any agent fails).
                                 event = inner.get("event", {}) or {}
                                 if event.get("kind") == "result":
                                     task_id = inner.get("task_id", "")
                                     result = event.get("result", {})
-                                    completed = self.db.mark_recovered(task_id, result)
-                                    if completed:
-                                        logger.info(
-                                            "task %s result event from worker %s: success=%s",
-                                            task_id[:8], worker_identity[:8], result.get("success"),
-                                        )
-                                        await self._publish_status(
-                                            task_id, "completed",
-                                            {"success": result.get("success")},
-                                        )
                                     if target.in_flight_task == task_id:
                                         target.in_flight_task = None
+                                    await self._handle_result_event(
+                                        task_id=task_id,
+                                        worker_identity=worker_identity,
+                                        result=result,
+                                    )
                     except Exception as exc:
                         # MLS decrypt failures are expected after an
                         # orchestrator restart: the worker's session
@@ -1174,7 +1577,14 @@ async def health() -> dict:
 
 @app.post("/tasks", dependencies=[Depends(require_token)], response_model=TaskResponse)
 async def submit_task(body: TaskSubmit) -> TaskResponse:
-    task_id = state["db"].create_task(body.description)
+    db: Db = state["db"]
+    task_id = db.create_task(body.description)
+    # Sprint 22: stash team_spec BEFORE the processor loop picks the task
+    # up. The processor reads team_spec when it dispatches; setting it
+    # after create_task is racy (processor polls every 0.5s) but in
+    # practice the round-trip is much faster.
+    if body.team_spec:
+        db.set_task_team_spec(task_id, body.team_spec)
     task = state["db"].get_task(task_id)
     return TaskResponse(**task)
 
@@ -1327,6 +1737,31 @@ async def admin_status(task_limit: int = 10) -> dict:
         "workers": workers,
         "tasks": tasks,
     }
+
+
+@app.get("/tasks/{task_id}/team", dependencies=[Depends(require_token)])
+async def get_task_team(task_id: str) -> dict:
+    """Sprint 22: return the team_spec + per-agent runtime state for a
+    multi-agent task. Powers the Discord-shaped task view's members
+    sidebar (Sprint 25). Returns {team_spec: null, agents: []} for
+    single-agent tasks."""
+    db: Db = state["db"]
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"task {task_id} not found")
+    return {
+        "task_id": task_id,
+        "team_spec": db.get_task_team_spec(task_id),
+        "agents": db.list_agents(task_id),
+    }
+
+
+@app.get("/admin/agent_roles", dependencies=[Depends(require_token)])
+async def list_agent_roles() -> dict:
+    """The agent palette. Static today (seeded once at orchestrator boot);
+    the Discord-shaped Flutter UI uses this to show role glyphs / names
+    in the members sidebar without hardcoding the list."""
+    return {"roles": state["db"].list_agent_roles()}
 
 
 @app.get("/admin/pool/status", dependencies=[Depends(require_token)])

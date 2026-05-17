@@ -59,12 +59,16 @@ def b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 
-def build_llm() -> LLM:
+def build_llm(model_override: str | None = None) -> LLM:
+    """Build an LLM client against Red Pill. Sprint 22: `model_override`
+    lets a per-agent spec choose its own model (e.g. Coder uses
+    qwen2.5-coder-32b, Planner uses kimi-k2). Falls back to `REDPILL_MODEL`
+    env var (which the legacy single-agent path still uses)."""
     api_key = os.environ.get("REDPILL_API_KEY")
     if not api_key:
         sys.exit("REDPILL_API_KEY not set")
     base_url = os.environ.get("REDPILL_BASE_URL", "https://api.redpill.ai/v1")
-    model_name = os.environ.get("REDPILL_MODEL", "moonshotai/kimi-k2.6")
+    model_name = model_override or os.environ.get("REDPILL_MODEL", "moonshotai/kimi-k2.6")
     # stream=True so token_callbacks fire per chunk; required for the
     # TokenBatcher → orchestrator → Flutter streaming pipeline.
     return LLM(model=f"openai/{model_name}", api_key=api_key, base_url=base_url, stream=True)
@@ -216,28 +220,89 @@ def perform_task(
     workspace: Path,
     event_callback,
     token_callback=None,
+    agent_spec: dict | None = None,
 ) -> dict:
     """Run OpenHands agent in workspace with event + token callbacks streaming
-    to the orchestrator via the emitter thread."""
-    llm = build_llm()
-    agent = Agent(
-        llm=llm,
-        tools=[
-            Tool(name=TerminalTool.name),
-            Tool(name=FileEditorTool.name),
-            Tool(name=TaskTrackerTool.name),
-        ],
-    )
+    to the orchestrator via the emitter thread.
+
+    Sprint 22: `agent_spec`, when provided, customises the agent for a
+    specific role. Shape:
+      {
+        "role": "Coder",
+        "model": "qwen/qwen2.5-coder-32b-instruct",
+        "system_prompt": "You are a senior engineer ...",
+        "tools": ["bash", "file_editor", "terminal"],
+      }
+    Backward-compatible: when `agent_spec is None`, runs the legacy
+    Sprint-1-era single-agent setup (Kimi from REDPILL_MODEL, all tools).
+    """
+    if agent_spec:
+        llm = build_llm(model_override=agent_spec.get("model"))
+        agent_kwargs: dict[str, Any] = {
+            "llm": llm,
+            "tools": _tools_from_spec(agent_spec.get("tools", [])),
+        }
+        if agent_spec.get("system_prompt"):
+            agent_kwargs["system_prompt"] = agent_spec["system_prompt"]
+        agent = Agent(**agent_kwargs)
+        # `spec` is the task-specific instruction for this agent — appended
+        # after the role's system prompt and the user's overall task.
+        per_agent_task = (
+            f"Team task: {task_description}\n\n"
+            f"Your role ({agent_spec.get('role', '?')}): {agent_spec.get('spec', '')}"
+        )
+    else:
+        llm = build_llm()
+        agent = Agent(
+            llm=llm,
+            tools=[
+                Tool(name=TerminalTool.name),
+                Tool(name=FileEditorTool.name),
+                Tool(name=TaskTrackerTool.name),
+            ],
+        )
+        per_agent_task = task_description
     kwargs: dict[str, Any] = {"agent": agent, "workspace": str(workspace), "callbacks": [event_callback]}
     if token_callback is not None:
         kwargs["token_callbacks"] = [token_callback]
     conversation = Conversation(**kwargs)
-    conversation.send_message(task_description)
+    conversation.send_message(per_agent_task)
     conversation.run()
     files_created = sorted(
         str(p.relative_to(workspace)) for p in workspace.rglob("*") if p.is_file()
     )
     return {"success": True, "files_created": files_created}
+
+
+def _tools_from_spec(tool_names: list[str]) -> list:
+    """Resolve agent-spec tool name strings to OpenHands Tool objects.
+
+    Read-only variants (file_editor_read, bash_read) are mapped to the
+    same Tool today — OpenHands doesn't yet expose a read-only mode at
+    this level. Agents that should not write files are kept honest via
+    system-prompt instructions (Reviewer / SecReviewer prompts say "do
+    not modify code"). Future work: wrap the tool in a permission
+    layer."""
+    name_to_tool = {
+        "bash": TerminalTool.name,
+        "bash_read": TerminalTool.name,
+        "file_editor": FileEditorTool.name,
+        "file_editor_read": FileEditorTool.name,
+        "task_tracker": TaskTrackerTool.name,
+        "terminal": TerminalTool.name,
+    }
+    seen: set[str] = set()
+    out: list = []
+    for n in tool_names:
+        tn = name_to_tool.get(n)
+        if tn and tn not in seen:
+            out.append(Tool(name=tn))
+            seen.add(tn)
+    # If the spec asks for no tools (e.g., a chat-only role), default to
+    # at least file_editor so the agent has somewhere to write its output.
+    if not out:
+        out.append(Tool(name=FileEditorTool.name))
+    return out
 
 
 def handle_fs_list_wake(session: MlsSession, payload: bytes, workspace_root: Path) -> bytes:
@@ -326,10 +391,23 @@ def handle_task_wake(
     task_description = task_spec["task"]
     task_id = task_spec.get("task_id", wake_id)
     orchestrator_bearer = task_spec.get("orchestrator_bearer")
+    # Sprint 22: the orchestrator may include a per-agent spec for the
+    # multi-agent path. If absent, we fall back to the single-agent legacy
+    # behavior (Kimi from env, all tools).
+    agent_spec = task_spec.get("agent_spec")
+    agent_idx = task_spec.get("agent_idx")
     print(f"[worker] task {task_id[:8]} (decrypted): {task_description[:80]}...", flush=True)
-    # Workspace dir keyed by task_id (not wake_id) so fs:list/fs:read can find
-    # it later by the same task_id the orchestrator + UI use.
-    task_workspace = workspace_root / f"task-{task_id[:12]}"
+    if agent_spec:
+        print(f"[worker] agent role={agent_spec.get('role')} model={agent_spec.get('model')}",
+              flush=True)
+    # Workspace: in single-agent mode, one dir per task. In multi-agent
+    # mode (Sprint 22), each agent gets its own subdir so the per-agent
+    # event poller can isolate file creations. The team-workspace
+    # promotion happens in Sprint 26 via SharedContext.
+    if agent_spec is not None and agent_idx is not None:
+        task_workspace = workspace_root / f"task-{task_id[:12]}" / f"agent-{agent_idx}-{agent_spec.get('role','x')}"
+    else:
+        task_workspace = workspace_root / f"task-{task_id[:12]}"
     task_workspace.mkdir(parents=True, exist_ok=True)
 
     event_queue: queue.Queue = queue.Queue()
@@ -373,7 +451,11 @@ def handle_task_wake(
             workspace=task_workspace,
             event_callback=on_event,
             token_callback=batcher.on_chunk if batcher is not None else None,
+            agent_spec=agent_spec,
         )
+        if agent_spec:
+            result["agent_role"] = agent_spec.get("role")
+            result["agent_idx"] = agent_idx
     except Exception as exc:
         result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
         print(f"[worker] perform_task raised: {exc}", flush=True)

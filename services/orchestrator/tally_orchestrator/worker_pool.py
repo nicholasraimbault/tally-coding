@@ -29,17 +29,18 @@ WORKER_DIR = Path(__file__).resolve().parents[3] / "spike" / "day4" / "worker"
 # `v10-<team_id>` tag for each provision so parallel deploys end up with
 # distinct App IDs (Phala derives the App ID from the compose hash, and
 # `image:` is one of the few fields that survives Phala's normalization).
-BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v12"
+BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v13"
 
 # GHCR package name for the worker image (used by Sprint 17's GC).
 GHCR_OWNER = "nicholasraimbault"
 GHCR_PACKAGE = "tally-spike-day4-worker"
 # Per-deploy tag prefix. GC targets only these — anything without this
-# prefix (e.g. `v12`, `v11`, `v10`, `v9`, `v1`) is preserved. Each base
-# bump leaves the prior prefix behind for cleanup of leftover tags.
+# prefix (e.g. `v13`, `v12`, `v11`, `v10`) is preserved. Each base bump
+# leaves the prior prefix behind for cleanup of leftover tags.
 DEPLOY_TAG_PREFIX_V10 = "v10-tally-auto-"
 DEPLOY_TAG_PREFIX_V11 = "v11-tally-auto-"
-DEPLOY_TAG_PREFIX = "v12-tally-auto-"
+DEPLOY_TAG_PREFIX_V12 = "v12-tally-auto-"
+DEPLOY_TAG_PREFIX = "v13-tally-auto-"
 
 
 def _phala_binary() -> str:
@@ -117,7 +118,7 @@ class WorkerPool:
         in ~1s (only the new manifest + tiny layer).
         """
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", team_id)
-        tag_name = f"v12-{safe}"
+        tag_name = f"v13-{safe}"
         new_ref = f"ghcr.io/nicholasraimbault/tally-spike-day4-worker:{tag_name}"
         # Ensure the base image is locally cached so the FROM in the
         # one-line Dockerfile resolves.
@@ -242,7 +243,8 @@ class WorkerPool:
             summary = {"id": v["id"], "digest": v["name"][:19], "tags": tags, "updated": updated}
             # Tagged version: only auto-deploy tags are GC targets.
             if tags:
-                auto_prefixes = (DEPLOY_TAG_PREFIX, DEPLOY_TAG_PREFIX_V11, DEPLOY_TAG_PREFIX_V10)
+                auto_prefixes = (DEPLOY_TAG_PREFIX, DEPLOY_TAG_PREFIX_V12,
+                                 DEPLOY_TAG_PREFIX_V11, DEPLOY_TAG_PREFIX_V10)
                 def _is_auto(t: str) -> bool:
                     return any(t.startswith(p) for p in auto_prefixes)
                 has_protected = any(not _is_auto(t) for t in tags)
