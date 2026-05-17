@@ -243,30 +243,146 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   /// and render each group with a colored band so multi-agent runs are
   /// readable. Events without agent_idx (Sprint 13 legacy) get a single
   /// unattributed band.
+  ///
+  /// Sprint 27.5 (open-items round): when team_spec.stages is set, insert
+  /// a "Stage N" divider before the first agent of each stage so a
+  /// reader of the chat scrollback can tell parallel stages apart from
+  /// sequential ones.
   List<Widget> _renderTimeline(bool taskRunning) {
     final groups = <int?, List<Map<String, dynamic>>>{};
     for (final ev in _events) {
       final idx = ev['agent_idx'] as int?;
       groups.putIfAbsent(idx, () => []).add(ev);
     }
-    // Sort: null first (legacy), then numeric agent_idx.
     final keys = groups.keys.toList()
       ..sort((a, b) => (a ?? -1).compareTo(b ?? -1));
+    // Build a {agent_idx → stage_idx} lookup from team_spec.stages.
+    final teamSpec = _task?.teamSpec;
+    final stages = (teamSpec?['stages'] as List<dynamic>?) ?? const [];
+    final stageByAgent = <int, int>{};
+    for (var s = 0; s < stages.length; s++) {
+      for (final i in (stages[s] as List<dynamic>)) {
+        if (i is int) stageByAgent[i] = s;
+      }
+    }
+    // Per-agent file list from result.agents[i].result.files_created.
+    // Available the moment the agent finishes; missing for in-flight
+    // agents and for legacy single-agent tasks.
+    final filesByAgent = <int, List<String>>{};
+    final resultAgents = (_task?.result?['agents'] as List<dynamic>?) ?? const [];
+    for (final a in resultAgents) {
+      if (a is! Map<String, dynamic>) continue;
+      final idx = a['agent_idx'];
+      final r = a['result'];
+      if (idx is! int || r is! Map<String, dynamic>) continue;
+      final fc = r['files_created'];
+      if (fc is List) {
+        filesByAgent[idx] = fc.whereType<String>().toList();
+      }
+    }
     final widgets = <Widget>[];
+    int? prevStage;
+    final seenPaths = <String>{};
     for (final k in keys) {
       final events = groups[k]!;
       final role = events.first['agent_role'] as String? ?? '?';
       final model = events.first['agent_model'] as String? ?? '';
       final isLastAgent = k == keys.last;
+      final stageIdx = (k != null) ? stageByAgent[k] : null;
+      // Emit a stage divider when we cross a stage boundary AND the
+      // team actually has a multi-stage shape (stages.length > 1).
+      if (stages.length > 1 && stageIdx != null && stageIdx != prevStage) {
+        final agentsInStage = (stages[stageIdx] as List).length;
+        widgets.add(_StageDivider(
+          stageIdx: stageIdx,
+          agentsInStage: agentsInStage,
+        ));
+        prevStage = stageIdx;
+      }
+      // Sprint 25.5 (open-items round): split the agent's file list
+      // into "new" (paths not seen in a prior agent) and "touched"
+      // (rewrote a prior file) so the user can tell where work was
+      // *added* vs where it was *iterated on*.
+      final allFiles = (k != null ? filesByAgent[k] : null) ?? const [];
+      final newFiles = <String>[];
+      final touchedFiles = <String>[];
+      for (final p in allFiles) {
+        if (seenPaths.contains(p)) {
+          touchedFiles.add(p);
+        } else {
+          newFiles.add(p);
+          seenPaths.add(p);
+        }
+      }
       widgets.add(_AgentBand(
         role: role,
         model: model,
         events: events,
         isLive: isLastAgent && taskRunning,
+        newFiles: newFiles,
+        touchedFiles: touchedFiles,
+        onFileTap: _openFileViewer,
       ));
       widgets.add(const SizedBox(height: 12));
     }
     return widgets;
+  }
+}
+
+class _StageDivider extends StatelessWidget {
+  final int stageIdx;
+  final int agentsInStage;
+  const _StageDivider({required this.stageIdx, required this.agentsInStage});
+
+  @override
+  Widget build(BuildContext context) {
+    final label = agentsInStage > 1
+        ? 'Stage ${stageIdx + 1} · $agentsInStage agents in parallel'
+        : 'Stage ${stageIdx + 1}';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Container(height: 1, color: const Color(0xFF1E1F22)),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2B2D31),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF404249)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    agentsInStage > 1 ? Icons.call_split : Icons.linear_scale,
+                    size: 12,
+                    color: const Color(0xFF8E9297),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      color: Color(0xFFB9BBBE),
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Expanded(
+            child: Container(height: 1, color: const Color(0xFF1E1F22)),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -299,11 +415,17 @@ class _AgentBand extends StatelessWidget {
   final String model;
   final List<Map<String, dynamic>> events;
   final bool isLive;
+  final List<String> newFiles;
+  final List<String> touchedFiles;
+  final ValueChanged<String>? onFileTap;
   const _AgentBand({
     required this.role,
     required this.model,
     required this.events,
     required this.isLive,
+    this.newFiles = const [],
+    this.touchedFiles = const [],
+    this.onFileTap,
   });
 
   @override
@@ -369,6 +491,13 @@ class _AgentBand extends StatelessWidget {
           ...[
             for (final w in _renderEvents(context, events, isLive)) w,
           ],
+          if (newFiles.isNotEmpty || touchedFiles.isNotEmpty)
+            _AgentFilesPanel(
+              tint: agentRoleOf(role).tint,
+              newFiles: newFiles,
+              touchedFiles: touchedFiles,
+              onTap: onFileTap,
+            ),
           const SizedBox(height: 8),
         ],
       ),
@@ -490,6 +619,108 @@ class _AgentBand extends StatelessWidget {
     );
   }
 }
+
+class _AgentFilesPanel extends StatelessWidget {
+  final Color tint;
+  final List<String> newFiles;
+  final List<String> touchedFiles;
+  final ValueChanged<String>? onTap;
+  const _AgentFilesPanel({
+    required this.tint,
+    required this.newFiles,
+    required this.touchedFiles,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E1F22).withValues(alpha: 0.5),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.folder_open, size: 12, color: tint),
+                const SizedBox(width: 6),
+                Text(
+                  'files',
+                  style: TextStyle(
+                    color: tint,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                if (newFiles.isNotEmpty)
+                  Text(
+                    '+${newFiles.length} new',
+                    style: const TextStyle(color: Color(0xFF57F287), fontSize: 10),
+                  ),
+                if (newFiles.isNotEmpty && touchedFiles.isNotEmpty)
+                  const Text(' · ', style: TextStyle(color: Color(0xFF8E9297), fontSize: 10)),
+                if (touchedFiles.isNotEmpty)
+                  Text(
+                    '~${touchedFiles.length} touched',
+                    style: const TextStyle(color: Color(0xFFFEE75C), fontSize: 10),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: [
+                for (final p in newFiles)
+                  _FileChip(path: p, color: const Color(0xFF57F287), onTap: onTap),
+                for (final p in touchedFiles)
+                  _FileChip(path: p, color: const Color(0xFFFEE75C), onTap: onTap),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FileChip extends StatelessWidget {
+  final String path;
+  final Color color;
+  final ValueChanged<String>? onTap;
+  const _FileChip({required this.path, required this.color, this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap == null ? null : () => onTap!(path),
+      borderRadius: BorderRadius.circular(3),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: Text(
+          path,
+          style: TextStyle(
+            color: color,
+            fontFamily: 'monospace',
+            fontSize: 10.5,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 
 class _BlinkingCursor extends StatefulWidget {
   final Color color;

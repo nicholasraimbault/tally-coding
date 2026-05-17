@@ -118,6 +118,21 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 CREATE INDEX IF NOT EXISTS idx_agents_task     ON agents(task_id);
 CREATE INDEX IF NOT EXISTS idx_agents_status   ON agents(status);
+
+-- Sprint 26.5 (open-items round): durable artifact map so a mid-task
+-- orchestrator restart can rehydrate the in-memory `_task_artifacts`
+-- and seed the next agent correctly. Without this, an orch restart
+-- between agents 2 and 3 leaves agent 3's workspace empty.
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    task_id     TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    b64_content TEXT NOT NULL,
+    agent_idx   INTEGER,                  -- which agent produced this
+    ts          REAL NOT NULL,
+    PRIMARY KEY (task_id, path),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
 """
 
 
@@ -487,6 +502,53 @@ class Db:
             "INSERT OR IGNORE INTO events (task_id, seq, event_json, received_at) VALUES (?, ?, ?, ?)",
             (task_id, seq, json.dumps(event), time.time()),
         )
+
+    # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
+
+    def upsert_artifacts(self, task_id: str, agent_idx: int | None, snap: dict[str, str]) -> None:
+        """Persist a per-agent file snapshot. Last-writer-wins per path —
+        matches the in-memory `_task_artifacts` semantics, just durable."""
+        now = time.time()
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO task_artifacts (task_id, path, b64_content, agent_idx, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(task_id, path, b64, agent_idx, now) for path, b64 in snap.items()],
+        )
+
+    def load_artifacts(self, task_id: str) -> dict[str, str]:
+        """Hydrate the {path: b64} dict for a task — used on lifespan boot
+        to rebuild the in-memory artifact map for in-flight tasks."""
+        rows = self._conn.execute(
+            "SELECT path, b64_content FROM task_artifacts WHERE task_id=?",
+            (task_id,),
+        ).fetchall()
+        return {path: b64 for path, b64 in rows}
+
+    def list_artifact_paths(self, task_id: str) -> list[dict]:
+        """Per-agent path manifest for the UI: {agent_idx, path, size_b64}.
+        Stays cheap because the table is keyed (task_id, path)."""
+        rows = self._conn.execute(
+            "SELECT path, agent_idx, length(b64_content) FROM task_artifacts "
+            "WHERE task_id=? ORDER BY agent_idx, path",
+            (task_id,),
+        ).fetchall()
+        return [
+            {"path": path, "agent_idx": idx, "size_b64": size}
+            for path, idx, size in rows
+        ]
+
+    def delete_artifacts(self, task_id: str) -> int:
+        """Free durable storage after a task is fully terminal."""
+        cur = self._conn.execute(
+            "DELETE FROM task_artifacts WHERE task_id=?", (task_id,),
+        )
+        return cur.rowcount or 0
+
+    def list_artifact_task_ids(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT task_id FROM task_artifacts"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ── worker pool state ──────────────────────────────────────────────────
 
@@ -951,20 +1013,48 @@ class Orchestrator:
         affinity: str | None = None
         if 0 <= agent_idx < len(spec_agents) and isinstance(spec_agents[agent_idx], dict):
             affinity = spec_agents[agent_idx].get("worker_affinity") or None
+        acquire_timeout = int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120"))
         try:
-            handle = await self.acquire_idle(
-                timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")),
-                affinity=affinity,
-            )
+            handle = await self.acquire_idle(timeout=acquire_timeout, affinity=affinity)
         except TimeoutError as exc:
-            logger.error(
-                "task %s agent %s: no worker available (affinity=%s)",
-                task["id"][:8], agent["role"], affinity,
+            # Sprint 28.5 fallover: a strict "local" or "tee" affinity that
+            # times out is usually because that worker tier went away
+            # (laptop closed, CVM died). Rather than failing the whole
+            # task, retry once with no affinity — better to run on the
+            # other tier than to abort the team.
+            if affinity in ("local", "tee"):
+                logger.warning(
+                    "task %s agent %s: affinity=%s unavailable; downgrading to any-worker retry",
+                    task["id"][:8], agent["role"], affinity,
+                )
+                try:
+                    handle = await self.acquire_idle(timeout=acquire_timeout, affinity=None)
+                    affinity_downgrade = True
+                except TimeoutError as exc2:
+                    logger.error(
+                        "task %s agent %s: no worker available even after downgrade",
+                        task["id"][:8], agent["role"],
+                    )
+                    self.db.mark_agent_failed(agent["id"], str(exc2))
+                    self.db.mark_failed(task["id"], f"no worker for {agent['role']}: {exc2}")
+                    await self._publish_status(task["id"], "failed", {"error": str(exc2)})
+                    return
+            else:
+                logger.error(
+                    "task %s agent %s: no worker available (affinity=%s)",
+                    task["id"][:8], agent["role"], affinity,
+                )
+                self.db.mark_agent_failed(agent["id"], str(exc))
+                self.db.mark_failed(task["id"], f"no worker for {agent['role']}: {exc}")
+                await self._publish_status(task["id"], "failed", {"error": str(exc)})
+                return
+        else:
+            affinity_downgrade = False
+        if affinity_downgrade:
+            logger.info(
+                "task %s agent %s landed on %s worker after affinity=%s downgrade",
+                task["id"][:8], agent["role"], handle.worker_type, affinity,
             )
-            self.db.mark_agent_failed(agent["id"], str(exc))
-            self.db.mark_failed(task["id"], f"no worker for {agent['role']}: {exc}")
-            await self._publish_status(task["id"], "failed", {"error": str(exc)})
-            return
         try:
             handle.in_flight_task = task["id"]
             self.db.set_task_worker(task["id"], handle.identity)
@@ -1322,6 +1412,9 @@ class Orchestrator:
             bucket = self._task_artifacts.setdefault(task_id, {})
             for path, b64 in snap.items():
                 bucket[path] = b64  # last-write-wins between agents
+            # Sprint 26.5: also persist so an orchestrator restart can
+            # rehydrate this dict before the next agent dispatches.
+            self.db.upsert_artifacts(task_id, agent_idx, snap)
             logger.info("task %s agent %s snapshot: %d file(s); team artifacts now=%d",
                         task_id[:8], target_agent["role"], len(snap), len(bucket))
         # Mark this agent done.
@@ -1338,6 +1431,7 @@ class Orchestrator:
         if result.get("success") is False:
             self.db.mark_failed(task_id, f"agent {target_agent['role']} failed: {result.get('error', '?')}")
             self._task_artifacts.pop(task_id, None)  # Sprint 26: free memory
+            self.db.delete_artifacts(task_id)        # Sprint 26.5: free durable copy
             await self._publish_status(
                 task_id, "failed",
                 {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
@@ -1397,6 +1491,7 @@ class Orchestrator:
         }
         self.db.mark_completed(task_id, aggregate)
         artifact_count = len(self._task_artifacts.pop(task_id, {}))  # Sprint 26: free memory
+        self.db.delete_artifacts(task_id)  # Sprint 26.5: free durable copy
         await self._publish_status(
             task_id, "completed",
             {"success": aggregate["success"], "agents_run": len(final_agents)},
@@ -1787,6 +1882,23 @@ async def lifespan(app: FastAPI):
     state["db"] = db
     state["event_bus"] = event_bus
 
+    # Sprint 26.5: rehydrate the in-memory artifact map from the durable
+    # task_artifacts table. Without this, a mid-task orchestrator restart
+    # would dispatch the next agent with an empty seed_files and break
+    # the artifact-passing contract.
+    pre_orch_artifacts: dict[str, dict[str, str]] = {}
+    for tid in db.list_artifact_task_ids():
+        t = db.get_task(tid)
+        if t is None or t.get("status") in ("completed", "failed"):
+            # Stale entry from a task that finished elsewhere; clean up.
+            db.delete_artifacts(tid)
+            continue
+        pre_orch_artifacts[tid] = db.load_artifacts(tid)
+    if pre_orch_artifacts:
+        logger.info("rehydrated artifacts for %d in-flight task(s): %s",
+                    len(pre_orch_artifacts),
+                    ", ".join(f"{tid[:8]}({len(v)})" for tid, v in pre_orch_artifacts.items()))
+
     orchestrator = Orchestrator(
         tally_url=tally_url,
         identity_path=identity_path,
@@ -1794,6 +1906,10 @@ async def lifespan(app: FastAPI):
         db=db,
         event_bus=event_bus,
     )
+    # Sprint 26.5: install the rehydrated artifact map so the next agent
+    # dispatched (e.g. by a stage advance after restart) gets the seed.
+    if pre_orch_artifacts:
+        orchestrator._task_artifacts.update(pre_orch_artifacts)
     # Sprint 23: load Red Pill creds from the same scripts/.env that builds
     # worker env files. The architect uses these for the per-task team
     # picker. Missing key → architect calls fall back to Solo Coder.
@@ -1842,14 +1958,18 @@ async def lifespan(app: FastAPI):
     state["processor_task"] = processor_task
     sweeper_task = asyncio.create_task(orchestrator.run_recovery_sweeper())
     state["sweeper_task"] = sweeper_task
-    logger.info("ready; pool=%d, processor + recovery sweeper started",
-                len(orchestrator.handles))
+    backup_task = asyncio.create_task(run_nightly_backup())  # Sprint 24.5
+    state["backup_task"] = backup_task
+    logger.info(
+        "ready; pool=%d, processor + recovery sweeper + nightly backup started",
+        len(orchestrator.handles),
+    )
     try:
         yield
     finally:
         for team_id in list(orchestrator.pollers.keys()):
             orchestrator.stop_poller(team_id)
-        for t in (processor_task, sweeper_task):
+        for t in (processor_task, sweeper_task, backup_task):
             t.cancel()
             try:
                 await t
@@ -2186,6 +2306,95 @@ async def pool_gc(body: PoolGcBody) -> dict:
         dry_run=body.dry_run,
     )
     return result
+
+
+# ── Sprint 24.5 (open items): SQLite backup endpoints ─────────────────────────
+
+
+_BACKUP_DIR_ENV = "ORCH_BACKUP_DIR"
+_BACKUP_DIR_DEFAULT = "/data/backups"
+
+
+def _backup_dir() -> Path:
+    return Path(os.environ.get(_BACKUP_DIR_ENV, _BACKUP_DIR_DEFAULT))
+
+
+def _take_sqlite_backup() -> Path:
+    """Use the SQLite Online Backup API (via Python's `backup()` method)
+    rather than copying the file, so the snapshot is consistent even
+    while the orchestrator is writing. Caller is responsible for
+    cleanup if the backup completes successfully."""
+    db: Db = state["db"]
+    out_dir = _backup_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    out_path = out_dir / f"tasks-{stamp}.db"
+    src = db._conn
+    import sqlite3 as _sqlite3
+    dst = _sqlite3.connect(str(out_path))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+    # Prune older than 7 backups — keep operational footprint small.
+    keep = 7
+    files = sorted(out_dir.glob("tasks-*.db"))
+    for old in files[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return out_path
+
+
+@app.post("/admin/backup", dependencies=[Depends(require_token)])
+async def admin_backup_create() -> dict:
+    """Trigger a SQLite .backup snapshot into ORCH_BACKUP_DIR (default
+    /data/backups). Returns the path + size so an operator can download
+    it via /admin/backup/<filename>."""
+    path = await asyncio.to_thread(_take_sqlite_backup)
+    return {"path": str(path), "size": path.stat().st_size, "filename": path.name}
+
+
+@app.get("/admin/backup", dependencies=[Depends(require_token)])
+async def admin_backup_list() -> dict:
+    out_dir = _backup_dir()
+    if not out_dir.exists():
+        return {"backups": []}
+    entries = []
+    for p in sorted(out_dir.glob("tasks-*.db")):
+        s = p.stat()
+        entries.append({"filename": p.name, "size": s.st_size, "mtime": s.st_mtime})
+    return {"backups": entries}
+
+
+@app.get("/admin/backup/{filename}", dependencies=[Depends(require_token)])
+async def admin_backup_download(filename: str):
+    # Path-traversal guard — filename must be exactly tasks-<stamp>.db.
+    if "/" in filename or ".." in filename or not filename.startswith("tasks-"):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="invalid filename")
+    p = _backup_dir() / filename
+    if not p.exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="no such backup")
+    from fastapi.responses import FileResponse
+    return FileResponse(str(p), media_type="application/octet-stream", filename=filename)
+
+
+async def run_nightly_backup() -> None:
+    """Background coroutine: take a SQLite snapshot every 24h. Started
+    from `lifespan`. Failures are warned + the loop continues."""
+    interval = float(os.environ.get("ORCH_BACKUP_INTERVAL_S", str(24 * 3600)))
+    # First backup at boot+60s (delay so transient startup churn settles).
+    await asyncio.sleep(60)
+    while True:
+        try:
+            path = await asyncio.to_thread(_take_sqlite_backup)
+            logger.info("nightly backup: %s (%d bytes)", path, path.stat().st_size)
+        except Exception as exc:
+            logger.warning("nightly backup failed: %s", exc)
+        await asyncio.sleep(interval)
 
 
 def main() -> None:

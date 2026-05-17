@@ -41,25 +41,42 @@ WORKSPACE_DIR = DATA_DIR / "workspace"
 ENV_FILE = DATA_DIR / "env"
 
 
+STANDALONE_VENV = DATA_DIR / "venv"
+
+
+def _has_mls_engine(py: Path) -> bool:
+    """Quick probe: does this interpreter's skytale_sdk expose MlsEngine?"""
+    try:
+        return subprocess.run(
+            [str(py), "-c", "from skytale_sdk import MlsEngine"],
+            capture_output=True,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
 def _venv_python() -> Path:
     """Locate a Python interpreter that has BOTH the MLS-enabled
-    skytale-sdk wheel (Sprint 11+) and the openhands-sdk runtime.
-    The orchestrator's venv ships both; the repo-root venv historically
-    has openhands but a stock PyPI skytale-sdk without `MlsEngine`,
-    which crashes the worker import chain.
+    skytale-sdk wheel and the openhands-sdk runtime.
 
-    Order matters — orchestrator venv first."""
+    Sprint 28.5 (open-items round) adds a STANDALONE venv at
+    `~/.local/share/tally-agent/venv/` as the preferred install target.
+    Falls back to checkout-relative venvs when standalone isn't yet
+    provisioned — which is exactly the bootstrap path for users
+    running tally-agent before `tally-agent install --standalone`."""
     candidates = [
+        STANDALONE_VENV / "bin" / "python",
         REPO_ROOT / "services" / "orchestrator" / ".venv" / "bin" / "python",
         WORKER_DIR / ".venv" / "bin" / "python",
         REPO_ROOT / ".venv" / "bin" / "python",
     ]
     for c in candidates:
-        if c.exists():
+        if c.exists() and _has_mls_engine(c):
             return c
     raise SystemExit(
-        f"no venv found; expected one of: {', '.join(str(c) for c in candidates)}\n"
-        f"run `uv sync` in services/orchestrator/ first"
+        "no Python interpreter found with a working `from skytale_sdk import MlsEngine`.\n"
+        "Run `tally-agent install --standalone` to provision a dedicated venv,\n"
+        "or ensure services/orchestrator/.venv is built (`uv sync` in that dir)."
     )
 
 
@@ -68,12 +85,80 @@ def _gen_team_id() -> str:
     return f"tally-local-{host}-{secrets.token_hex(3)}"
 
 
+def _build_standalone_venv() -> Path:
+    """Sprint 28.5: provision a dedicated venv at
+    `~/.local/share/tally-agent/venv/` so tally-agent doesn't require
+    the orchestrator's checkout. Needs cargo + maturin in PATH because
+    skytale-sdk's MlsEngine isn't on PyPI yet — falls back to a clear
+    error message if the build deps are missing."""
+    if STANDALONE_VENV.exists() and _has_mls_engine(STANDALONE_VENV / "bin" / "python"):
+        print(f">>> standalone venv already healthy: {STANDALONE_VENV}")
+        return STANDALONE_VENV / "bin" / "python"
+    uv = shutil.which("uv")
+    if uv is None:
+        raise SystemExit(
+            "uv not found in PATH; install with `pipx install uv` or "
+            "`curl -LsSf https://astral.sh/uv/install.sh | sh`"
+        )
+    print(f">>> provisioning standalone venv at {STANDALONE_VENV}")
+    subprocess.run([uv, "venv", str(STANDALONE_VENV), "--python", "3.12"], check=True)
+    py = STANDALONE_VENV / "bin" / "python"
+    # PyPI deps — anything that doesn't need source builds.
+    print(">>> installing PyPI deps (openhands, httpx, cryptography, …)")
+    subprocess.run([
+        uv, "pip", "install", "--python", str(py),
+        "openhands-ai",
+        "httpx>=0.27.0",
+        "cryptography>=42.0",
+        "python-dotenv>=1.0.0",
+    ], check=True)
+    # tally-coding-core (path package; no PyPI release).
+    print(">>> installing tally-coding-core from repo")
+    subprocess.run([
+        uv, "pip", "install", "--python", str(py), "--no-deps",
+        str(REPO_ROOT),
+    ], check=True)
+    # skytale-sdk: PyPI version lacks MlsEngine, so build from source via
+    # maturin. Requires cargo. If maturin isn't present, install it into
+    # the same venv first (it's a pure-python wheel with a pre-built
+    # Rust binary).
+    print(">>> building skytale-sdk from skytale repo master (needs cargo + rustc)")
+    if shutil.which("cargo") is None:
+        raise SystemExit(
+            "cargo not found in PATH. tally-agent's MLS-enabled skytale-sdk\n"
+            "isn't on PyPI yet; install rustup (https://rustup.rs) then re-run\n"
+            "`tally-agent install --standalone`. Or skip --standalone and use\n"
+            "the orchestrator's venv via `uv sync` in services/orchestrator/."
+        )
+    subprocess.run([uv, "pip", "install", "--python", str(py), "maturin"], check=True)
+    skytale_src = REPO_ROOT.parent / "skytale" / "sdk"
+    if not skytale_src.exists():
+        raise SystemExit(
+            f"skytale sources not found at {skytale_src}. Clone the skytale\n"
+            "repo as a sibling of tally-coding (`git clone …/skytale.git ../skytale`)\n"
+            "and re-run install."
+        )
+    subprocess.run([
+        str(py), "-m", "maturin", "develop", "--release", "--features", "python",
+        "--manifest-path", str(skytale_src / "Cargo.toml"),
+    ], check=True)
+    if not _has_mls_engine(py):
+        raise SystemExit(
+            "standalone venv built but `from skytale_sdk import MlsEngine` still fails.\n"
+            "This is unexpected; please file an issue."
+        )
+    print(f">>> standalone venv ready: {py}")
+    return py
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.chmod(0o700)
     MLS_STATE_DIR.mkdir(parents=True, exist_ok=True)
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "standalone", False):
+        _build_standalone_venv()
 
     # Generate (or keep) the team_id. Idempotent across reruns; user can
     # force a new identity by `tally-agent uninstall && rm -rf <DATA_DIR>`.
@@ -160,12 +245,26 @@ EnvironmentFile={ENV_FILE}
 ExecStart={py} {WORKER_DIR}/worker_spike.py
 Restart=on-failure
 RestartSec=5
-# Light sandboxing. NoNewPrivileges blocks setuid escalation; the
-# OpenHands tools are sandboxed at the OpenHands layer (FileEditor
-# write paths, etc.). Heavier systemd sandboxing (ProtectHome /
-# BindReadOnlyPaths) is left out — getting the namespace bindings
-# right is finicky and most local-agent users want flexibility.
+
+# ── Sandbox (Sprint 28.5) ───────────────────────────────────────────────
+# Block setuid escalation entirely.
 NoNewPrivileges=yes
+# Per-unit /tmp so workspaces don't leak across runs.
+PrivateTmp=yes
+# Most of the filesystem is read-only; only DATA_DIR is writable.
+ProtectSystem=strict
+# $HOME is read-only — the venv + sources stay visible, but the agent
+# can't trash random user files. DATA_DIR comes back read-write via
+# BindPaths so the keypair + workspace work.
+ProtectHome=read-only
+BindPaths={DATA_DIR}
+# Misc kernel hardening — cheap, no behavioral impact.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=default.target
@@ -264,7 +363,14 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("install", help="generate keypair + write systemd user unit").set_defaults(fn=cmd_install)
+    install_p = sub.add_parser("install", help="generate keypair + write systemd user unit")
+    install_p.add_argument(
+        "--standalone",
+        action="store_true",
+        help="provision a dedicated venv at ~/.local/share/tally-agent/venv/ "
+             "(needs cargo + maturin until skytale-sdk publishes MlsEngine to PyPI)",
+    )
+    install_p.set_defaults(fn=cmd_install)
     sub.add_parser("enroll",  help="print TEAM_ID + WORKER_IDENTITY_B64 for the orchestrator").set_defaults(fn=cmd_enroll)
     sub.add_parser("run",     help="run the worker in the foreground (systemd ExecStart)").set_defaults(fn=cmd_run)
     sub.add_parser("status",  help="systemctl --user status tally-agent").set_defaults(fn=cmd_status)
