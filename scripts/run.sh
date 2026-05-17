@@ -39,14 +39,49 @@ prompt_for_secret() {
   printf -v "$varname" "%s" "$value"
 }
 
+# Probe Red Pill auth with a minimal completion request.
+# Returns 0 if key is accepted (HTTP 200), 1 otherwise.
+# Prints the HTTP status code so callers can give a useful message.
+probe_redpill_key() {
+  local key="$1"
+  local base_url="${2:-https://api.redpill.ai/v1}"
+  local model="${3:-moonshotai/Kimi-K2-6}"
+  local http_code
+  http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -X POST "${base_url}/chat/completions" \
+    -H "Authorization: Bearer ${key}" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
+    --max-time 15 2>/dev/null || echo "000")
+  echo "$http_code"
+  [[ "$http_code" == "200" ]]
+}
+
 ensure_env_configured() {
-  # If .env exists and has a non-empty REDPILL_API_KEY, we're set
+  # If .env exists with a non-empty key, validate it against Red Pill before reusing.
+  # If the key is rejected (401) or unreachable, delete .env and re-prompt — silent
+  # re-tries with a known-bad key waste 5+ min on uv sync + agent boot before failing.
   if [[ -f scripts/.env ]]; then
-    # Don't `source` raw user input directly — parse the key safely
     local existing_key
     existing_key=$(grep -E '^REDPILL_API_KEY=' scripts/.env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]' || true)
     if [[ -n "$existing_key" ]]; then
-      return 0
+      echo ">> Validating existing REDPILL_API_KEY against api.redpill.ai..."
+      local probe_status
+      probe_status=$(probe_redpill_key "$existing_key" | tail -1)
+      if [[ "$probe_status" == "200" ]]; then
+        echo "  ✓ Key accepted (HTTP 200)"
+        return 0
+      fi
+      echo "  ✗ Key rejected (HTTP ${probe_status}) — re-prompting"
+      if [[ "$probe_status" == "401" ]]; then
+        echo "    (401 = key not recognized by Red Pill; likely wrong dashboard or expired)"
+      elif [[ "$probe_status" == "402" || "$probe_status" == "429" ]]; then
+        echo "    (${probe_status} = key valid but account out of credits/quota)"
+      elif [[ "$probe_status" == "000" ]]; then
+        echo "    (network unreachable; check connection and try again)"
+        exit 1
+      fi
+      rm -f scripts/.env
     fi
   fi
 
@@ -57,18 +92,40 @@ ensure_env_configured() {
 ║  Tally Coding Week 1 Runner — first-time setup                 ║
 ╚════════════════════════════════════════════════════════════════╝
 
-Need your Phala API key for TEE-attested LLM inference (Redpill).
-Get it from: https://phala.com/ → Dashboard → API Keys
+Need your Red Pill API key for TEE-attested LLM inference.
+Get it from: https://redpill.ai/dashboard → API Keys
+(Red Pill is the LLM gateway powered by Phala TEE — separate signup from
+Phala Cloud. A Phala Cloud key will NOT work here.)
 (Key is stored to scripts/.env locally; gitignored; never sent anywhere.)
 
 BANNER
 
   local redpill_key=""
-  while [[ -z "$redpill_key" ]]; do
-    prompt_for_secret "Phala API key (REDPILL_API_KEY): " redpill_key
-    if [[ -z "$redpill_key" ]]; then
-      echo "  (empty — try again, or Ctrl+C to abort)"
+  while true; do
+    redpill_key=""
+    while [[ -z "$redpill_key" ]]; do
+      prompt_for_secret "Red Pill API key (REDPILL_API_KEY): " redpill_key
+      if [[ -z "$redpill_key" ]]; then
+        echo "  (empty — try again, or Ctrl+C to abort)"
+      fi
+    done
+    echo "  >> Validating against api.redpill.ai..."
+    local probe_status
+    probe_status=$(probe_redpill_key "$redpill_key" | tail -1)
+    if [[ "$probe_status" == "200" ]]; then
+      echo "  ✓ Key accepted (HTTP 200)"
+      break
     fi
+    echo "  ✗ Key rejected (HTTP ${probe_status})."
+    if [[ "$probe_status" == "401" ]]; then
+      echo "    Likely wrong dashboard. Generate one at https://redpill.ai/dashboard."
+    elif [[ "$probe_status" == "402" || "$probe_status" == "429" ]]; then
+      echo "    Account out of credits/quota. Top up at https://redpill.ai/dashboard."
+    elif [[ "$probe_status" == "000" ]]; then
+      echo "    Network unreachable. Aborting."
+      exit 1
+    fi
+    echo "    Paste a different key, or Ctrl+C to abort."
   done
 
   # Show confirmation with masked key (first 4 + last 4 chars)
@@ -78,11 +135,13 @@ BANNER
   else
     masked="(set; ${#redpill_key} chars)"
   fi
-  echo "  ✓ Phala API key recorded: ${masked}"
+  echo "  ✓ Red Pill API key recorded: ${masked}"
 
   # Optional second key
   echo ""
   echo "Optional: Phala Cloud API key for headless 'phala deploy' (Day 2-4)."
+  echo "Get it from: https://cloud.phala.network → API Tokens (different account"
+  echo "from Red Pill above)."
   echo "If you skip this, the script will prompt you to run 'phala login' once."
   local phala_cloud_key=""
   prompt_for_secret "Phala Cloud API key (PHALA_CLOUD_API_KEY; press Enter to skip): " phala_cloud_key
