@@ -92,10 +92,11 @@ ensure_env_configured() {
 ║  Tally Coding Week 1 Runner — first-time setup                 ║
 ╚════════════════════════════════════════════════════════════════╝
 
-Need your Red Pill API key for TEE-attested LLM inference.
-Get it from: https://redpill.ai/dashboard → API Keys
-(Red Pill is the LLM gateway powered by Phala TEE — separate signup from
-Phala Cloud. A Phala Cloud key will NOT work here.)
+Need your Phala API key for TEE-attested LLM inference (Red Pill).
+Get it from: https://cloud.phala.com → dashboard → API Keys
+(Red Pill is Phala's inference brand; one Phala account, one dashboard.
+If you have multiple API key sections, pick the AI / Red Pill one — not
+the CVM-management one. Verify your account has credits before using.)
 (Key is stored to scripts/.env locally; gitignored; never sent anywhere.)
 
 BANNER
@@ -118,9 +119,10 @@ BANNER
     fi
     echo "  ✗ Key rejected (HTTP ${probe_status})."
     if [[ "$probe_status" == "401" ]]; then
-      echo "    Likely wrong dashboard. Generate one at https://redpill.ai/dashboard."
+      echo "    Likely: wrong API key section (you may have a CVM key, not an AI key),"
+      echo "    no credits on account, or AI inference not enabled. Check cloud.phala.com."
     elif [[ "$probe_status" == "402" || "$probe_status" == "429" ]]; then
-      echo "    Account out of credits/quota. Top up at https://redpill.ai/dashboard."
+      echo "    Account out of credits/quota. Top up at cloud.phala.com → Billing."
     elif [[ "$probe_status" == "000" ]]; then
       echo "    Network unreachable. Aborting."
       exit 1
