@@ -45,6 +45,7 @@ from tally_coding_core.identity import bearer_from_pubkey, load_or_create_identi
 from tally_coding_core.mls import MlsSession
 from tally_coding_core.tally_workers import TallyWorkersClient
 
+from .architect import architect_team
 from .worker_pool import WorkerPool
 
 logger = logging.getLogger("tally.orchestrator")
@@ -258,12 +259,18 @@ class Db:
 
     _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity"
 
-    def create_task(self, description: str) -> str:
+    def create_task(self, description: str, team_spec: dict | None = None) -> str:
+        """Sprint 23: team_spec can be set atomically with task creation so
+        the processor loop never sees a `pending` row without its
+        team_spec already attached. Without this guard, the architect's
+        ~3-5s LLM call lets the processor pick up the task as single-agent
+        before the spec lands (race observed in Sprint 23 validation)."""
         task_id = uuid.uuid4().hex
         now = time.time()
         self._conn.execute(
-            "INSERT INTO tasks (id, description, status, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?)",
-            (task_id, description, now, now),
+            "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at) "
+            "VALUES (?, ?, 'pending', ?, ?, ?)",
+            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now),
         )
         return task_id
 
@@ -654,6 +661,12 @@ class Orchestrator:
         self._sweep_last_at: float | None = None
         self._sweep_last_demoted: int = 0
         self._sweep_total_demoted: int = 0
+        # Sprint 23: Red Pill credentials for the Tally architect. Loaded
+        # from the same scripts/.env that builds worker env files. None
+        # means architect calls fall back to Solo Coder unconditionally
+        # (logged at boot if missing).
+        self.redpill_key: str | None = None
+        self.redpill_base: str = "https://api.redpill.ai/v1"
 
     # ── handle lifecycle ──────────────────────────────────────────────────
 
@@ -1529,6 +1542,24 @@ async def lifespan(app: FastAPI):
         db=db,
         event_bus=event_bus,
     )
+    # Sprint 23: load Red Pill creds from the same scripts/.env that builds
+    # worker env files. The architect uses these for the per-task team
+    # picker. Missing key → architect calls fall back to Solo Coder.
+    try:
+        env_lines = Path(scripts_env).read_text().splitlines()
+        for line in env_lines:
+            line = line.strip()
+            if line.startswith("REDPILL_API_KEY="):
+                orchestrator.redpill_key = line.split("=", 1)[1].strip()
+            elif line.startswith("REDPILL_BASE_URL="):
+                orchestrator.redpill_base = line.split("=", 1)[1].strip()
+        if orchestrator.redpill_key:
+            logger.info("Tally architect ready (Red Pill at %s)", orchestrator.redpill_base)
+        else:
+            logger.warning("REDPILL_API_KEY not found in %s; architect will fall back to Solo Coder",
+                           scripts_env)
+    except OSError as exc:
+        logger.warning("could not read %s for Red Pill creds: %s", scripts_env, exc)
     state["orchestrator"] = orchestrator
 
     slots = await _resolve_pool(db, pool, target_pool_size)
@@ -1578,14 +1609,35 @@ async def health() -> dict:
 @app.post("/tasks", dependencies=[Depends(require_token)], response_model=TaskResponse)
 async def submit_task(body: TaskSubmit) -> TaskResponse:
     db: Db = state["db"]
-    task_id = db.create_task(body.description)
-    # Sprint 22: stash team_spec BEFORE the processor loop picks the task
-    # up. The processor reads team_spec when it dispatches; setting it
-    # after create_task is racy (processor polls every 0.5s) but in
-    # practice the round-trip is much faster.
-    if body.team_spec:
-        db.set_task_team_spec(task_id, body.team_spec)
-    task = state["db"].get_task(task_id)
+    orch: Orchestrator = state["orchestrator"]
+    # Sprint 22-23: figure out the team BEFORE creating the task row, so
+    # the processor loop can't race the architect. Three sources, in
+    # order of priority:
+    #   1. Client supplied team_spec in the request — use as-is.
+    #   2. Tally architect — synchronous LLM call (Llama-3.3 via Red Pill).
+    #   3. Architect's internal fallback (Solo Coder).
+    # The architect call adds ~500ms-3s of latency to POST /tasks. Worth
+    # it for zero-config multi-agent — users just describe what they
+    # want and Tally builds the team.
+    team_spec = body.team_spec
+    if team_spec is None and orch.redpill_key:
+        try:
+            palette = db.list_agent_roles()
+            team_spec = await asyncio.to_thread(
+                architect_team,
+                description=body.description,
+                palette=palette,
+                redpill_key=orch.redpill_key,
+                redpill_base=orch.redpill_base,
+            )
+        except Exception as exc:
+            logger.exception("architect call raised; falling back to single-agent: %s", exc)
+            team_spec = None
+    # Atomic insert with team_spec attached — no race window for the
+    # processor to pick the task up as single-agent before team_spec
+    # lands.
+    task_id = db.create_task(body.description, team_spec=team_spec)
+    task = db.get_task(task_id)
     return TaskResponse(**task)
 
 
