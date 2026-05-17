@@ -671,6 +671,14 @@ class Orchestrator:
         # (logged at boot if missing).
         self.redpill_key: str | None = None
         self.redpill_base: str = "https://api.redpill.ai/v1"
+        # Sprint 26: per-task accumulated artifacts. Each value is a
+        # {relative_path: base64_content} dict; agents receive prior
+        # agents' files via the `seed_files` field on dispatch, and
+        # their result events deliver their snapshot under `files_b64`.
+        # In-memory only — the orchestrator can rebuild it from the
+        # last agent's result on restart if needed (Sprint 18's
+        # recovery semantics already handle the at-least-once case).
+        self._task_artifacts: dict[str, dict[str, str]] = {}
 
     # ── handle lifecycle ──────────────────────────────────────────────────
 
@@ -877,6 +885,9 @@ class Orchestrator:
                         "system_prompt": role.get("system_prompt", ""),
                         "tools": role.get("tools", []),
                     },
+                    # Sprint 26: hand the agent its predecessors' files.
+                    # Empty on the first agent in a team.
+                    "seed_files": self._task_artifacts.get(task["id"], {}),
                 }
                 ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
                 ack_bytes = await asyncio.to_thread(
@@ -1157,6 +1168,18 @@ class Orchestrator:
             logger.debug("duplicate result event for task %s agent %s; ignoring",
                          task_id[:8], target_agent["role"])
             return
+        # Sprint 26: harvest workspace snapshot before persisting the
+        # result row. We keep the per-agent files in memory keyed by
+        # task_id and strip `files_b64` from what we write into SQLite
+        # — those base64 blobs would balloon the row and Sprint 26's
+        # caps already keep the in-memory copy bounded (2 MB / task).
+        snap = result.pop("files_b64", None) if isinstance(result, dict) else None
+        if snap:
+            bucket = self._task_artifacts.setdefault(task_id, {})
+            for path, b64 in snap.items():
+                bucket[path] = b64  # last-write-wins between agents
+            logger.info("task %s agent %s snapshot: %d file(s); team artifacts now=%d",
+                        task_id[:8], target_agent["role"], len(snap), len(bucket))
         # Mark this agent done.
         if result.get("success") is False:
             self.db.mark_agent_failed(target_agent["id"], result.get("error", "agent returned failure"))
@@ -1170,6 +1193,7 @@ class Orchestrator:
         # Did this agent fail? Short-circuit the rest of the workflow.
         if result.get("success") is False:
             self.db.mark_failed(task_id, f"agent {target_agent['role']} failed: {result.get('error', '?')}")
+            self._task_artifacts.pop(task_id, None)  # Sprint 26: free memory
             await self._publish_status(
                 task_id, "failed",
                 {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
@@ -1200,11 +1224,13 @@ class Orchestrator:
             ],
         }
         self.db.mark_completed(task_id, aggregate)
+        artifact_count = len(self._task_artifacts.pop(task_id, {}))  # Sprint 26: free memory
         await self._publish_status(
             task_id, "completed",
             {"success": aggregate["success"], "agents_run": len(final_agents)},
         )
-        logger.info("task %s team complete: %d agents", task_id[:8], len(final_agents))
+        logger.info("task %s team complete: %d agents, %d artifact(s) accumulated",
+                    task_id[:8], len(final_agents), artifact_count)
 
     async def run_recovery_sweeper(self) -> None:
         """Sprint 18+19: every 60s, demote any `recovering` row older

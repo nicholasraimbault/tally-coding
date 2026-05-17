@@ -74,6 +74,80 @@ def build_llm(model_override: str | None = None) -> LLM:
     return LLM(model=f"openai/{model_name}", api_key=api_key, base_url=base_url, stream=True)
 
 
+# Sprint 26: workspace artifact passing — caps used by both the seed
+# (orchestrator → worker on dispatch) and the snapshot (worker →
+# orchestrator on result). Filters keep the payload practical for MLS
+# wakes and skip directories the agent shouldn't leak forward.
+_SEED_PER_FILE_MAX_BYTES = 256 * 1024        # 256 KB per file
+_SNAPSHOT_PER_FILE_MAX_BYTES = 256 * 1024    # ditto
+_SNAPSHOT_TOTAL_MAX_BYTES = 2 * 1024 * 1024  # 2 MB total per agent
+_SKIP_PATH_SEGMENTS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
+
+
+def _path_is_skipped(rel_path: str) -> bool:
+    parts = rel_path.split("/")
+    return any(p in _SKIP_PATH_SEGMENTS for p in parts)
+
+
+def _materialize_seed_files(workspace: Path, seed_files: dict) -> int:
+    """Sprint 26: write the orchestrator-supplied seed files into the
+    agent's workspace before OpenHands runs. Returns the count written.
+
+    Each value is base64-encoded bytes. Paths are validated to stay
+    inside `workspace` (no `..` traversal). Skipped paths and oversize
+    files are silently ignored — the orchestrator already filters them
+    but the worker double-checks since the payload came over the wire."""
+    workspace_resolved = workspace.resolve()
+    count = 0
+    for rel_path, b64_content in seed_files.items():
+        if not isinstance(rel_path, str) or not isinstance(b64_content, str):
+            continue
+        if _path_is_skipped(rel_path):
+            continue
+        try:
+            content = base64.b64decode(b64_content, validate=True)
+        except Exception:
+            continue
+        if len(content) > _SEED_PER_FILE_MAX_BYTES:
+            continue
+        target = (workspace / rel_path).resolve()
+        try:
+            target.relative_to(workspace_resolved)
+        except ValueError:
+            continue  # path-traversal attempt; skip
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        count += 1
+    return count
+
+
+def _snapshot_workspace(workspace: Path) -> dict:
+    """Sprint 26: read all files in the agent's workspace and return them
+    as a {relative_path: base64_content} dict for the result event. Caps
+    per-file and total size; skips directories from `_SKIP_PATH_SEGMENTS`.
+    The orchestrator merges this into the team-wide artifact map and
+    seeds the next agent's workspace from it."""
+    files_b64: dict[str, str] = {}
+    total = 0
+    for p in sorted(workspace.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(workspace))
+        if _path_is_skipped(rel):
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        if len(data) > _SNAPSHOT_PER_FILE_MAX_BYTES:
+            continue
+        if total + len(data) > _SNAPSHOT_TOTAL_MAX_BYTES:
+            break
+        total += len(data)
+        files_b64[rel] = base64.b64encode(data).decode("ascii")
+    return files_b64
+
+
 def event_summary(event: Any) -> dict:
     """Reduce a verbose OpenHands event to a UI-friendly dict.
 
@@ -411,19 +485,28 @@ def handle_task_wake(
     # behavior (Kimi from env, all tools).
     agent_spec = task_spec.get("agent_spec")
     agent_idx = task_spec.get("agent_idx")
+    # Sprint 26: orchestrator may include prior agents' files so the
+    # current agent sees the team's accumulated workspace, not just its
+    # own. Dict of {relative_path: base64_content}.
+    seed_files = task_spec.get("seed_files") or {}
     print(f"[worker] task {task_id[:8]} (decrypted): {task_description[:80]}...", flush=True)
     if agent_spec:
         print(f"[worker] agent role={agent_spec.get('role')} model={agent_spec.get('model')}",
               flush=True)
     # Workspace: in single-agent mode, one dir per task. In multi-agent
     # mode (Sprint 22), each agent gets its own subdir so the per-agent
-    # event poller can isolate file creations. The team-workspace
-    # promotion happens in Sprint 26 via SharedContext.
+    # event poller can isolate file creations. Sprint 26 layers a seed
+    # of the team's workspace on top before OpenHands starts.
     if agent_spec is not None and agent_idx is not None:
         task_workspace = workspace_root / f"task-{task_id[:12]}" / f"agent-{agent_idx}-{agent_spec.get('role','x')}"
     else:
         task_workspace = workspace_root / f"task-{task_id[:12]}"
     task_workspace.mkdir(parents=True, exist_ok=True)
+
+    # Sprint 26: seed the agent's workspace with prior agents' files.
+    if seed_files:
+        seeded = _materialize_seed_files(task_workspace, seed_files)
+        print(f"[worker] seeded {seeded} file(s) from prior agents", flush=True)
 
     event_queue: queue.Queue = queue.Queue()
     emitter_thread = None
@@ -476,6 +559,16 @@ def handle_task_wake(
         if agent_spec:
             result["agent_role"] = agent_spec.get("role")
             result["agent_idx"] = agent_idx
+        # Sprint 26: snapshot the workspace so the orchestrator can seed
+        # the next agent. Only sent when this is part of a multi-agent
+        # team — single-agent legacy tasks have no downstream consumer.
+        if agent_spec is not None and agent_idx is not None:
+            snap = _snapshot_workspace(task_workspace)
+            if snap:
+                result["files_b64"] = snap
+                print(f"[worker] snapshot: {len(snap)} file(s), "
+                      f"{sum(len(v) for v in snap.values())} b64 bytes",
+                      flush=True)
     except Exception as exc:
         result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
         print(f"[worker] perform_task raised: {exc}", flush=True)
