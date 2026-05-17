@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../api.dart';
+import 'file_tree.dart';
 
 class _BlinkingCursor extends StatefulWidget {
   final Color color;
@@ -51,6 +52,10 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
   int _lastSeq = -1;
   String? _error;
   StreamSubscription? _framesSub;
+  // Workspace tree state — fetched once after the task reaches terminal.
+  List<Map<String, dynamic>>? _files;
+  String? _filesError;
+  bool _filesLoading = false;
 
   @override
   void initState() {
@@ -79,9 +84,34 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
       final t = await widget.client.getTask(widget.taskId);
       if (!mounted) return;
       setState(() => _task = t);
+      // If the task is already terminal (page open after completion) and we
+      // haven't fetched the workspace yet, kick that off now too.
+      if (t.isTerminal && _files == null && !_filesLoading) {
+        _fetchFiles();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
+    }
+  }
+
+  Future<void> _fetchFiles() async {
+    if (_filesLoading) return;
+    setState(() => _filesLoading = true);
+    try {
+      final entries = await widget.client.listFiles(widget.taskId);
+      if (!mounted) return;
+      setState(() {
+        _files = entries;
+        _filesError = null;
+        _filesLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _filesError = e.toString();
+        _filesLoading = false;
+      });
     }
   }
 
@@ -328,26 +358,43 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                         ),
                       ),
                     ),
-                    if (t.result?['files_created'] is List) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        'Files created (${(t.result!['files_created'] as List).length}) — tap to view',
-                        style: Theme.of(context).textTheme.titleSmall,
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Text('Workspace', style: Theme.of(context).textTheme.titleSmall),
+                        const SizedBox(width: 8),
+                        if (_files != null)
+                          Text('(${_files!.where((e) => e['is_dir'] != true).length} files)',
+                              style: Theme.of(context).textTheme.bodySmall),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.refresh, size: 18),
+                          tooltip: 'Refresh workspace',
+                          onPressed: _filesLoading ? null : _fetchFiles,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    if (_filesLoading && _files == null)
+                      const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator()))
+                    else if (_filesError != null && _files == null)
+                      Card(
+                        color: Theme.of(context).colorScheme.errorContainer,
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: SelectableText(_filesError!),
+                        ),
+                      )
+                    else if (_files != null)
+                      Card(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: FileTreeView(
+                            root: FileTreeNode.build(_files!),
+                            onFileTap: _openFileViewer,
+                          ),
+                        ),
                       ),
-                      const SizedBox(height: 4),
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
-                        children: (t.result!['files_created'] as List).map((f) {
-                          final path = f.toString();
-                          return ActionChip(
-                            label: Text(path, style: const TextStyle(fontSize: 12)),
-                            avatar: const Icon(Icons.description, size: 14),
-                            onPressed: () => _openFileViewer(path),
-                          );
-                        }).toList(),
-                      ),
-                    ],
                   ],
                   if (t.status == 'failed' && t.error != null) ...[
                     Text('Error', style: Theme.of(context).textTheme.titleSmall),
