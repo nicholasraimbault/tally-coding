@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""tally-agent — Sprint 28 local-worker daemon.
+
+Drops a systemd user unit on the user's machine + generates a wake-bearer
+keypair. The daemon registers itself with the Tally Workers relay just
+like a Phala-hosted worker, so the orchestrator (running in a CVM)
+can dispatch tasks to it via the existing MLS-encrypted wake path —
+no incoming network required on the laptop.
+
+Usage:
+    tally-agent install     # one-time setup: keypair, dirs, systemd unit
+    tally-agent enroll      # print TEAM_ID + WORKER_IDENTITY_B64 for orch
+    tally-agent run         # foreground (used by systemd ExecStart)
+    tally-agent status      # systemctl --user status tally-agent
+    tally-agent start       # systemctl --user start tally-agent
+    tally-agent stop        # systemctl --user stop tally-agent
+    tally-agent uninstall   # remove systemd unit (leaves keypair intact)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKER_DIR = REPO_ROOT / "spike" / "day4" / "worker"
+CORE_DIR = REPO_ROOT
+DATA_DIR = Path.home() / ".local" / "share" / "tally-agent"
+SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
+UNIT_NAME = "tally-agent.service"
+TEAM_ID_FILE = DATA_DIR / "team_id"
+IDENTITY_KEY_PATH = DATA_DIR / "worker.key"
+MLS_STATE_DIR = DATA_DIR / "mls-state"
+WORKSPACE_DIR = DATA_DIR / "workspace"
+ENV_FILE = DATA_DIR / "env"
+
+
+def _venv_python() -> Path:
+    """Locate a Python interpreter that has BOTH the MLS-enabled
+    skytale-sdk wheel (Sprint 11+) and the openhands-sdk runtime.
+    The orchestrator's venv ships both; the repo-root venv historically
+    has openhands but a stock PyPI skytale-sdk without `MlsEngine`,
+    which crashes the worker import chain.
+
+    Order matters — orchestrator venv first."""
+    candidates = [
+        REPO_ROOT / "services" / "orchestrator" / ".venv" / "bin" / "python",
+        WORKER_DIR / ".venv" / "bin" / "python",
+        REPO_ROOT / ".venv" / "bin" / "python",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise SystemExit(
+        f"no venv found; expected one of: {', '.join(str(c) for c in candidates)}\n"
+        f"run `uv sync` in services/orchestrator/ first"
+    )
+
+
+def _gen_team_id() -> str:
+    host = socket.gethostname().split(".")[0][:16]
+    return f"tally-local-{host}-{secrets.token_hex(3)}"
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.chmod(0o700)
+    MLS_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate (or keep) the team_id. Idempotent across reruns; user can
+    # force a new identity by `tally-agent uninstall && rm -rf <DATA_DIR>`.
+    if TEAM_ID_FILE.exists():
+        team_id = TEAM_ID_FILE.read_text().strip()
+        print(f">>> using existing team_id: {team_id}")
+    else:
+        team_id = _gen_team_id()
+        TEAM_ID_FILE.write_text(team_id + "\n")
+        TEAM_ID_FILE.chmod(0o600)
+        print(f">>> generated team_id: {team_id}")
+
+    # Generate the worker identity if missing. We try to do this here so
+    # `enroll` can run straight after install without first starting the
+    # service; if the system Python lacks `cryptography`, fall back to
+    # using the venv Python via a subprocess. If neither is available,
+    # the key will be lazily created by worker_spike.py's first run.
+    if not IDENTITY_KEY_PATH.exists():
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            priv = Ed25519PrivateKey.generate()
+            IDENTITY_KEY_PATH.write_bytes(priv.private_bytes_raw())
+            IDENTITY_KEY_PATH.chmod(0o600)
+            print(f">>> generated worker identity: {IDENTITY_KEY_PATH}")
+        except ModuleNotFoundError:
+            try:
+                venv_py = _venv_python()
+                subprocess.run(
+                    [str(venv_py), "-c",
+                     "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey;"
+                     "import sys, pathlib;"
+                     "p = Ed25519PrivateKey.generate();"
+                     f"pathlib.Path('{IDENTITY_KEY_PATH}').write_bytes(p.private_bytes_raw())"],
+                    check=True,
+                )
+                IDENTITY_KEY_PATH.chmod(0o600)
+                print(f">>> generated worker identity via {venv_py}")
+            except Exception as exc:
+                print(f"!!! could not generate identity now ({exc}); worker_spike will create it on first run")
+    else:
+        print(f">>> using existing identity: {IDENTITY_KEY_PATH}")
+
+    # Write the env file. The systemd unit's EnvironmentFile points here
+    # so the user can tweak (REDPILL_API_KEY, TALLY_WORKERS_URL) without
+    # re-running install.
+    redpill = os.environ.get("REDPILL_API_KEY", "")
+    redpill_base = os.environ.get("REDPILL_BASE_URL", "https://api.redpill.ai/v1")
+    redpill_model = os.environ.get("REDPILL_MODEL", "moonshotai/kimi-k2.6")
+    tally_url = os.environ.get("TALLY_WORKERS_URL", "https://tally.nraimbault16.workers.dev")
+    if not redpill:
+        scripts_env = REPO_ROOT / "scripts" / ".env"
+        if scripts_env.exists():
+            for line in scripts_env.read_text().splitlines():
+                if line.startswith("REDPILL_API_KEY="):
+                    redpill = line.split("=", 1)[1].strip()
+                    break
+    if not redpill:
+        print("!!! REDPILL_API_KEY not found in env or scripts/.env — agent will run but agents needing LLM calls will fail")
+    env_lines = [
+        f"TEAM_ID={team_id}",
+        f"WORKER_IDENTITY_PATH={IDENTITY_KEY_PATH}",
+        f"WORKER_MLS_STATE_DIR={MLS_STATE_DIR}",
+        f"WORKSPACE_DIR={WORKSPACE_DIR}",
+        f"TALLY_WORKERS_URL={tally_url}",
+        f"REDPILL_API_KEY={redpill}",
+        f"REDPILL_BASE_URL={redpill_base}",
+        f"REDPILL_MODEL={redpill_model}",
+        f"PYTHONPATH={WORKER_DIR}:{CORE_DIR}",
+    ]
+    ENV_FILE.write_text("\n".join(env_lines) + "\n")
+    ENV_FILE.chmod(0o600)
+    print(f">>> wrote env file: {ENV_FILE}")
+
+    # Write the systemd user unit.
+    py = _venv_python()
+    unit = f"""[Unit]
+Description=Tally Coding local-worker daemon (Sprint 28)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile={ENV_FILE}
+ExecStart={py} {WORKER_DIR}/worker_spike.py
+Restart=on-failure
+RestartSec=5
+# Light sandboxing. NoNewPrivileges blocks setuid escalation; the
+# OpenHands tools are sandboxed at the OpenHands layer (FileEditor
+# write paths, etc.). Heavier systemd sandboxing (ProtectHome /
+# BindReadOnlyPaths) is left out — getting the namespace bindings
+# right is finicky and most local-agent users want flexibility.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+"""
+    unit_path = SYSTEMD_USER_DIR / UNIT_NAME
+    unit_path.write_text(unit)
+    print(f">>> wrote unit: {unit_path}")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    print(">>> systemctl --user daemon-reload")
+    print()
+    print(">>> install complete. Next:")
+    print("    tally-agent enroll        # copy values into services/orchestrator/.env.prod")
+    print("    tally-agent start         # systemctl --user start tally-agent")
+    print("    tally-agent status        # confirm it registered")
+    return 0
+
+
+def _identity_b64() -> str:
+    """Read the worker's public-key identity (base64url, no pad) — the
+    same bearer the orchestrator passes as WORKER_IDENTITY_B64. This
+    is what `phala deploy`'s seed script captures by polling the
+    worker's stdout; for a local daemon we derive it directly from
+    the private key on disk.
+
+    Run via the venv Python so cryptography is available — system
+    Python often lacks it on minimal installs."""
+    if not IDENTITY_KEY_PATH.exists():
+        raise SystemExit(f"no identity at {IDENTITY_KEY_PATH}; run `tally-agent install` first")
+    venv_py = _venv_python()
+    res = subprocess.run(
+        [str(venv_py), "-c",
+         f"import sys; sys.path.insert(0, '{CORE_DIR}');"
+         "from tally_coding_core.identity import bearer_from_pubkey, load_or_create_identity;"
+         f"_, pub = load_or_create_identity('{IDENTITY_KEY_PATH}');"
+         "print(bearer_from_pubkey(pub))"],
+        capture_output=True, text=True, check=True,
+    )
+    return res.stdout.strip()
+
+
+def cmd_enroll(args: argparse.Namespace) -> int:
+    if not TEAM_ID_FILE.exists():
+        raise SystemExit("not installed; run `tally-agent install` first")
+    team_id = TEAM_ID_FILE.read_text().strip()
+    identity = _identity_b64()
+    print(f"TEAM_ID_LOCAL={team_id}")
+    print(f"WORKER_IDENTITY_B64_LOCAL={identity}")
+    print()
+    print("Add the two lines above to services/orchestrator/.env.prod, then:")
+    print("    phala deploy --cvm-id <orch-cvm-id> -c docker-compose.yml -e .env.prod --wait")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Foreground run — used by the systemd ExecStart. Just invokes
+    worker_spike.py's main() with the env file's vars already in the
+    process environment."""
+    # Ensure env file is loaded if we were invoked directly without systemd.
+    if ENV_FILE.exists() and not os.environ.get("TEAM_ID"):
+        for line in ENV_FILE.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+    sys.path.insert(0, str(WORKER_DIR))
+    sys.path.insert(0, str(CORE_DIR))
+    import worker_spike  # type: ignore
+    return worker_spike.main()
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    return subprocess.call(
+        ["systemctl", "--user", "status", UNIT_NAME, "--no-pager"]
+    )
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    return subprocess.call(["systemctl", "--user", "start", UNIT_NAME])
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    return subprocess.call(["systemctl", "--user", "stop", UNIT_NAME])
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    subprocess.call(["systemctl", "--user", "stop", UNIT_NAME], stderr=subprocess.DEVNULL)
+    subprocess.call(["systemctl", "--user", "disable", UNIT_NAME], stderr=subprocess.DEVNULL)
+    unit_path = SYSTEMD_USER_DIR / UNIT_NAME
+    if unit_path.exists():
+        unit_path.unlink()
+        print(f">>> removed unit: {unit_path}")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    print(f">>> kept keypair + workspace at {DATA_DIR}; rm -rf to wipe completely")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("install", help="generate keypair + write systemd user unit").set_defaults(fn=cmd_install)
+    sub.add_parser("enroll",  help="print TEAM_ID + WORKER_IDENTITY_B64 for the orchestrator").set_defaults(fn=cmd_enroll)
+    sub.add_parser("run",     help="run the worker in the foreground (systemd ExecStart)").set_defaults(fn=cmd_run)
+    sub.add_parser("status",  help="systemctl --user status tally-agent").set_defaults(fn=cmd_status)
+    sub.add_parser("start",   help="systemctl --user start tally-agent").set_defaults(fn=cmd_start)
+    sub.add_parser("stop",    help="systemctl --user stop tally-agent").set_defaults(fn=cmd_stop)
+    sub.add_parser("uninstall", help="remove systemd unit (keypair preserved)").set_defaults(fn=cmd_uninstall)
+    args = parser.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

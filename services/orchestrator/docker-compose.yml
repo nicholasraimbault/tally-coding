@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v5
+    image: ghcr.io/nicholasraimbault/tally-orch:v6
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -24,6 +24,14 @@ services:
       # provisions a worker locally and writes them into .env.prod.
       - TEAM_ID=${TEAM_ID:-}
       - WORKER_IDENTITY_B64=${WORKER_IDENTITY_B64:-}
+      # Sprint 28: optional local-worker pin. Set TEAM_ID_LOCAL +
+      # WORKER_IDENTITY_B64_LOCAL via `tally-agent enroll`'s output;
+      # the orchestrator joins both workers into its pool and routes
+      # by `worker_affinity` on each agent. With two workers in the
+      # pool, bump TALLY_POOL_SIZE to 2 so the orchestrator's
+      # bootstrap accepts both env-pinned workers.
+      - TEAM_ID_LOCAL=${TEAM_ID_LOCAL:-}
+      - WORKER_IDENTITY_B64_LOCAL=${WORKER_IDENTITY_B64_LOCAL:-}
     volumes:
       - data:/data
 

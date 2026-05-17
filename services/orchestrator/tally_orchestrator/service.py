@@ -657,6 +657,13 @@ class WorkerHandle:
     cvm_id: str
     app_id: str | None
     session: MlsSession
+    # Sprint 28: how the orchestrator should think about this worker's
+    # environment. "tee" = Phala CVM (default; full sandbox, no host
+    # filesystem). "local" = a user-installed `tally-agent` daemon on
+    # the user's machine — same MLS handshake, just running outside
+    # a TEE. Agents whose team_spec sets worker_affinity="local" or
+    # "local_if_available" prefer this handle.
+    worker_type: str = "tee"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     failures: int = 0  # consecutive task failures on this handle
     in_flight_task: str | None = None  # task_id currently running on this worker
@@ -719,7 +726,15 @@ class Orchestrator:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def add_handle(self, *, team_id: str, worker_identity: str, cvm_id: str, app_id: str | None) -> WorkerHandle:
+    def add_handle(
+        self,
+        *,
+        team_id: str,
+        worker_identity: str,
+        cvm_id: str,
+        app_id: str | None,
+        worker_type: str = "tee",
+    ) -> WorkerHandle:
         """Construct a WorkerHandle (no bootstrap yet). Caller must call
         bootstrap_handle() before the handle is usable for tasks."""
         group_id = f"orch-worker-{team_id}".encode("utf-8")
@@ -730,7 +745,7 @@ class Orchestrator:
         )
         handle = WorkerHandle(
             identity=worker_identity, team_id=team_id, cvm_id=cvm_id,
-            app_id=app_id, session=session,
+            app_id=app_id, session=session, worker_type=worker_type,
         )
         self.handles[worker_identity] = handle
         return handle
@@ -802,15 +817,41 @@ class Orchestrator:
         )
         return b64url_decode(result["response"])
 
-    async def acquire_idle(self, timeout: float = 60.0) -> WorkerHandle:
+    async def acquire_idle(
+        self,
+        timeout: float = 60.0,
+        *,
+        affinity: str | None = None,
+    ) -> WorkerHandle:
         """Wait up to `timeout` for a handle that is both unlocked AND has
         no in-flight task (Sprint 19). The lock guards MLS sender-ratchet
         state during a dispatch; `in_flight_task` guards worker busyness
         across the gap between dispatch-ack and result-event arrival.
+
+        Sprint 28: `affinity` filters which handles count as candidates.
+          - None / "any": any worker type
+          - "tee":              only TEE handles
+          - "local":            only local handles (hard requirement)
+          - "local_if_available": local first; falls back to any handle
+            once half the timeout has elapsed without a local match.
         Picks the first matching handle in dict-insertion order."""
+        def _matches(h: WorkerHandle, want: str | None) -> bool:
+            if want in (None, "any"):
+                return True
+            if want == "local_if_available":
+                return h.worker_type == "local"
+            return h.worker_type == want
         deadline = time.monotonic() + timeout
+        # For local_if_available, soft-prefer local until half the budget
+        # is gone, then accept any handle. Hard "local" / "tee" never
+        # widen — operator chose them deliberately.
+        soft_deadline = deadline if affinity != "local_if_available" else time.monotonic() + (timeout / 2.0)
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            want = affinity if (affinity != "local_if_available" or now < soft_deadline) else None
             for handle in list(self.handles.values()):
+                if not _matches(handle, want):
+                    continue
                 if handle.lock.locked() or handle.in_flight_task is not None:
                     continue
                 try:
@@ -824,7 +865,9 @@ class Orchestrator:
                     continue
                 return handle
             await asyncio.sleep(0.5)
-        raise TimeoutError(f"no idle worker available within {timeout}s")
+        raise TimeoutError(
+            f"no idle worker available within {timeout}s (affinity={affinity})"
+        )
 
     async def _publish_status(self, task_id: str, status: str, extra: dict | None = None) -> None:
         payload = {"task_id": task_id, "status": status, "ts": time.time()}
@@ -897,10 +940,27 @@ class Orchestrator:
         """Encrypt + send one agent's task wake. Fire-and-forget; the
         event poller advances to the next agent on result. Mirrors
         `_dispatch_single_agent` but with per-agent payload."""
+        # Sprint 28: per-agent worker_affinity, sourced from the
+        # architect's team_spec.agents[idx].worker_affinity. The
+        # dispatcher prefers handles of the matching type; with
+        # "local_if_available" we widen to any handle after half the
+        # acquire timeout, so a missing local worker doesn't stall.
+        team_spec = task.get("team_spec") or {}
+        agent_idx = agent["agent_idx"]
+        spec_agents = (team_spec.get("agents") or []) if isinstance(team_spec, dict) else []
+        affinity: str | None = None
+        if 0 <= agent_idx < len(spec_agents) and isinstance(spec_agents[agent_idx], dict):
+            affinity = spec_agents[agent_idx].get("worker_affinity") or None
         try:
-            handle = await self.acquire_idle(timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")))
+            handle = await self.acquire_idle(
+                timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")),
+                affinity=affinity,
+            )
         except TimeoutError as exc:
-            logger.error("task %s agent %s: no worker available", task["id"][:8], agent["role"])
+            logger.error(
+                "task %s agent %s: no worker available (affinity=%s)",
+                task["id"][:8], agent["role"], affinity,
+            )
             self.db.mark_agent_failed(agent["id"], str(exc))
             self.db.mark_failed(task["id"], f"no worker for {agent['role']}: {exc}")
             await self._publish_status(task["id"], "failed", {"error": str(exc)})
@@ -1547,12 +1607,28 @@ async def _resolve_pool(db: Db, pool: WorkerPool, target_size: int) -> list[dict
     env_team = os.environ.get("TEAM_ID", "").strip()
     env_id = os.environ.get("WORKER_IDENTITY_B64", "").strip()
     if env_team and env_id:
-        logger.info("using env-pinned worker: team=%s identity=%s...", env_team, env_id[:12])
+        logger.info("using env-pinned tee worker: team=%s identity=%s...", env_team, env_id[:12])
         results.append({
             "team_id": env_team, "identity": env_id,
             "cvm_id": f"env-{env_team}", "app_id": None, "from_env": True,
+            "worker_type": "tee",
         })
         seen.add(env_id)
+
+    # Sprint 28: optional second pinned worker — `tally-agent` running on
+    # the user's laptop. Identical bootstrap path to the TEE worker, just
+    # tagged with worker_type="local" so the dispatcher can route by
+    # `worker_affinity` (Sprint 28's affinity-aware acquire_idle).
+    local_team = os.environ.get("TEAM_ID_LOCAL", "").strip()
+    local_id = os.environ.get("WORKER_IDENTITY_B64_LOCAL", "").strip()
+    if local_team and local_id and local_id not in seen:
+        logger.info("using env-pinned local worker: team=%s identity=%s...", local_team, local_id[:12])
+        results.append({
+            "team_id": local_team, "identity": local_id,
+            "cvm_id": f"env-{local_team}", "app_id": None, "from_env": True,
+            "worker_type": "local",
+        })
+        seen.add(local_id)
 
     for w in db.list_active_workers():
         if len(results) >= target_size:
@@ -1633,6 +1709,7 @@ async def _bootstrap_slot(
         handle = orch.add_handle(
             team_id=w["team_id"], worker_identity=w["identity"],
             cvm_id=w["cvm_id"], app_id=w.get("app_id"),
+            worker_type=w.get("worker_type", "tee"),
         )
         try:
             await asyncio.to_thread(orch.bootstrap_handle, handle)

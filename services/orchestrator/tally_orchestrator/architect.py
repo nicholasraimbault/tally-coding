@@ -144,6 +144,15 @@ Constraints:
 - Keep spec strings short and actionable.
 - The workflow string is human-readable; `stages` is the authoritative graph.
 
+Optional per-agent fields:
+- `worker_affinity`: where this agent should run.
+  - `"tee"`         — must run in a Phala TEE worker (default for Coder/SecReviewer/anything writing secrets-adjacent code).
+  - `"local"`       — must run on the user's local-worker daemon (requires `tally-agent` installed; rare; for FS-touching tasks).
+  - `"local_if_available"` — prefer local; fall back to TEE if local isn't online. Good default for Tester (runs against the user's real environment).
+  - `"any"` (or absent) — let the orchestrator decide.
+
+Output `worker_affinity` only when you have a real reason; defaults are fine for most tasks.
+
 Task: {description}
 
 Return JSON ONLY."""
@@ -222,6 +231,7 @@ def _validate_team_spec(raw: dict, valid_roles: set[str]) -> dict | None:
     if not isinstance(agents, list) or not agents:
         return None
     cleaned_agents: list[dict[str, Any]] = []
+    _valid_affinities = {"any", "tee", "local", "local_if_available"}
     for a in agents:
         if not isinstance(a, dict):
             return None
@@ -231,7 +241,15 @@ def _validate_team_spec(raw: dict, valid_roles: set[str]) -> dict | None:
         spec = a.get("spec", "")
         if not isinstance(spec, str):
             return None
-        cleaned_agents.append({"role": role, "spec": spec[:1000]})
+        cleaned = {"role": role, "spec": spec[:1000]}
+        # Sprint 28: worker_affinity is optional; only carry forward when
+        # the architect picked a non-default value. Garbage / unknown
+        # values silently drop to default ("any"), so the orchestrator
+        # never has to handle malformed affinities at dispatch time.
+        aff = a.get("worker_affinity")
+        if isinstance(aff, str) and aff in _valid_affinities and aff != "any":
+            cleaned["worker_affinity"] = aff
+        cleaned_agents.append(cleaned)
     workflow = raw.get("workflow")
     if not isinstance(workflow, str):
         workflow = " -> ".join(a["role"] for a in cleaned_agents)
