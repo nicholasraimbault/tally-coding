@@ -578,15 +578,18 @@ class Orchestrator:
         removed: list[str] = []
         if target_size > current:
             n = target_size - current
-            logger.info("scale: adding %d worker(s) serially (current=%d, target=%d)",
+            logger.info("scale: adding %d worker(s) in parallel (current=%d, target=%d)",
                         n, current, target_size)
-            # Serial provisioning: see _resolve_pool for the Phala KMS
-            # UNIQUE-on-address constraint that bites parallel deploys.
-            for i in range(n):
-                try:
-                    r = await asyncio.to_thread(pool.provision)
-                except Exception as exc:
-                    logger.warning("scale: provision %d/%d failed: %s", i + 1, n, exc)
+            # Parallel: per-deploy image tags (Sprint 16) give each CVM
+            # its own Phala App ID, so the KMS UNIQUE(address) race that
+            # required serial in Sprint 14 no longer applies.
+            provisioned = await asyncio.gather(
+                *[asyncio.to_thread(pool.provision) for _ in range(n)],
+                return_exceptions=True,
+            )
+            for r in provisioned:
+                if isinstance(r, BaseException):
+                    logger.warning("scale: provision failed: %s", r)
                     continue
                 assert r.identity is not None
                 self.db.add_active_worker(
@@ -841,19 +844,18 @@ async def _resolve_pool(db: Db, pool: WorkerPool, target_size: int) -> list[dict
 
     shortfall = target_size - len(results)
     if shortfall > 0:
-        # Provision serially. Phala's centralized KMS has a UNIQUE constraint
-        # on `dstack_app_nonces.address`; two parallel `phala deploy` calls
-        # that hash to the same App ID race for that row and the loser fails
-        # with `ix_dstack_app_nonces_address`. Serial deploys land the first
-        # nonce successfully, and the second deploy proceeds (Phala accepts
-        # multiple CVMs sharing an App ID once the nonce is established).
-        logger.info("auto-provisioning %d worker(s) serially (may take ~%dmin)",
-                    shortfall, 3 * shortfall)
-        for i in range(shortfall):
-            try:
-                r = await asyncio.to_thread(pool.provision)
-            except Exception as exc:
-                logger.warning("provision %d/%d failed: %s", i + 1, shortfall, exc)
+        # Provision in parallel. Each provision pushes its own per-deploy
+        # image tag (Sprint 16) before calling phala deploy, so each lands
+        # in a distinct Phala App ID — no UNIQUE(address) race like the
+        # Sprint 14 serial workaround was avoiding.
+        logger.info("auto-provisioning %d worker(s) in parallel (may take ~3-5min)", shortfall)
+        provisioned = await asyncio.gather(
+            *[asyncio.to_thread(pool.provision) for _ in range(shortfall)],
+            return_exceptions=True,
+        )
+        for r in provisioned:
+            if isinstance(r, BaseException):
+                logger.warning("provision failed: %s", r)
                 continue
             assert r.identity is not None
             db.add_active_worker(

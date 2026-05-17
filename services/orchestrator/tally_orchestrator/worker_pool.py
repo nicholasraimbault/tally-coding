@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # phala-deploy invocation runs from this directory.
 WORKER_DIR = Path(__file__).resolve().parents[3] / "spike" / "day4" / "worker"
 
+# Base image that every per-deploy alias tag points at. Sprint 16 pushes a
+# `v10-<team_id>` tag for each provision so parallel deploys end up with
+# distinct App IDs (Phala derives the App ID from the compose hash, and
+# `image:` is one of the few fields that survives Phala's normalization).
+BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v10"
+
 
 def _phala_binary() -> str:
     """Locate the phala CLI. systemd user units inherit the user's PATH;
@@ -60,9 +66,12 @@ class WorkerPool:
 
     def provision(self) -> WorkerInfo:
         """Deploy a new worker CVM with a pre-generated Ed25519 keypair
-        passed via env. The CVM uses this directly as its MLS identity, so
-        two parallel provisions land in distinct identities even when Phala
-        collapses their docker-compose into a single shared App ID."""
+        passed via env, against a per-deploy image tag pushed to GHCR. The
+        unique image reference is what gives each CVM its own Phala App ID
+        — Sprint 14 found that container_name, labels, volumes and command
+        all get stripped from the compose before hashing, but `image:`
+        survives, so swapping the tag is the cheapest way to bust the
+        hash."""
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
         suffix = secrets.token_hex(3)
@@ -70,8 +79,9 @@ class WorkerPool:
         worker_name = f"tally-worker-{int(time.time())}-{suffix}"
         priv_obj = Ed25519PrivateKey.generate()
         privkey_hex = priv_obj.private_bytes_raw().hex()
+        image_ref = self._ensure_unique_image_tag(team_id)
         env_file = self._build_env_file(team_id, privkey_hex)
-        compose_file = self._build_compose_file(team_id)
+        compose_file = self._build_compose_file(team_id, image_ref)
         info = self._deploy(worker_name, env_file, compose_file)
         info.team_id = team_id
         info.identity = self._await_identity(info.cvm_id)
@@ -79,16 +89,75 @@ class WorkerPool:
                     info.cvm_id[:8], team_id, (info.identity or "")[:12])
         return info
 
-    def _build_compose_file(self, team_id: str) -> Path:
-        """Generate a per-deploy compose. With Sprint 14's WORKER_PRIVKEY_HEX
-        env-passing model (worker:v10+) the compose doesn't need to differ
-        between deploys for correctness — Phala's app dedup is fine here
-        since each CVM gets its own env + key via the env file. We still
-        write a per-team file just to keep the deploy-time inputs isolated
-        and easy to inspect at /tmp/tally-auto-compose-*.yml."""
+    def _ensure_unique_image_tag(self, team_id: str) -> str:
+        """Build + push a *digest-distinct* per-deploy image to GHCR.
+
+        Phala derives the App ID from a compose hash that resolves
+        `image:` to its registry digest — so swapping the *tag* alone
+        (pointing at the same manifest) doesn't change the App ID. We
+        observed two parallel deploys with `v10-7ad21b` and `v10-02e174`
+        both landing on the same App ID and the second failing with
+        "This app_id already has an active CVM with a different
+        configuration."
+
+        The fix: add a tiny one-line layer (`LABEL`) on top of the base
+        image. The label has no runtime effect but does change the
+        manifest digest. Each `docker build` of `FROM v10 + LABEL=X`
+        finishes in ~1s (no rebuild of underlying layers) and pushes
+        in ~1s (only the new manifest + tiny layer).
+        """
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", team_id)
+        tag_name = f"v10-{safe}"
+        new_ref = f"ghcr.io/nicholasraimbault/tally-spike-day4-worker:{tag_name}"
+        # Ensure the base image is locally cached so the FROM in the
+        # one-line Dockerfile resolves.
+        res = subprocess.run(
+            ["docker", "pull", BASE_IMAGE],
+            capture_output=True, text=True, timeout=300,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"docker pull failed for {BASE_IMAGE}:\n{res.stdout}\n{res.stderr}")
+        # Per-deploy build context as a tiny Dockerfile passed via stdin.
+        # The LABEL forces a new layer → new image digest → new compose
+        # hash → new Phala App ID.
+        dockerfile = (
+            f"FROM {BASE_IMAGE}\n"
+            f"LABEL tally.deploy_id=\"{team_id}\"\n"
+        )
+        res = subprocess.run(
+            ["docker", "build", "-t", new_ref, "-"],
+            input=dockerfile, capture_output=True, text=True, timeout=120,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"docker build failed for {new_ref}:\n{res.stdout}\n{res.stderr}")
+        res = subprocess.run(
+            ["docker", "push", new_ref],
+            capture_output=True, text=True, timeout=120,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"docker push failed for {new_ref}:\n{res.stdout}\n{res.stderr}")
+        logger.info("pushed per-deploy image %s (digest-distinct)", tag_name)
+        return new_ref
+
+    def _build_compose_file(self, team_id: str, image_ref: str) -> Path:
+        """Generate a per-deploy compose with the per-team image ref
+        substituted into the `image:` line. Phala's KMS hashes the compose
+        into the App ID; swapping the image tag changes the hash so
+        parallel deploys land in distinct App IDs (and therefore distinct
+        KMS nonce records, avoiding the UNIQUE(address) race that bit
+        Sprint 14's serial workaround)."""
         src = WORKER_DIR / "docker-compose.yml"
         target = Path("/tmp") / f"tally-auto-compose-{team_id}.yml"
-        target.write_text(src.read_text())
+        content = src.read_text()
+        # Replace the base image ref with the per-deploy alias. Match the
+        # full registry+name+tag form so we don't accidentally rewrite a
+        # comment or a different field.
+        content = re.sub(
+            r"image:\s*ghcr\.io/nicholasraimbault/tally-spike-day4-worker:[a-zA-Z0-9_.-]+",
+            f"image: {image_ref}",
+            content,
+        )
+        target.write_text(content)
         return target
 
     def delete(self, cvm_id: str) -> None:
