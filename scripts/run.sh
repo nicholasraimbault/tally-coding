@@ -39,22 +39,41 @@ prompt_for_secret() {
   printf -v "$varname" "%s" "$value"
 }
 
-# Probe Red Pill auth with a minimal completion request.
-# Returns 0 if key is accepted (HTTP 200), 1 otherwise.
-# Prints the HTTP status code so callers can give a useful message.
+# Probe Red Pill auth via GET /models — pure auth check, no model dependency.
+# Prints the HTTP status code. Returns 0 if key is accepted (HTTP 200).
+# Using /models instead of /chat/completions means we don't have to know which
+# specific model slugs are in the user's catalog ahead of time.
 probe_redpill_key() {
   local key="$1"
   local base_url="${2:-https://api.redpill.ai/v1}"
-  local model="${3:-moonshotai/Kimi-K2-6}"
   local http_code
   http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
-    -X POST "${base_url}/chat/completions" \
+    "${base_url}/models" \
     -H "Authorization: Bearer ${key}" \
-    -H "Content-Type: application/json" \
-    -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
     --max-time 15 2>/dev/null || echo "000")
   echo "$http_code"
   [[ "$http_code" == "200" ]]
+}
+
+# Fetch the user's model catalog and pick the best slug for agentic coding work.
+# Priority: Kimi (best agent benchmarks) → DeepSeek V3 → Qwen3-Coder → Claude
+# Sonnet → first available. Prints chosen slug to stdout, or empty on failure.
+pick_redpill_model() {
+  local key="$1"
+  local base_url="${2:-https://api.redpill.ai/v1}"
+  local models
+  models=$(curl -sS "${base_url}/models" \
+    -H "Authorization: Bearer ${key}" \
+    --max-time 15 2>/dev/null \
+    | grep -oE '"id":"[^"]*"' | sed 's/"id":"//;s/"$//')
+  [[ -z "$models" ]] && return 1
+  local pattern pick=""
+  for pattern in 'kimi.*k2' 'deepseek.*v3' 'qwen3.*coder' 'claude.*sonnet' 'llama.*3\.3'; do
+    pick=$(echo "$models" | grep -iE "$pattern" | head -1)
+    [[ -n "$pick" ]] && break
+  done
+  [[ -z "$pick" ]] && pick=$(echo "$models" | head -1)
+  echo "$pick"
 }
 
 ensure_env_configured() {
@@ -70,6 +89,17 @@ ensure_env_configured() {
       probe_status=$(probe_redpill_key "$existing_key" | tail -1)
       if [[ "$probe_status" == "200" ]]; then
         echo "  ✓ Key accepted (HTTP 200)"
+        # Make sure REDPILL_MODEL is also set to something that exists on this
+        # account — old .env files might list a model the catalog doesn't have.
+        local existing_model picked_model
+        existing_model=$(grep -E '^REDPILL_MODEL=' scripts/.env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]' || true)
+        if [[ -z "$existing_model" ]]; then
+          picked_model=$(pick_redpill_model "$existing_key")
+          if [[ -n "$picked_model" ]]; then
+            echo "  ✓ Auto-picked model: ${picked_model}"
+            echo "REDPILL_MODEL=${picked_model}" >> scripts/.env
+          fi
+        fi
         return 0
       fi
       echo "  ✗ Key rejected (HTTP ${probe_status}) — re-prompting"
@@ -102,6 +132,7 @@ the CVM-management one. Verify your account has credits before using.)
 BANNER
 
   local redpill_key=""
+  local picked_model=""
   while true; do
     redpill_key=""
     while [[ -z "$redpill_key" ]]; do
@@ -115,6 +146,14 @@ BANNER
     probe_status=$(probe_redpill_key "$redpill_key" | tail -1)
     if [[ "$probe_status" == "200" ]]; then
       echo "  ✓ Key accepted (HTTP 200)"
+      echo "  >> Fetching available models..."
+      picked_model=$(pick_redpill_model "$redpill_key")
+      if [[ -n "$picked_model" ]]; then
+        echo "  ✓ Auto-picked model: ${picked_model}"
+      else
+        echo "  ! Could not list models (response shape unexpected); using default."
+        picked_model="moonshotai/Kimi-K2-6"
+      fi
       break
     fi
     echo "  ✗ Key rejected (HTTP ${probe_status})."
@@ -165,7 +204,7 @@ BANNER
 REDPILL_API_KEY=${redpill_key}
 PHALA_CLOUD_API_KEY=${phala_cloud_key}
 REDPILL_BASE_URL=https://api.redpill.ai/v1
-REDPILL_MODEL=moonshotai/Kimi-K2-6
+REDPILL_MODEL=${picked_model:-moonshotai/Kimi-K2-6}
 TEAM_ID_PREFIX=tally-coding-runner
 TALLY_WORKERS_URL=https://tally.nraimbault16.workers.dev
 EOF
