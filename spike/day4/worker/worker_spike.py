@@ -62,7 +62,9 @@ def build_llm() -> LLM:
         sys.exit("REDPILL_API_KEY not set")
     base_url = os.environ.get("REDPILL_BASE_URL", "https://api.redpill.ai/v1")
     model_name = os.environ.get("REDPILL_MODEL", "moonshotai/kimi-k2.6")
-    return LLM(model=f"openai/{model_name}", api_key=api_key, base_url=base_url)
+    # stream=True so token_callbacks fire per chunk; required for the
+    # TokenBatcher → orchestrator → Flutter streaming pipeline.
+    return LLM(model=f"openai/{model_name}", api_key=api_key, base_url=base_url, stream=True)
 
 
 def event_summary(event: Any) -> dict:
@@ -129,14 +131,79 @@ def run_event_emitter(
             print(f"[worker] event emit failed seq={seq}: {exc}", flush=True)
 
 
+class TokenBatcher:
+    """Buffers OpenHands token_callbacks deltas and flushes them as a single
+    TokenBatch event every ~250ms or 200 chars (whichever first). Without
+    batching, a 50-tok/s stream would mean 50 wakes/sec — too noisy for the
+    transport. With batching, ~4 wakes/sec at typical model speeds."""
+
+    def __init__(self, event_queue, flush_interval_s: float = 0.25, flush_chars: int = 200) -> None:
+        self._event_queue = event_queue
+        self._buffer: list[str] = []
+        self._lock = threading.Lock()
+        self._last_flush = time.monotonic()
+        self._flush_interval = flush_interval_s
+        self._flush_chars = flush_chars
+        self._stop = threading.Event()
+        self._timer = threading.Thread(target=self._timer_loop, daemon=True, name="token-batcher")
+        self._timer.start()
+
+    def on_chunk(self, chunk) -> None:
+        """Token callback. `chunk` is a litellm ModelResponseStream."""
+        try:
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None) or ""
+        except (AttributeError, IndexError):
+            return
+        if not content:
+            return
+        with self._lock:
+            self._buffer.append(content)
+            if self._should_flush_locked():
+                self._flush_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.flush()
+
+    def _should_flush_locked(self) -> bool:
+        if not self._buffer:
+            return False
+        if time.monotonic() - self._last_flush >= self._flush_interval:
+            return True
+        if sum(len(c) for c in self._buffer) >= self._flush_chars:
+            return True
+        return False
+
+    def _flush_locked(self) -> None:
+        if not self._buffer:
+            return
+        text = "".join(self._buffer)
+        self._buffer.clear()
+        self._last_flush = time.monotonic()
+        self._event_queue.put({"type": "TokenBatch", "content": text, "ts": time.time()})
+
+    def _timer_loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(0.1)
+            with self._lock:
+                if self._should_flush_locked():
+                    self._flush_locked()
+
+
 def perform_task(
     *,
     task_description: str,
     workspace: Path,
     event_callback,
+    token_callback=None,
 ) -> dict:
-    """Run OpenHands agent in workspace with an event callback that streams
-    each event to the orchestrator via the emitter thread."""
+    """Run OpenHands agent in workspace with event + token callbacks streaming
+    to the orchestrator via the emitter thread."""
     llm = build_llm()
     agent = Agent(
         llm=llm,
@@ -146,11 +213,10 @@ def perform_task(
             Tool(name=TaskTrackerTool.name),
         ],
     )
-    conversation = Conversation(
-        agent=agent,
-        workspace=str(workspace),
-        callbacks=[event_callback],
-    )
+    kwargs: dict[str, Any] = {"agent": agent, "workspace": str(workspace), "callbacks": [event_callback]}
+    if token_callback is not None:
+        kwargs["token_callbacks"] = [token_callback]
+    conversation = Conversation(**kwargs)
     conversation.send_message(task_description)
     conversation.run()
     files_created = sorted(
@@ -214,8 +280,16 @@ def handle_task_wake(
         emitter_thread.start()
         print(f"[worker] streaming events to {orchestrator_bearer[:12]}...", flush=True)
 
+    batcher: TokenBatcher | None = None
+    if orchestrator_bearer:
+        batcher = TokenBatcher(event_queue)
+
     def on_event(event):
         try:
+            # Drain pending token deltas first so they appear in causal order
+            # relative to the action/observation event that follows.
+            if batcher is not None:
+                batcher.flush()
             event_queue.put_nowait(event_summary(event))
         except Exception as exc:
             print(f"[worker] event callback failed: {exc}", flush=True)
@@ -225,8 +299,11 @@ def handle_task_wake(
             task_description=task_description,
             workspace=task_workspace,
             event_callback=on_event,
+            token_callback=batcher.on_chunk if batcher is not None else None,
         )
     finally:
+        if batcher is not None:
+            batcher.stop()
         if emitter_thread is not None:
             event_queue.put(_EMITTER_SHUTDOWN)
             emitter_thread.join(timeout=10)

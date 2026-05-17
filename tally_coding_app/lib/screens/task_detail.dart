@@ -5,6 +5,37 @@ import 'package:flutter/material.dart';
 
 import '../api.dart';
 
+class _BlinkingCursor extends StatefulWidget {
+  final Color color;
+  const _BlinkingCursor({required this.color});
+
+  @override
+  State<_BlinkingCursor> createState() => _BlinkingCursorState();
+}
+
+class _BlinkingCursorState extends State<_BlinkingCursor> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))
+      ..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => FadeTransition(
+        opacity: _ctrl,
+        child: Text('▌', style: TextStyle(color: widget.color, fontSize: 14)),
+      );
+}
+
 class TaskDetailScreen extends StatefulWidget {
   final TallyOrchClient client;
   final String taskId;
@@ -114,6 +145,75 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
     );
   }
 
+  /// Renders a contiguous run of TokenBatch events as one growing "streaming
+  /// thought" bubble. Shows a typing cursor while the run is still live (i.e.,
+  /// it's the last group of events and the task is still running).
+  Widget _tokenBubble(List<Map<String, dynamic>> batches, {required bool isLive}) {
+    final text = batches.map((b) => b['content'] as String? ?? '').join();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.psychology, size: 18, color: Theme.of(context).colorScheme.tertiary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.tertiaryContainer.withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Theme.of(context).colorScheme.tertiary.withValues(alpha: 0.3)),
+              ),
+              child: RichText(
+                text: TextSpan(
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.4),
+                  children: [
+                    TextSpan(
+                      text: text,
+                      style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+                    ),
+                    if (isLive)
+                      WidgetSpan(
+                        alignment: PlaceholderAlignment.middle,
+                        child: _BlinkingCursor(color: Theme.of(context).colorScheme.tertiary),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Text(
+            '${batches.length} batch${batches.length == 1 ? '' : 'es'}',
+            style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 10),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _renderTimeline(bool taskRunning) {
+    final widgets = <Widget>[];
+    var i = 0;
+    while (i < _events.length) {
+      final ev = _events[i];
+      if (ev['type'] == 'TokenBatch') {
+        // Collect this contiguous run of TokenBatch events.
+        final run = <Map<String, dynamic>>[];
+        while (i < _events.length && _events[i]['type'] == 'TokenBatch') {
+          run.add(_events[i]);
+          i++;
+        }
+        final isLastRun = i == _events.length;
+        widgets.add(_tokenBubble(run, isLive: isLastRun && taskRunning));
+      } else {
+        widgets.add(_eventTile(ev));
+        i++;
+      }
+    }
+    return widgets;
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = _task;
@@ -161,9 +261,8 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                     const SizedBox(height: 4),
                     Card(
                       child: Column(
-                        children: [
-                          for (final ev in _events) _eventTile(ev),
-                        ],
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: _renderTimeline(t.status == 'running' || t.status == 'pending'),
                       ),
                     ),
                     const SizedBox(height: 24),
