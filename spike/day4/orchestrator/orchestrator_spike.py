@@ -98,7 +98,23 @@ def main() -> int:
     print(f"[orchestrator] received key package ({len(worker_kp)} bytes)", flush=True)
 
     # Step 2: create group + add worker locally; get the Welcome.
-    welcome_bytes = session.create_and_add(worker_kp)
+    # MLS KeyPackages carry a not_before lifetime ~now; cross-node clock skew can
+    # leave the orchestrator a few seconds behind the worker. Retry on
+    # InvalidLifetime up to ~30s total.
+    import time as _time
+    welcome_bytes = None
+    for attempt in range(6):
+        try:
+            welcome_bytes = session.create_and_add(worker_kp)
+            break
+        except Exception as exc:
+            if "InvalidLifetime" in str(exc) and attempt < 5:
+                print(f"[orchestrator] add_member InvalidLifetime (attempt {attempt+1}/6); sleeping 5s", flush=True)
+                _time.sleep(5)
+                continue
+            raise
+    if welcome_bytes is None:
+        raise RuntimeError("create_and_add failed after retries")
     print(f"[orchestrator] created group; welcome bundle is {len(welcome_bytes)} bytes", flush=True)
 
     # Step 3: send the Welcome to the worker.
