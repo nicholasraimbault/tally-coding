@@ -571,6 +571,14 @@ def handle_task_wake(
                       flush=True)
     except Exception as exc:
         result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+        # Sprint 27 fix: keep agent attribution on failure so the
+        # orchestrator's multi-agent path can route the failure to the
+        # right agent row. Without these, the result event takes the
+        # legacy single-agent path and prematurely marks the task as
+        # completed (mark_recovered).
+        if agent_spec is not None and agent_idx is not None:
+            result["agent_role"] = agent_spec.get("role")
+            result["agent_idx"] = agent_idx
         print(f"[worker] perform_task raised: {exc}", flush=True)
     finally:
         if batcher is not None:

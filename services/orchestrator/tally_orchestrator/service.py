@@ -568,6 +568,38 @@ class Db:
         }
 
 
+def _resolve_stages(raw: Any, n_agents: int) -> list[list[int]]:
+    """Sprint 27: turn an architect's `stages` value into the
+    authoritative execution graph the dispatcher uses.
+
+    Sequential workflows from Sprint 22-26 omit `stages` entirely; we
+    return a fully-serialized `[[0], [1], ...]` in that case so the
+    Sprint 22 codepath behaves identically.
+
+    Any malformed input falls back to sequential — the architect's
+    own validator already runs the same checks, so this is a backstop
+    against hand-crafted team_specs and DB rows from older versions.
+    """
+    default = [[i] for i in range(n_agents)]
+    if not isinstance(raw, list) or not raw:
+        return default
+    seen: set[int] = set()
+    cleaned: list[list[int]] = []
+    for stage in raw:
+        if not isinstance(stage, list) or not stage:
+            return default
+        cleaned_stage: list[int] = []
+        for idx in stage:
+            if not isinstance(idx, int) or idx < 0 or idx >= n_agents or idx in seen:
+                return default
+            seen.add(idx)
+            cleaned_stage.append(idx)
+        cleaned.append(cleaned_stage)
+    if seen != set(range(n_agents)):
+        return default
+    return cleaned
+
+
 class EventBus:
     """In-memory per-task subscriber lists, used to push events to SSE clients
     the moment they're persisted (instead of forcing the client to poll the DB).
@@ -818,10 +850,13 @@ class Orchestrator:
             await self._dispatch_single_agent(task)
 
     async def _start_team(self, task: dict, team_spec: dict) -> None:
-        """Resolve role defaults, insert per-agent rows, dispatch first.
+        """Resolve role defaults, insert per-agent rows, dispatch the
+        first stage.
 
-        Sprint 22 workflow is sequential-only (agents run in their
-        agent_idx order). Sprint 27 adds parallel + branching.
+        Sprint 22 workflow was sequential-only. Sprint 27 adds parallel
+        stages: `team_spec["stages"]` is `list[list[int]]`; every agent
+        in stage N runs concurrently, the next stage starts when stage N
+        is fully complete.
         """
         agents_spec = team_spec.get("agents", []) or []
         if not agents_spec:
@@ -844,10 +879,19 @@ class Orchestrator:
             )
         self.db.mark_running(task["id"])
         await self._publish_status(task["id"], "running", {"team_size": len(agents_spec)})
-        first_agent = self.db.list_agents(task["id"])[0]
-        logger.info("starting team for task %s: %d agents, first=%s",
-                    task["id"][:8], len(agents_spec), first_agent["role"])
-        await self._dispatch_agent(task, first_agent)
+        stages = _resolve_stages(team_spec.get("stages"), len(agents_spec))
+        first_stage_indices = stages[0]
+        all_agents = self.db.list_agents(task["id"])
+        by_idx = {a["agent_idx"]: a for a in all_agents}
+        first_stage = [by_idx[i] for i in first_stage_indices]
+        logger.info("starting team for task %s: %d agents, stage 0 = [%s]",
+                    task["id"][:8], len(agents_spec),
+                    ", ".join(a["role"] for a in first_stage))
+        # Fan out the first stage. Each dispatch is fire-and-forget;
+        # _handle_result_event advances stages when the last agent in
+        # the current stage finishes.
+        for agent in first_stage:
+            asyncio.create_task(self._dispatch_agent(task, agent))
 
     async def _dispatch_agent(self, task: dict, agent: dict) -> None:
         """Encrypt + send one agent's task wake. Fire-and-forget; the
@@ -1144,18 +1188,43 @@ class Orchestrator:
         """
         agent_idx = result.get("agent_idx")
         if agent_idx is None:
-            # Single-agent legacy path
-            completed = self.db.mark_recovered(task_id, result)
-            if completed:
-                logger.info(
-                    "task %s result event from worker %s: success=%s",
-                    task_id[:8], worker_identity[:8], result.get("success"),
+            # Sprint 27 fix: a result event without `agent_idx` should
+            # only take the single-agent path when the task is *actually*
+            # single-agent. A multi-agent task with running rows but a
+            # bare result event signals a worker bug (e.g., exception
+            # path dropping agent_idx) — attribute the failure to the
+            # in-flight agent on this worker rather than prematurely
+            # marking the whole task completed.
+            running_agents = [
+                a for a in self.db.list_agents(task_id) if a["status"] == "running"
+            ]
+            if running_agents:
+                # Match the result to the agent the worker was busy with.
+                target = next(
+                    (a for a in running_agents if a.get("worker_identity") == worker_identity),
+                    running_agents[0],
                 )
-                await self._publish_status(
-                    task_id, "completed",
-                    {"success": result.get("success")},
+                logger.warning(
+                    "task %s: result event lacked agent_idx on multi-agent task; "
+                    "attributing to running agent %s/%s",
+                    task_id[:8], target["agent_idx"], target["role"],
                 )
-            return
+                result = {**result, "agent_idx": target["agent_idx"], "agent_role": target["role"]}
+                agent_idx = target["agent_idx"]
+                # fall through to the multi-agent path below
+            else:
+                # Single-agent legacy path.
+                completed = self.db.mark_recovered(task_id, result)
+                if completed:
+                    logger.info(
+                        "task %s result event from worker %s: success=%s",
+                        task_id[:8], worker_identity[:8], result.get("success"),
+                    )
+                    await self._publish_status(
+                        task_id, "completed",
+                        {"success": result.get("success")},
+                    )
+                return
 
         # Multi-agent path
         agents = self.db.list_agents(task_id)
@@ -1167,6 +1236,21 @@ class Orchestrator:
         if target_agent["status"] in ("completed", "failed"):
             logger.debug("duplicate result event for task %s agent %s; ignoring",
                          task_id[:8], target_agent["role"])
+            return
+        # Sprint 27: if the task already failed (e.g. one parallel agent
+        # crashed and we marked the whole task failed), drop late results
+        # from sibling agents. Still record the agent's own row so the UI
+        # can see what happened, but don't advance stages or aggregate.
+        task_row = self.db.get_task(task_id)
+        task_already_terminal = (
+            task_row is not None
+            and task_row.get("status") in ("completed", "failed")
+        )
+        if task_already_terminal:
+            self.db.mark_agent_completed(target_agent["id"], result) if result.get("success") else \
+                self.db.mark_agent_failed(target_agent["id"], result.get("error", "?"))
+            logger.info("task %s already terminal; recorded late result from agent %s",
+                        task_id[:8], target_agent["role"])
             return
         # Sprint 26: harvest workspace snapshot before persisting the
         # result row. We keep the per-agent files in memory keyed by
@@ -1199,19 +1283,47 @@ class Orchestrator:
                 {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
             )
             return
-        # Find next pending agent in sequence (Sprint 22 = strictly
-        # sequential by agent_idx).
-        remaining = [a for a in agents if a["agent_idx"] > agent_idx and a["status"] == "pending"]
-        if remaining:
-            next_agent = remaining[0]
-            task = self.db.get_task(task_id)
-            if task is None:
-                logger.error("task %s gone before next agent dispatch", task_id[:8])
-                return
-            # Refresh the agent row (status changed since list_agents).
-            next_agent = next(a for a in self.db.list_agents(task_id)
-                              if a["agent_idx"] == next_agent["agent_idx"])
-            asyncio.create_task(self._dispatch_agent(task, next_agent))
+        # Sprint 27: stage-aware advancement. The agent we just finished
+        # is in some stage; only advance to the *next* stage when EVERY
+        # agent in this stage has reached a terminal status. Sequential
+        # workflows collapse to one-agent-per-stage and behave identically
+        # to Sprint 22.
+        task = self.db.get_task(task_id)
+        if task is None:
+            logger.error("task %s gone before stage advance", task_id[:8])
+            return
+        team_spec = task.get("team_spec") or {}
+        stages = _resolve_stages(team_spec.get("stages"), len(agents))
+        cur_stage_idx = next(
+            (i for i, stage in enumerate(stages) if agent_idx in stage),
+            None,
+        )
+        if cur_stage_idx is None:
+            logger.warning("task %s agent %d not in any stage; assuming sequential tail",
+                           task_id[:8], agent_idx)
+            cur_stage_idx = len(stages) - 1
+        # Refresh agents — this agent's status changed inside this handler.
+        fresh = self.db.list_agents(task_id)
+        by_idx = {a["agent_idx"]: a for a in fresh}
+        cur_stage = stages[cur_stage_idx]
+        stage_pending = [
+            i for i in cur_stage
+            if by_idx.get(i, {}).get("status") not in ("completed", "failed")
+        ]
+        if stage_pending:
+            logger.debug("task %s stage %d still has pending: %s",
+                         task_id[:8], cur_stage_idx, stage_pending)
+            return  # other agents in this stage still running
+        # Stage complete; dispatch the next one if any.
+        next_stage_idx = cur_stage_idx + 1
+        if next_stage_idx < len(stages):
+            next_stage_indices = stages[next_stage_idx]
+            next_agents = [by_idx[i] for i in next_stage_indices if by_idx.get(i)]
+            logger.info("task %s stage %d → %d: dispatching [%s]",
+                        task_id[:8], cur_stage_idx, next_stage_idx,
+                        ", ".join(a["role"] for a in next_agents))
+            for a in next_agents:
+                asyncio.create_task(self._dispatch_agent(task, a))
             return
         # All agents done — task is complete. Aggregate results.
         final_agents = self.db.list_agents(task_id)

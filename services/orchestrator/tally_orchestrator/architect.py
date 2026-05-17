@@ -44,6 +44,7 @@ FALLBACK_TEAM = {
         }
     ],
     "workflow": "Coder",
+    "stages": [[0]],
     "reasoning": "Architect call failed or returned malformed output; falling back to Solo Coder.",
 }
 
@@ -111,26 +112,37 @@ Available agent roles:
 {roles_block}
 
 For each task, decide:
-1. Which roles to include (1-5 agents typical; only add roles that add real value).
+1. Which roles to include (1-6 agents typical; only add roles that add real value).
 2. Per-agent `spec` — a short, task-specific instruction for that agent (1-3 sentences).
-3. Workflow — for Sprint 23 this is always strict sequential, written as `Role1 -> Role2 -> Role3` (use ASCII arrow).
-4. Reasoning — one short sentence explaining the team composition.
+3. Workflow + stages — agents can run in sequence OR in parallel:
+   - Sequential: each agent waits for the previous one to finish. Use one stage per agent.
+   - Parallel: independent agents at the same stage run concurrently. Each stage gets a list of agent indices that run together. Stages execute strictly in order.
+   - Pick parallel ONLY when the agents truly don't depend on each other's output (e.g. SecReviewer + Tester both reading the Coder's code, independent FE Coder + BE Coder, etc.). When in doubt, stay sequential.
+4. Reasoning — one short sentence explaining the team composition AND the parallelism choice.
 
 Output schema (return EXACTLY this JSON shape):
 {{
   "agents": [
     {{"role": "Planner", "spec": "..."}},
-    {{"role": "Coder",   "spec": "..."}}
+    {{"role": "Coder",   "spec": "..."}},
+    {{"role": "Reviewer","spec": "..."}},
+    {{"role": "Tester",  "spec": "..."}}
   ],
-  "workflow": "Planner -> Coder",
+  "stages": [[0], [1], [2, 3]],
+  "workflow": "Planner -> Coder -> (Reviewer || Tester)",
   "reasoning": "..."
 }}
+
+Stages reference agents by their index in the `agents` array (0-based).
+Every agent index must appear in `stages` exactly once. Use one-element
+lists for serial steps and multi-element lists for parallel steps.
 
 Constraints:
 - Each agent's `role` MUST match one of the available role names exactly.
 - Do not invent new roles; only use names from the palette.
 - Do not include agents whose role you don't have available.
 - Keep spec strings short and actionable.
+- The workflow string is human-readable; `stages` is the authoritative graph.
 
 Task: {description}
 
@@ -226,8 +238,46 @@ def _validate_team_spec(raw: dict, valid_roles: set[str]) -> dict | None:
     reasoning = raw.get("reasoning", "")
     if not isinstance(reasoning, str):
         reasoning = ""
+    # Sprint 27: optional `stages` — list[list[int]]. Each inner list is
+    # a stage; agents in the same stage run concurrently. Sequential
+    # behavior is the default when stages is missing or invalid.
+    stages = _validate_stages(raw.get("stages"), len(cleaned_agents))
     return {
         "agents": cleaned_agents,
         "workflow": workflow,
+        "stages": stages,
         "reasoning": reasoning[:500],
     }
+
+
+def _validate_stages(raw_stages: Any, n_agents: int) -> list[list[int]]:
+    """Sprint 27: validate the architect's stage graph.
+
+    Required invariants for a valid `stages`:
+      - list of lists of ints
+      - every agent idx in [0, n_agents) appears exactly once
+      - no negative/oob indices, no duplicates within or across stages
+
+    Returns the cleaned stages on success; on any violation, returns the
+    fully-sequential default `[[0], [1], ..., [n-1]]` so the task still
+    runs (we're lenient — the dispatcher path is the same code regardless
+    of the architect's parallelism choice).
+    """
+    default = [[i] for i in range(n_agents)]
+    if not isinstance(raw_stages, list) or not raw_stages:
+        return default
+    seen: set[int] = set()
+    cleaned: list[list[int]] = []
+    for stage in raw_stages:
+        if not isinstance(stage, list) or not stage:
+            return default
+        cleaned_stage: list[int] = []
+        for idx in stage:
+            if not isinstance(idx, int) or idx < 0 or idx >= n_agents or idx in seen:
+                return default
+            seen.add(idx)
+            cleaned_stage.append(idx)
+        cleaned.append(cleaned_stage)
+    if seen != set(range(n_agents)):
+        return default
+    return cleaned

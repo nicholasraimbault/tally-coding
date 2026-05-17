@@ -46,19 +46,21 @@ else:
 # `v10-<team_id>` tag for each provision so parallel deploys end up with
 # distinct App IDs (Phala derives the App ID from the compose hash, and
 # `image:` is one of the few fields that survives Phala's normalization).
-BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v14"
+BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v15"
 
 # GHCR package name for the worker image (used by Sprint 17's GC).
 GHCR_OWNER = "nicholasraimbault"
 GHCR_PACKAGE = "tally-spike-day4-worker"
 # Per-deploy tag prefix. GC targets only these — anything without this
-# prefix (e.g. `v14`, `v13`, `v12`, `v11`, `v10`) is preserved. Each
-# base bump leaves the prior prefix behind for cleanup of leftover tags.
+# prefix (e.g. `v15`, `v14`, `v13`, `v12`, `v11`, `v10`) is preserved.
+# Each base bump leaves the prior prefix behind for cleanup of leftover
+# tags.
 DEPLOY_TAG_PREFIX_V10 = "v10-tally-auto-"
 DEPLOY_TAG_PREFIX_V11 = "v11-tally-auto-"
 DEPLOY_TAG_PREFIX_V12 = "v12-tally-auto-"
 DEPLOY_TAG_PREFIX_V13 = "v13-tally-auto-"
-DEPLOY_TAG_PREFIX = "v14-tally-auto-"
+DEPLOY_TAG_PREFIX_V14 = "v14-tally-auto-"
+DEPLOY_TAG_PREFIX = "v15-tally-auto-"
 
 
 def _phala_binary() -> str:
@@ -148,7 +150,7 @@ class WorkerPool:
         in ~1s (only the new manifest + tiny layer).
         """
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", team_id)
-        tag_name = f"v14-{safe}"
+        tag_name = f"v15-{safe}"
         new_ref = f"ghcr.io/nicholasraimbault/tally-spike-day4-worker:{tag_name}"
         # Ensure the base image is locally cached so the FROM in the
         # one-line Dockerfile resolves.
