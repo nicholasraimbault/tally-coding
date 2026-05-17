@@ -1,0 +1,21 @@
+[Unit]
+Description=Tally Coding GHCR GC daily timer (Sprint 20)
+Documentation=https://github.com/nicholasraimbault/tally-coding/blob/main/docs/SPRINT-20-COMPLETE.md
+
+[Timer]
+# Fire daily at 03:17 local time — pre-dawn so it doesn't compete
+# with interactive use, and 17 minutes past the hour to avoid the
+# cron-typical "everyone schedules on the hour" thundering herd.
+OnCalendar=*-*-* 03:17:00
+# If the host was off when the trigger should have fired, run as
+# soon as the timer comes up.
+Persistent=true
+# A 5-minute randomized jitter so multiple hosts pointing at the
+# same GHCR project (e.g. dev + staging boxes) don't hammer the
+# REST API simultaneously.
+RandomizedDelaySec=5min
+# Same unit name minus .timer = the service we activate.
+Unit=tally-orch-gc.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Tally Coding GHCR garbage collection (Sprint 17 + 20)
+# Best-effort dependency: GC needs the orchestrator's /admin/pool/gc
+# endpoint up, which means the service must be running. systemd won't
+# *start* tally-orch for us — if it's down, the GC is a no-op (curl
+# fails inside the CLI; service exits non-zero, journal records it).
+After=tally-orch.service
+Wants=tally-orch.service
+# Only run with network up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/pronoic/tally-coding/services/orchestrator
+# Same env file as the orchestrator — picks up TALLY_API_TOKEN (the
+# CLI needs it to call /admin/pool/gc).
+EnvironmentFile=%h/.config/tally-orch/env
+# Run the GC with a 24h grace period — only versions whose
+# `updated_at` is older than a day are eligible. That keeps a tag
+# from a worker rotated 10 min ago around until we're confident the
+# rotation completed.
+ExecStart=%h/.local/bin/uv run tally pool gc --older-than-hours 24
+# Don't restart on failure — the timer fires us again tomorrow.
+# Failure paths (orchestrator down, GHCR API hiccup, etc.) self-heal
+# without intervention.
+[Install]
+# Not for direct start — the .timer pulls us in.
