@@ -187,6 +187,25 @@ class Db:
             (error, time.time(), task_id),
         )
 
+    def recover_stuck_running(self, error: str) -> int:
+        """Demote every status='running' row to status='failed' with the
+        given error message. Called once at orchestrator startup to clear
+        orphans left behind by a crash, OOM, or hard restart — the
+        processor loop only considers status='pending' rows, so without
+        this step the orphans would sit forever, invisible.
+
+        Returns the number of rows demoted. Marking them failed rather
+        than re-pending is intentional: a still-running worker on the
+        other side might be mid-task; demoting to pending would cause
+        a duplicate dispatch that races for the same `/workspace`. Users
+        can resubmit explicitly if they want a retry."""
+        now = time.time()
+        cursor = self._conn.execute(
+            "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE status='running'",
+            (error, now),
+        )
+        return cursor.rowcount or 0
+
     def insert_event(self, task_id: str, seq: int, event: dict) -> None:
         """Insert a streaming event from the worker. Idempotent on (task_id, seq)."""
         self._conn.execute(
@@ -708,7 +727,26 @@ class Orchestrator:
                                     {"seq": inner["seq"], "received_at": time.time(), **inner["event"]},
                                 )
                     except Exception as exc:
-                        logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
+                        # MLS decrypt failures are expected after an
+                        # orchestrator restart: the worker's session
+                        # state outlives the orchestrator's in-memory
+                        # state, so any in-flight wake the worker sent
+                        # against the previous ratchet position can't
+                        # be decrypted by the newly-bootstrapped group.
+                        # Ack and skip — subsequent wakes encrypted with
+                        # the current ratchet will work fine.
+                        is_mls = (
+                            type(exc).__name__ in ("MlsError", "MlsSessionError")
+                            or "MLS engine error" in str(exc)
+                            or "CryptoProviderError" in str(exc)
+                        )
+                        if is_mls:
+                            logger.warning(
+                                "event decrypt failed for wake %s (likely stale session after restart); ack+skip",
+                                wake_id[:8],
+                            )
+                        else:
+                            logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
                     finally:
                         await asyncio.to_thread(
                             self.client.complete_wake,
@@ -892,6 +930,13 @@ async def lifespan(app: FastAPI):
 
     db = Db(db_path)
     state["api_token"] = _resolve_token(Path(db_path).parent)
+    # Self-heal any tasks left mid-flight by a previous crash. They'd be
+    # invisible to next_pending() and pin nothing on the new pool — but
+    # they'd also lie about the worker that ran them in /tasks responses
+    # forever. Demote them to `failed` with a clear marker.
+    orphans = db.recover_stuck_running("orchestrator restarted while task was running")
+    if orphans:
+        logger.warning("recovered %d stuck running task(s) on startup (demoted to failed)", orphans)
     event_bus = EventBus()
     pool = WorkerPool(scripts_env_path=scripts_env)
     state["worker_pool"] = pool

@@ -10,6 +10,12 @@ EnvironmentFile=%h/.config/tally-orch/env
 ExecStart=%h/.local/bin/uv run tally-orch
 Restart=on-failure
 RestartSec=3
+# Soft-cap memory at 2G (cgroup throttle) and hard-kill at 3G so any
+# future leak can't drag the desktop into swap. Sprint 14 saw a
+# 11G runaway from a duplicate-coroutine spawn bug; the bug is fixed
+# but the cap is cheap insurance.
+MemoryHigh=2G
+MemoryMax=3G
 # Keep stdout/stderr in the journal — `journalctl --user -u tally-orch -f`.
 
 [Install]
