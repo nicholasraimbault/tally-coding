@@ -30,14 +30,12 @@ import logging
 import os
 import secrets
 import sqlite3
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -47,7 +45,7 @@ from tally_coding_core.identity import bearer_from_pubkey, load_or_create_identi
 from tally_coding_core.mls import MlsSession
 from tally_coding_core.tally_workers import TallyWorkersClient
 
-from .worker_pool import WorkerInfo, WorkerPool
+from .worker_pool import WorkerPool
 
 logger = logging.getLogger("tally.orchestrator")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -59,13 +57,14 @@ FS_LIST_CONTEXT_ID = "task:fs:list"
 FS_READ_CONTEXT_ID = "task:fs:read"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
-    id           TEXT PRIMARY KEY,
-    description  TEXT NOT NULL,
-    status       TEXT NOT NULL,
-    result_json  TEXT,
-    error        TEXT,
-    created_at   REAL NOT NULL,
-    updated_at   REAL NOT NULL
+    id              TEXT PRIMARY KEY,
+    description     TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    result_json     TEXT,
+    error           TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    worker_identity TEXT  -- which WorkerHandle ran this; null until dispatched
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 
@@ -120,6 +119,15 @@ class Db:
         self.path = path
         self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._conn.executescript(SCHEMA)
+        # Idempotent column-adds for upgrades from older DBs. SQLite has no
+        # "ALTER TABLE ADD COLUMN IF NOT EXISTS"; catching the "duplicate
+        # column" error is the canonical workaround.
+        try:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN worker_identity TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity"
 
     def create_task(self, description: str) -> str:
         task_id = uuid.uuid4().hex
@@ -132,25 +140,34 @@ class Db:
 
     def get_task(self, task_id: str) -> dict | None:
         row = self._conn.execute(
-            "SELECT id, description, status, result_json, error, created_at, updated_at FROM tasks WHERE id = ?",
-            (task_id,),
+            f"SELECT {self._TASK_COLS} FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
     def list_tasks(self, limit: int = 100) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT id, description, status, result_json, error, created_at, updated_at "
-            "FROM tasks ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            f"SELECT {self._TASK_COLS} FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def next_pending(self) -> dict | None:
         row = self._conn.execute(
-            "SELECT id, description, status, result_json, error, created_at, updated_at "
-            "FROM tasks WHERE status = 'pending' ORDER BY created_at LIMIT 1"
+            f"SELECT {self._TASK_COLS} FROM tasks WHERE status = 'pending' ORDER BY created_at LIMIT 1"
         ).fetchone()
         return self._row_to_dict(row) if row else None
+
+    def set_task_worker(self, task_id: str, worker_identity: str) -> None:
+        """Record which worker is handling this task; used later for fs:list/fs:read routing."""
+        self._conn.execute(
+            "UPDATE tasks SET worker_identity=? WHERE id=?",
+            (worker_identity, task_id),
+        )
+
+    def get_task_worker(self, task_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT worker_identity FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
     def mark_running(self, task_id: str) -> None:
         self._conn.execute(
@@ -200,6 +217,26 @@ class Db:
         ).fetchone()
         if not row:
             return None
+        return self._worker_row(row)
+
+    def list_active_workers(self) -> list[dict]:
+        """All active workers (sprint 14: pool may contain N>1)."""
+        rows = self._conn.execute(
+            "SELECT cvm_id, app_id, team_id, identity, status, created_at, retired_at "
+            "FROM workers WHERE status = 'active' ORDER BY created_at"
+        ).fetchall()
+        return [self._worker_row(r) for r in rows]
+
+    def add_active_worker(self, *, cvm_id: str, app_id: str | None, team_id: str, identity: str) -> None:
+        """Insert a new active worker without retiring the existing ones (sprint 14)."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO workers (cvm_id, app_id, team_id, identity, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'active', ?)",
+            (cvm_id, app_id, team_id, identity, time.time()),
+        )
+
+    @staticmethod
+    def _worker_row(row: tuple) -> dict:
         return {
             "cvm_id": row[0], "app_id": row[1], "team_id": row[2], "identity": row[3],
             "status": row[4], "created_at": row[5], "retired_at": row[6],
@@ -232,6 +269,7 @@ class Db:
             "error": row[4],
             "created_at": row[5],
             "updated_at": row[6],
+            "worker_identity": row[7] if len(row) > 7 else None,
         }
 
 
@@ -269,85 +307,123 @@ class EventBus:
                 logger.warning("dropped event for task %s subscriber (queue full)", task_id[:8])
 
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class WorkerHandle:
+    """One worker's view in the orchestrator: identity, MLS session, lock.
+    The lock is held while a task is being dispatched against this worker —
+    the MLS sender ratchet is single-writer, so concurrent encrypts would
+    corrupt state. Concurrency comes from having N WorkerHandles."""
+    identity: str
+    team_id: str
+    cvm_id: str
+    app_id: str | None
+    session: MlsSession
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    failures: int = 0  # consecutive task failures on this handle
+
+
 class Orchestrator:
-    """Holds the MLS session with the worker; dispatches encrypted task wakes."""
+    """Pool of WorkerHandles. Concurrent task dispatch up to len(handles).
+
+    Each handle owns one MLS group with one worker. The orchestrator itself
+    has a single Ed25519 identity (the bearer that all workers dispatch
+    events back to)."""
 
     def __init__(
         self,
         *,
         tally_url: str,
-        team_id: str,
-        worker_identity: str,
         identity_path: str,
-        mls_state_dir: str,
+        mls_state_base_dir: str,
         db: Db,
         event_bus: EventBus,
     ) -> None:
         self.tally_url = tally_url
-        self.team_id = team_id
-        self.worker_identity = worker_identity
         self.db = db
         self.event_bus = event_bus
-        Path(mls_state_dir).mkdir(parents=True, exist_ok=True)
+        self.mls_state_base = Path(mls_state_base_dir)
+        self.mls_state_base.mkdir(parents=True, exist_ok=True)
         _privkey, pubkey = load_or_create_identity(identity_path)
         self.pubkey = pubkey
         self.bearer = bearer_from_pubkey(pubkey)
         self.client = TallyWorkersClient(base_url=tally_url)
-        group_id = f"orch-worker-{team_id}".encode("utf-8")
-        self.session = MlsSession(data_dir=mls_state_dir, identity=pubkey, group_id=group_id)
-        self._dispatch_lock = asyncio.Lock()
-        # Sprint 13: runtime auto-rotation. Track consecutive task failures so
-        # we can detect a dead worker and trigger a rotate. Threshold tunable
-        # via TALLY_AUTO_ROTATE_THRESHOLD for shorter test cycles.
-        self._consecutive_failures = 0
+        self.handles: dict[str, WorkerHandle] = {}     # keyed by worker identity
+        self.pollers: dict[str, asyncio.Task] = {}     # keyed by team_id
         self._auto_rotate_threshold = int(os.environ.get("TALLY_AUTO_ROTATE_THRESHOLD", "3"))
-        self._rotating = False
+        self._rotating: set[str] = set()  # identities currently being rotated
 
-    def bootstrap(self) -> None:
-        """3-wake bootstrap: request_kp → create_and_add → welcome.
-        Also registers task:event handler so the worker can stream events back."""
-        self.client.team_init(self.team_id, bearer=self.bearer)
-        self.client.register(
-            self.team_id, self.bearer, bearer=self.bearer, context_id=EVENT_CONTEXT_ID
+    # ── handle lifecycle ──────────────────────────────────────────────────
+
+    def _session_dir(self, team_id: str) -> Path:
+        d = self.mls_state_base / f"team-{team_id}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def add_handle(self, *, team_id: str, worker_identity: str, cvm_id: str, app_id: str | None) -> WorkerHandle:
+        """Construct a WorkerHandle (no bootstrap yet). Caller must call
+        bootstrap_handle() before the handle is usable for tasks."""
+        group_id = f"orch-worker-{team_id}".encode("utf-8")
+        session = MlsSession(
+            data_dir=str(self._session_dir(team_id)),
+            identity=self.pubkey,
+            group_id=group_id,
         )
-        logger.info("bootstrap step 1: requesting worker key package")
+        handle = WorkerHandle(
+            identity=worker_identity, team_id=team_id, cvm_id=cvm_id,
+            app_id=app_id, session=session,
+        )
+        self.handles[worker_identity] = handle
+        return handle
+
+    def bootstrap_handle(self, handle: WorkerHandle) -> None:
+        """3-wake handshake against handle's worker. Also registers the
+        orchestrator's bearer as the task:event handler in the worker's team
+        so events route back through tally-workers correctly."""
+        self.client.team_init(handle.team_id, bearer=self.bearer)
+        self.client.register(handle.team_id, self.bearer, bearer=self.bearer, context_id=EVENT_CONTEXT_ID)
+        logger.info("bootstrap[%s]: requesting worker key package", handle.identity[:8])
         kp_resp = self._dispatch_blocking(
-            context_id=BOOTSTRAP_CONTEXT_ID,
+            handle, context_id=BOOTSTRAP_CONTEXT_ID,
             payload=json.dumps({"phase": "request_kp"}).encode("utf-8"),
             timeout_seconds=60,
         )
         worker_kp = b64url_decode(json.loads(kp_resp.decode("utf-8"))["key_package"])
-        logger.info("received key package (%d bytes); creating MLS group", len(worker_kp))
-
         welcome_bytes = None
         for attempt in range(6):
             try:
-                welcome_bytes = self.session.create_and_add(worker_kp)
+                welcome_bytes = handle.session.create_and_add(worker_kp)
                 break
             except Exception as exc:
                 if "InvalidLifetime" in str(exc) and attempt < 5:
-                    logger.warning("add_member InvalidLifetime (attempt %d/6); sleeping 5s", attempt + 1)
+                    logger.warning("bootstrap[%s] InvalidLifetime (attempt %d/6); sleeping 5s",
+                                   handle.identity[:8], attempt + 1)
                     time.sleep(5)
                     continue
                 raise
         if welcome_bytes is None:
-            raise RuntimeError("create_and_add failed after retries")
-
-        logger.info("bootstrap step 3: sending welcome (%d bytes)", len(welcome_bytes))
+            raise RuntimeError(f"create_and_add failed for worker {handle.identity[:12]}")
         ack = self._dispatch_blocking(
-            context_id=BOOTSTRAP_CONTEXT_ID,
+            handle, context_id=BOOTSTRAP_CONTEXT_ID,
             payload=json.dumps({"phase": "welcome", "welcome": b64url_no_pad(welcome_bytes)}).encode("utf-8"),
             timeout_seconds=60,
         )
         if not json.loads(ack.decode("utf-8")).get("ok"):
-            raise RuntimeError(f"worker rejected welcome: {ack!r}")
-        logger.info("MLS session established")
+            raise RuntimeError(f"worker {handle.identity[:12]} rejected welcome")
+        logger.info("bootstrap[%s]: MLS session established (team=%s)", handle.identity[:8], handle.team_id)
 
-    def _dispatch_blocking(self, *, context_id: str, payload: bytes, timeout_seconds: int) -> bytes:
-        """Synchronous wake dispatch. Returns response bytes (b64 decoded)."""
+    def remove_handle(self, identity: str) -> WorkerHandle | None:
+        """Drop a handle from the pool. Caller must stop its poller separately."""
+        return self.handles.pop(identity, None)
+
+    # ── dispatch ──────────────────────────────────────────────────────────
+
+    def _dispatch_blocking(self, handle: WorkerHandle, *, context_id: str, payload: bytes, timeout_seconds: int) -> bytes:
         result = self.client.dispatch_wake(
-            team_id=self.team_id,
-            target_identity=self.worker_identity,
+            team_id=handle.team_id,
+            target_identity=handle.identity,
             context_id=context_id,
             payload=b64url_no_pad(payload),
             timeout_seconds=timeout_seconds,
@@ -355,164 +431,280 @@ class Orchestrator:
         )
         return b64url_decode(result["response"])
 
+    async def acquire_idle(self, timeout: float = 60.0) -> WorkerHandle:
+        """Wait up to `timeout` for any handle to be unlocked, then acquire it.
+        Picks the first idle handle in dict-insertion order (no priority)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for handle in list(self.handles.values()):
+                if not handle.lock.locked():
+                    try:
+                        await asyncio.wait_for(handle.lock.acquire(), timeout=0.01)
+                        return handle
+                    except asyncio.TimeoutError:
+                        continue
+            await asyncio.sleep(0.5)
+        raise TimeoutError(f"no idle worker available within {timeout}s")
+
     async def _publish_status(self, task_id: str, status: str, extra: dict | None = None) -> None:
-        """Publish a status_change marker to the bus so SSE subscribers learn
-        about task transitions without needing to poll /tasks/{id}."""
         payload = {"task_id": task_id, "status": status, "ts": time.time()}
         if extra:
             payload.update(extra)
         await self.event_bus.publish(task_id, {"_kind": "status_change", **payload})
 
     async def process_task(self, task: dict) -> None:
-        """Encrypt task, dispatch, decrypt response, update db, push status events."""
-        async with self._dispatch_lock:
+        """Acquire an idle handle, encrypt+dispatch the task via that handle's
+        MLS session, persist result, release. Failures bump the handle's
+        failure counter; consecutive failures across the threshold trigger a
+        per-handle rotation (other handles keep serving traffic)."""
+        try:
+            handle = await self.acquire_idle(timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")))
+        except TimeoutError as exc:
+            logger.error("task %s: no worker available within timeout", task["id"][:8])
+            self.db.mark_failed(task["id"], str(exc))
+            await self._publish_status(task["id"], "failed", {"error": str(exc)})
+            return
+        try:
+            self.db.set_task_worker(task["id"], handle.identity)
             self.db.mark_running(task["id"])
             await self._publish_status(task["id"], "running")
-            logger.info("running task %s: %s", task["id"][:8], task["description"][:80])
+            logger.info("running task %s on worker %s: %s",
+                        task["id"][:8], handle.identity[:8], task["description"][:60])
             try:
                 payload_obj = {
                     "task": task["description"],
                     "task_id": task["id"],
                     "orchestrator_bearer": self.bearer,
                 }
-                ciphertext = self.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
-                logger.info("dispatching task %s (%d bytes ciphertext)", task["id"][:8], len(ciphertext))
+                ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
                 response_bytes = await asyncio.to_thread(
-                    self._dispatch_blocking,
+                    self._dispatch_blocking, handle,
                     context_id=TASK_CONTEXT_ID,
                     payload=ciphertext,
                     timeout_seconds=int(os.environ.get("TALLY_TASK_DISPATCH_TIMEOUT", "300")),
                 )
-                response_plain = self.session.decrypt(response_bytes).decode("utf-8")
+                response_plain = handle.session.decrypt(response_bytes).decode("utf-8")
                 result = json.loads(response_plain)
                 self.db.mark_completed(task["id"], result)
                 await self._publish_status(task["id"], "completed", {"success": result.get("success")})
-                logger.info("task %s completed: success=%s", task["id"][:8], result.get("success"))
-                self._consecutive_failures = 0
+                logger.info("task %s completed on worker %s: success=%s",
+                            task["id"][:8], handle.identity[:8], result.get("success"))
+                handle.failures = 0
             except Exception as exc:
-                logger.exception("task %s failed", task["id"][:8])
+                logger.exception("task %s on worker %s failed", task["id"][:8], handle.identity[:8])
                 self.db.mark_failed(task["id"], str(exc))
                 await self._publish_status(task["id"], "failed", {"error": str(exc)})
-                self._consecutive_failures += 1
-                if (
-                    self._consecutive_failures >= self._auto_rotate_threshold
-                    and not self._rotating
-                ):
-                    logger.warning(
-                        "auto-rotating worker after %d consecutive task failures",
-                        self._consecutive_failures,
-                    )
-                    self._rotating = True
-                    asyncio.create_task(self._trigger_auto_rotate())
+                handle.failures += 1
+                if handle.failures >= self._auto_rotate_threshold and handle.identity not in self._rotating:
+                    logger.warning("auto-rotating worker %s after %d failures",
+                                   handle.identity[:8], handle.failures)
+                    self._rotating.add(handle.identity)
+                    asyncio.create_task(self._rotate_handle(handle))
+        finally:
+            handle.lock.release()
 
-    async def list_workspace(self, task_id: str) -> dict:
-        """Dispatch a fs:list wake and return the decrypted response dict."""
-        async with self._dispatch_lock:
-            payload = json.dumps({"task_id": task_id}).encode("utf-8")
-            ciphertext = self.session.encrypt(payload)
-            resp = await asyncio.to_thread(
-                self._dispatch_blocking,
-                context_id=FS_LIST_CONTEXT_ID,
-                payload=ciphertext,
-                timeout_seconds=30,
-            )
-            return json.loads(self.session.decrypt(resp).decode("utf-8"))
+    async def _rotate_handle(self, handle: WorkerHandle) -> WorkerHandle | None:
+        """Replace one specific handle. Other handles keep serving traffic
+        while this one is being swapped — no service exit needed.
 
-    async def read_workspace_file(self, task_id: str, path: str) -> dict:
-        """Dispatch a fs:read wake and return the decrypted response dict."""
-        async with self._dispatch_lock:
-            payload = json.dumps({"task_id": task_id, "path": path}).encode("utf-8")
-            ciphertext = self.session.encrypt(payload)
-            resp = await asyncio.to_thread(
-                self._dispatch_blocking,
-                context_id=FS_READ_CONTEXT_ID,
-                payload=ciphertext,
-                timeout_seconds=30,
-            )
-            return json.loads(self.session.decrypt(resp).decode("utf-8"))
-
-    async def _trigger_auto_rotate(self) -> None:
-        """Triggered when consecutive task failures hit threshold. Provision a
-        fresh worker, persist as active (retires prior), schedule background
-        CVM delete, exit non-zero so systemd respawns into clean state."""
+        Returns the new handle on success, None on failure. Caller is
+        responsible for adding/removing from self._rotating around the call."""
         pool: WorkerPool | None = state.get("worker_pool")
         if pool is None:
-            logger.error("auto-rotate requested but worker pool not initialised")
-            return
+            logger.error("rotate requested but worker pool not initialised")
+            self._rotating.discard(handle.identity)
+            return None
+        old_cvm = handle.cvm_id
+        old_identity = handle.identity
+        old_team = handle.team_id
         try:
-            current = self.db.get_active_worker()
-            logger.info("auto-rotate: provisioning new worker")
+            logger.info("rotate[%s]: provisioning replacement", old_identity[:8])
             new = await asyncio.to_thread(pool.provision)
             assert new.identity is not None
-            self.db.upsert_active_worker(
+            self.db.add_active_worker(
                 cvm_id=new.cvm_id, app_id=new.app_id,
                 team_id=new.team_id, identity=new.identity,
             )
-            if current:
-                asyncio.create_task(asyncio.to_thread(pool.delete, current["cvm_id"]))
-            logger.info("auto-rotate: new worker %s persisted; exiting for respawn", new.cvm_id[:8])
-            await asyncio.sleep(2)
-            os._exit(1)
+            self.db.retire_worker(old_cvm)
+            replacement = self.add_handle(
+                team_id=new.team_id, worker_identity=new.identity,
+                cvm_id=new.cvm_id, app_id=new.app_id,
+            )
+            await asyncio.to_thread(self.bootstrap_handle, replacement)
+            self.start_poller(replacement)
+            self.stop_poller(old_team)
+            self.remove_handle(old_identity)
+            asyncio.create_task(asyncio.to_thread(pool.delete, old_cvm))
+            logger.info("rotate[%s]: replaced by %s", old_identity[:8], new.identity[:8])
+            return replacement
         except Exception:
-            logger.exception("auto-rotate failed; clearing flag so a later attempt can fire")
-            self._rotating = False
+            logger.exception("rotate[%s] failed; clearing flag", old_identity[:8])
+            return None
+        finally:
+            self._rotating.discard(old_identity)
+
+    async def scale_pool(self, target_size: int) -> dict:
+        """Bring the pool to `target_size`. Returns identities added/removed.
+
+        Scale-up provisions and bootstraps in parallel. Scale-down acquires
+        each victim's lock before retiring it so an in-flight task isn't
+        interrupted mid-dispatch. Victims are selected from the tail of
+        insertion order (most-recently-added first)."""
+        pool: WorkerPool | None = state.get("worker_pool")
+        if pool is None:
+            raise RuntimeError("worker pool not initialised")
+        current = len(self.handles)
+        added: list[str] = []
+        removed: list[str] = []
+        if target_size > current:
+            n = target_size - current
+            logger.info("scale: adding %d worker(s) serially (current=%d, target=%d)",
+                        n, current, target_size)
+            # Serial provisioning: see _resolve_pool for the Phala KMS
+            # UNIQUE-on-address constraint that bites parallel deploys.
+            for i in range(n):
+                try:
+                    r = await asyncio.to_thread(pool.provision)
+                except Exception as exc:
+                    logger.warning("scale: provision %d/%d failed: %s", i + 1, n, exc)
+                    continue
+                assert r.identity is not None
+                self.db.add_active_worker(
+                    cvm_id=r.cvm_id, app_id=r.app_id,
+                    team_id=r.team_id, identity=r.identity,
+                )
+                handle = self.add_handle(
+                    team_id=r.team_id, worker_identity=r.identity,
+                    cvm_id=r.cvm_id, app_id=r.app_id,
+                )
+                try:
+                    await asyncio.to_thread(self.bootstrap_handle, handle)
+                    self.start_poller(handle)
+                    added.append(r.identity)
+                    logger.info("scale: worker %s online", r.identity[:8])
+                except Exception as exc:
+                    logger.warning("scale: bootstrap for %s failed: %s", r.identity[:12], exc)
+                    self.remove_handle(r.identity)
+                    self.db.retire_worker(r.cvm_id)
+                    asyncio.create_task(asyncio.to_thread(pool.delete, r.cvm_id))
+        elif target_size < current:
+            n = current - target_size
+            logger.info("scale: removing %d worker(s) (current=%d, target=%d)",
+                        n, current, target_size)
+            victims = list(self.handles.values())[-n:]
+            for victim in victims:
+                async with victim.lock:
+                    self.stop_poller(victim.team_id)
+                    self.remove_handle(victim.identity)
+                    self.db.retire_worker(victim.cvm_id)
+                    asyncio.create_task(asyncio.to_thread(pool.delete, victim.cvm_id))
+                    removed.append(victim.identity)
+                    logger.info("scale: worker %s retired", victim.identity[:8])
+        return {"added": added, "removed": removed, "current": len(self.handles)}
+
+    # ── workspace browse: route by task→worker mapping ────────────────────
+
+    async def _dispatch_to_task_worker(
+        self, *, task_id: str, context_id: str, payload_obj: dict, timeout: int
+    ) -> dict:
+        worker_identity = self.db.get_task_worker(task_id)
+        if not worker_identity or worker_identity not in self.handles:
+            return {"error": f"worker for task {task_id[:8]} unavailable (rotated or retired)"}
+        handle = self.handles[worker_identity]
+        async with handle.lock:
+            payload = json.dumps(payload_obj).encode("utf-8")
+            ciphertext = handle.session.encrypt(payload)
+            resp = await asyncio.to_thread(
+                self._dispatch_blocking, handle,
+                context_id=context_id, payload=ciphertext, timeout_seconds=timeout,
+            )
+            return json.loads(handle.session.decrypt(resp).decode("utf-8"))
+
+    async def list_workspace(self, task_id: str) -> dict:
+        return await self._dispatch_to_task_worker(
+            task_id=task_id, context_id=FS_LIST_CONTEXT_ID,
+            payload_obj={"task_id": task_id}, timeout=30,
+        )
+
+    async def read_workspace_file(self, task_id: str, path: str) -> dict:
+        return await self._dispatch_to_task_worker(
+            task_id=task_id, context_id=FS_READ_CONTEXT_ID,
+            payload_obj={"task_id": task_id, "path": path}, timeout=30,
+        )
+
+    # ── processor + event pollers ─────────────────────────────────────────
 
     async def run_processor_loop(self) -> None:
+        """Pull pending tasks; spawn process_task as background tasks so the
+        loop is non-blocking. Concurrency caps at len(self.handles) via the
+        per-handle locks inside process_task."""
         while True:
+            free = sum(1 for h in self.handles.values() if not h.lock.locked())
+            if free == 0:
+                await asyncio.sleep(0.5)
+                continue
             task = self.db.next_pending()
             if task is None:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 continue
-            await self.process_task(task)
+            asyncio.create_task(self.process_task(task))
 
-    async def run_event_poller_loop(self) -> None:
-        """Long-poll the orchestrator inbox for task:event wakes from the worker;
-        decrypt + persist each one. Events come in MLS-encrypted; the session
-        handles both directions since it's the same group."""
-        while True:
-            try:
-                # Long-poll with a short wait so a stuck worker doesn't tie us up.
-                resp = await asyncio.to_thread(
-                    self.client.read_inbox,
-                    self.team_id,
-                    self.bearer,
-                    bearer=self.bearer,
-                    wait_seconds=15,
-                )
-            except Exception as exc:
-                logger.warning("inbox poll error: %s; sleeping 2s", exc)
-                await asyncio.sleep(2)
-                continue
-            wakes = resp.get("wakes", [])
-            for wake in wakes:
-                wake_id = wake["wake_id"]
-                context_id = wake.get("context_id", "?")
-                if context_id != EVENT_CONTEXT_ID:
-                    logger.warning("unexpected wake context %s; ignoring", context_id)
-                    # Complete it anyway so it doesn't sit in the inbox forever.
-                    await asyncio.to_thread(
-                        self.client.complete_wake,
-                        self.team_id, wake_id, b64url_no_pad(b"{}"), bearer=self.bearer,
-                    )
-                    continue
+    def start_poller(self, handle: WorkerHandle) -> None:
+        """One event-poller asyncio task per worker team. Decodes the
+        plaintext envelope, routes by worker_identity to the right handle's
+        MLS session, persists the decrypted event, publishes to SSE."""
+        team_id = handle.team_id
+
+        async def _poll() -> None:
+            while True:
                 try:
-                    ciphertext = b64url_decode(wake["payload"])
-                    plaintext = self.session.decrypt(ciphertext).decode("utf-8")
-                    msg = json.loads(plaintext)
-                    self.db.insert_event(msg["task_id"], msg["seq"], msg["event"])
-                    # Push to any live SSE subscribers for this task. Format mirrors
-                    # the GET /events response: includes seq + received_at + event fields.
-                    await self.event_bus.publish(
-                        msg["task_id"],
-                        {"seq": msg["seq"], "received_at": time.time(), **msg["event"]},
+                    resp = await asyncio.to_thread(
+                        self.client.read_inbox,
+                        team_id, self.bearer,
+                        bearer=self.bearer, wait_seconds=15,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
-                # Always ack the wake (worker doesn't read the body anyway).
-                await asyncio.to_thread(
-                    self.client.complete_wake,
-                    self.team_id, wake_id, b64url_no_pad(b"{}"), bearer=self.bearer,
-                )
+                    logger.warning("inbox poll error (team=%s): %s; sleeping 2s", team_id, exc)
+                    await asyncio.sleep(2)
+                    continue
+                for wake in resp.get("wakes", []):
+                    wake_id = wake["wake_id"]
+                    context_id = wake.get("context_id", "?")
+                    try:
+                        if context_id != EVENT_CONTEXT_ID:
+                            logger.warning("unexpected wake context %s; ack+ignore", context_id)
+                        else:
+                            envelope_bytes = b64url_decode(wake["payload"])
+                            envelope = json.loads(envelope_bytes.decode("utf-8"))
+                            worker_identity = envelope["worker_identity"]
+                            target = self.handles.get(worker_identity)
+                            if target is None:
+                                logger.warning("event from unknown worker %s; dropping",
+                                               worker_identity[:12])
+                            else:
+                                ciphertext = b64url_decode(envelope["encrypted_b64"])
+                                inner = json.loads(target.session.decrypt(ciphertext).decode("utf-8"))
+                                self.db.insert_event(inner["task_id"], inner["seq"], inner["event"])
+                                await self.event_bus.publish(
+                                    inner["task_id"],
+                                    {"seq": inner["seq"], "received_at": time.time(), **inner["event"]},
+                                )
+                    except Exception as exc:
+                        logger.exception("event decode failed for wake %s: %s", wake_id[:8], exc)
+                    finally:
+                        await asyncio.to_thread(
+                            self.client.complete_wake,
+                            team_id, wake_id, b64url_no_pad(b"{}"), bearer=self.bearer,
+                        )
+
+        self.pollers[team_id] = asyncio.create_task(_poll(), name=f"poller-{team_id}")
+
+    def stop_poller(self, team_id: str) -> None:
+        task = self.pollers.pop(team_id, None)
+        if task is not None:
+            task.cancel()
 
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
@@ -551,42 +743,135 @@ async def require_token(
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 
-async def _resolve_worker(db: Db, pool: WorkerPool) -> tuple[str, str]:
-    """Decide which worker to bootstrap MLS with.
+async def _resolve_pool(db: Db, pool: WorkerPool, target_size: int) -> list[dict]:
+    """Decide which `target_size` workers to bootstrap into the pool.
 
-    Order: explicit env override (TEAM_ID + WORKER_IDENTITY_B64) → previously
-    persisted active worker in the DB → auto-provision a new one. The
-    auto-provision path takes ~3-5 min (CVM cold-start), which is why we cache
-    in the DB across orchestrator restarts.
+    Sources, layered in order until target_size is satisfied:
+      1. Env override: `TEAM_ID` + `WORKER_IDENTITY_B64` (single pinned worker).
+      2. DB cache: any rows with status='active' (survives orchestrator restart
+         without burning ~$0.05/CVM cold-start).
+      3. Auto-provision: fill the remaining slots in parallel via phala CLI.
+
+    Provisioning happens via asyncio.gather so an N=4 cold-start finishes in
+    ~3 min (one CVM provision wall-time) instead of ~12 min serial.
+
+    Returns dicts of {team_id, identity, cvm_id, app_id, from_env}. Workers
+    flagged `from_env=True` are pinned by the operator — the rotate/scale
+    paths must not delete or retire them.
     """
+    results: list[dict] = []
+    seen: set[str] = set()
+
     env_team = os.environ.get("TEAM_ID", "").strip()
     env_id = os.environ.get("WORKER_IDENTITY_B64", "").strip()
     if env_team and env_id:
-        logger.info("using worker from env: team=%s identity=%s...", env_team, env_id[:12])
-        return env_team, env_id
+        logger.info("using env-pinned worker: team=%s identity=%s...", env_team, env_id[:12])
+        results.append({
+            "team_id": env_team, "identity": env_id,
+            "cvm_id": f"env-{env_team}", "app_id": None, "from_env": True,
+        })
+        seen.add(env_id)
 
-    existing = db.get_active_worker()
-    if existing:
-        logger.info("reusing active worker %s from DB", existing["cvm_id"][:8])
-        return existing["team_id"], existing["identity"]
+    for w in db.list_active_workers():
+        if len(results) >= target_size:
+            break
+        if w["identity"] in seen:
+            continue
+        logger.info("reusing active worker %s from DB", w["cvm_id"][:8])
+        results.append({
+            "team_id": w["team_id"], "identity": w["identity"],
+            "cvm_id": w["cvm_id"], "app_id": w.get("app_id"),
+            "from_env": False,
+        })
+        seen.add(w["identity"])
 
-    logger.info("no worker configured — auto-provisioning via phala CLI (may take ~3-5min)")
-    info = await asyncio.to_thread(pool.provision)
-    assert info.identity is not None
-    db.upsert_active_worker(
-        cvm_id=info.cvm_id, app_id=info.app_id,
-        team_id=info.team_id, identity=info.identity,
-    )
-    return info.team_id, info.identity
+    shortfall = target_size - len(results)
+    if shortfall > 0:
+        # Provision serially. Phala's centralized KMS has a UNIQUE constraint
+        # on `dstack_app_nonces.address`; two parallel `phala deploy` calls
+        # that hash to the same App ID race for that row and the loser fails
+        # with `ix_dstack_app_nonces_address`. Serial deploys land the first
+        # nonce successfully, and the second deploy proceeds (Phala accepts
+        # multiple CVMs sharing an App ID once the nonce is established).
+        logger.info("auto-provisioning %d worker(s) serially (may take ~%dmin)",
+                    shortfall, 3 * shortfall)
+        for i in range(shortfall):
+            try:
+                r = await asyncio.to_thread(pool.provision)
+            except Exception as exc:
+                logger.warning("provision %d/%d failed: %s", i + 1, shortfall, exc)
+                continue
+            assert r.identity is not None
+            db.add_active_worker(
+                cvm_id=r.cvm_id, app_id=r.app_id,
+                team_id=r.team_id, identity=r.identity,
+            )
+            results.append({
+                "team_id": r.team_id, "identity": r.identity,
+                "cvm_id": r.cvm_id, "app_id": r.app_id, "from_env": False,
+            })
+            seen.add(r.identity)
+    return results
+
+
+async def _bootstrap_slot(
+    orch: "Orchestrator", db: Db, pool: WorkerPool, w: dict
+) -> "WorkerHandle | None":
+    """Build + bootstrap one handle. On failure, retire the worker and try
+    once more with a fresh provision. Returns the handle on success, None
+    if both attempts failed.
+
+    Env-pinned workers are not retired or replaced on failure — we let the
+    caller surface the bootstrap error so the operator can debug their CVM.
+    """
+    for attempt in (1, 2):
+        handle = orch.add_handle(
+            team_id=w["team_id"], worker_identity=w["identity"],
+            cvm_id=w["cvm_id"], app_id=w.get("app_id"),
+        )
+        try:
+            await asyncio.to_thread(orch.bootstrap_handle, handle)
+            return handle
+        except Exception as exc:
+            logger.warning(
+                "bootstrap[%s] attempt %d/2 failed: %s",
+                w["identity"][:12], attempt, exc,
+            )
+            orch.remove_handle(w["identity"])
+            if w.get("from_env"):
+                # User pinned this one; don't try a replacement.
+                return None
+            db.retire_worker(w["cvm_id"])
+            asyncio.create_task(asyncio.to_thread(pool.delete, w["cvm_id"]))
+            if attempt == 2:
+                return None
+            # Provision a replacement for the retry.
+            try:
+                info = await asyncio.to_thread(pool.provision)
+                assert info.identity is not None
+                db.add_active_worker(
+                    cvm_id=info.cvm_id, app_id=info.app_id,
+                    team_id=info.team_id, identity=info.identity,
+                )
+                w = {
+                    "team_id": info.team_id, "identity": info.identity,
+                    "cvm_id": info.cvm_id, "app_id": info.app_id, "from_env": False,
+                }
+            except Exception as prov_exc:
+                logger.warning("bootstrap[%s] replacement provision failed: %s",
+                               w["identity"][:12], prov_exc)
+                return None
+    return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tally_url = os.environ.get("TALLY_WORKERS_URL", "https://tally.nraimbault16.workers.dev")
     identity_path = os.environ.get("ORCH_IDENTITY_PATH", "/tmp/tally-orch/orchestrator.key")
-    mls_state_dir = os.environ.get("ORCH_MLS_STATE_DIR", "/tmp/tally-orch/mls-state")
+    mls_state_base_dir = os.environ.get("ORCH_MLS_STATE_DIR", "/tmp/tally-orch/mls-state")
     db_path = os.environ.get("ORCH_DB_PATH", "/tmp/tally-orch/tasks.db")
     scripts_env = os.environ.get("SCRIPTS_ENV_PATH", str(Path(__file__).resolve().parents[3] / "scripts" / ".env"))
+    target_pool_size = max(1, int(os.environ.get("TALLY_POOL_SIZE", "1")))
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     db = Db(db_path)
@@ -597,62 +882,45 @@ async def lifespan(app: FastAPI):
     state["db"] = db
     state["event_bus"] = event_bus
 
-    # Bootstrap with up to 3 attempts. A failure here usually means the worker
-    # CVM stored in the DB is dead (deleted out-of-band, crashed, network
-    # partitioned). Retire it and let the next attempt fall through to
-    # auto-provisioning. Each MLS state file is per-team — wipe the dir between
-    # attempts so a stale group on disk doesn't poison the new bootstrap.
-    orchestrator: Orchestrator | None = None
-    for attempt in range(1, 4):
-        team_id, worker_identity = await _resolve_worker(db, pool)
-        if attempt > 1:
-            try:
-                import shutil
-                shutil.rmtree(mls_state_dir, ignore_errors=True)
-                Path(mls_state_dir).mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                logger.warning("could not wipe MLS state dir: %s", exc)
-        orchestrator = Orchestrator(
-            tally_url=tally_url,
-            team_id=team_id,
-            worker_identity=worker_identity,
-            identity_path=identity_path,
-            mls_state_dir=mls_state_dir,
-            db=db,
-            event_bus=event_bus,
-        )
-        logger.info(
-            "bootstrap attempt %d/3 with worker %s",
-            attempt, worker_identity[:12],
-        )
-        try:
-            await asyncio.to_thread(orchestrator.bootstrap)
-            break
-        except Exception as exc:
-            logger.warning("bootstrap attempt %d/3 failed: %s", attempt, exc)
-            stale = db.get_active_worker()
-            if stale:
-                db.retire_worker(stale["cvm_id"])
-                asyncio.create_task(asyncio.to_thread(pool.delete, stale["cvm_id"]))
-                logger.warning("retired stale worker %s; will re-resolve", stale["cvm_id"][:8])
-            if attempt == 3:
-                raise
-    assert orchestrator is not None
+    orchestrator = Orchestrator(
+        tally_url=tally_url,
+        identity_path=identity_path,
+        mls_state_base_dir=mls_state_base_dir,
+        db=db,
+        event_bus=event_bus,
+    )
     state["orchestrator"] = orchestrator
+
+    slots = await _resolve_pool(db, pool, target_pool_size)
+    logger.info("bootstrapping pool of %d worker(s) in parallel", len(slots))
+    handles = await asyncio.gather(
+        *[_bootstrap_slot(orchestrator, db, pool, w) for w in slots]
+    )
+    ok = [h for h in handles if h is not None]
+    if not ok:
+        raise RuntimeError(
+            f"no workers bootstrapped (target={target_pool_size}); "
+            "systemd will respawn for a fresh attempt"
+        )
+    if len(ok) < target_pool_size:
+        logger.warning("only %d/%d workers bootstrapped; will run degraded",
+                       len(ok), target_pool_size)
+    for h in ok:
+        orchestrator.start_poller(h)
+
     processor_task = asyncio.create_task(orchestrator.run_processor_loop())
-    event_task = asyncio.create_task(orchestrator.run_event_poller_loop())
     state["processor_task"] = processor_task
-    state["event_task"] = event_task
-    logger.info("ready; processor + event-poller loops started")
+    logger.info("ready; pool=%d, processor loop started", len(orchestrator.handles))
     try:
         yield
     finally:
-        for t in (processor_task, event_task):
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+        for team_id in list(orchestrator.pollers.keys()):
+            orchestrator.stop_poller(team_id)
+        processor_task.cancel()
+        try:
+            await processor_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Tally Orchestrator", lifespan=lifespan)
@@ -773,54 +1041,90 @@ async def read_task_file(task_id: str, path: str) -> dict:
     return resp
 
 
+class PoolRotateBody(BaseModel):
+    identity: str | None = None  # None means "rotate the first handle in the pool"
+
+
+class PoolScaleBody(BaseModel):
+    size: int
+
+
 @app.get("/admin/pool/status", dependencies=[Depends(require_token)])
 async def pool_status() -> dict:
-    """Return the active worker's metadata + uptime. Returns null if none."""
-    info = state["db"].get_active_worker()
-    if info is None:
-        return {"worker": None}
-    return {"worker": {**info, "uptime_seconds": time.time() - info["created_at"]}}
+    """Return every active worker's metadata + uptime + lock state.
+
+    Lock state is in-process truth (asyncio.Lock from the WorkerHandle),
+    while everything else is pulled from the DB. A worker can be 'active'
+    in the DB but absent from `orchestrator.handles` mid-rotation — those
+    rows show busy=False, present=False so operators can spot mismatches."""
+    db: Db = state["db"]
+    orch: Orchestrator = state["orchestrator"]
+    now = time.time()
+    workers = []
+    for w in db.list_active_workers():
+        handle = orch.handles.get(w["identity"])
+        workers.append({
+            **w,
+            "uptime_seconds": now - w["created_at"],
+            "present": handle is not None,
+            "busy": handle.lock.locked() if handle else None,
+            "failures": handle.failures if handle else None,
+        })
+    return {"workers": workers, "pool_size": len(orch.handles)}
 
 
 @app.post("/admin/pool/rotate", dependencies=[Depends(require_token)])
-async def pool_rotate() -> dict:
-    """Provision a fresh worker, persist it as the active worker, delete the
-    old CVM, and exit non-zero so systemd respawns the orchestrator (which
-    then bootstraps MLS against the new worker on startup).
+async def pool_rotate(body: PoolRotateBody | None = None) -> dict:
+    """Rotate one worker: provision a fresh CVM, bootstrap a new handle, then
+    retire+delete the old one. The other handles keep serving tasks while this
+    one is being swapped — no service exit needed (unlike Sprint 12's path).
 
-    Returns 200 with the new worker info; the service exits ~2 s later. The
-    client should expect a connection reset shortly after this response."""
-    db: Db = state["db"]
-    pool: WorkerPool = state["worker_pool"]
-    current = db.get_active_worker()
-    logger.info("rotate: provisioning new worker (current=%s)",
-                current["cvm_id"][:8] if current else "none")
-    new = await asyncio.to_thread(pool.provision)
-    assert new.identity is not None
-    db.upsert_active_worker(
-        cvm_id=new.cvm_id, app_id=new.app_id,
-        team_id=new.team_id, identity=new.identity,
-    )
-    if current:
-        # Best-effort tear down of the prior CVM. Don't block the response on it.
-        asyncio.create_task(asyncio.to_thread(pool.delete, current["cvm_id"]))
-
-    # Schedule a non-zero exit so systemd respawns the service with the new
-    # worker on next bootstrap.
-    async def _exit_soon():
-        await asyncio.sleep(2)
-        logger.info("rotate: exiting for systemd respawn")
-        os._exit(1)
-    asyncio.create_task(_exit_soon())
+    Body: {"identity": "<b64-pubkey>"} to target a specific worker.
+    Empty/missing body rotates the first handle in pool-insertion order."""
+    orch: Orchestrator = state["orchestrator"]
+    if not orch.handles:
+        raise HTTPException(503, "no workers in pool")
+    target_identity = (body.identity if body else None) or next(iter(orch.handles))
+    handle = orch.handles.get(target_identity)
+    if handle is None:
+        raise HTTPException(404, f"worker {target_identity[:12]}... not in active pool")
+    if target_identity in orch._rotating:
+        raise HTTPException(409, "rotation already in progress for this worker")
+    orch._rotating.add(target_identity)
+    logger.info("admin rotate: target=%s", target_identity[:12])
+    new_handle = await orch._rotate_handle(handle)
+    if new_handle is None:
+        raise HTTPException(500, "rotation failed; check service logs")
     return {
-        "new_worker": {
-            "cvm_id": new.cvm_id,
-            "team_id": new.team_id,
-            "identity": new.identity,
+        "old_worker": {
+            "cvm_id": handle.cvm_id, "team_id": handle.team_id,
+            "identity": handle.identity,
         },
-        "old_worker": current,
-        "respawn_in_seconds": 2,
+        "new_worker": {
+            "cvm_id": new_handle.cvm_id, "team_id": new_handle.team_id,
+            "identity": new_handle.identity,
+        },
+        "pool_size": len(orch.handles),
     }
+
+
+@app.post("/admin/pool/scale", dependencies=[Depends(require_token)])
+async def pool_scale(body: PoolScaleBody) -> dict:
+    """Resize the worker pool to `body.size`. Up = provision N new CVMs in
+    parallel + bootstrap. Down = release the tail handles (waits for any
+    in-flight task to finish on each before retiring).
+
+    Blocks until the scale completes — scale-up to a new size may take 3-5
+    min for the CVM cold-start. Use a generous client timeout."""
+    if body.size < 0:
+        raise HTTPException(400, "size must be >= 0")
+    if body.size > 16:
+        raise HTTPException(400, "size capped at 16 for safety")
+    orch: Orchestrator = state["orchestrator"]
+    before = len(orch.handles)
+    logger.info("admin scale: %d -> %d", before, body.size)
+    result = await orch.scale_pool(body.size)
+    return {"before": before, "after": len(orch.handles), **result}
 
 
 def main() -> None:

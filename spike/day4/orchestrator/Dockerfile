@@ -6,6 +6,7 @@ ARG SKYTALE_BRANCH=feat/py-mls-engine
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates pkg-config libssl-dev build-essential \
+    protobuf-compiler cmake \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

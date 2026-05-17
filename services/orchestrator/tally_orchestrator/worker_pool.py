@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -58,16 +59,37 @@ class WorkerPool:
         self.identity_timeout_s = identity_timeout_s
 
     def provision(self) -> WorkerInfo:
-        """Deploy a new worker CVM and wait for it to emit an MLS KeyPackage."""
-        team_id = f"tally-auto-{int(time.time())}"
-        worker_name = f"tally-worker-{int(time.time())}"
-        env_file = self._build_env_file(team_id)
-        info = self._deploy(worker_name, env_file)
+        """Deploy a new worker CVM with a pre-generated Ed25519 keypair
+        passed via env. The CVM uses this directly as its MLS identity, so
+        two parallel provisions land in distinct identities even when Phala
+        collapses their docker-compose into a single shared App ID."""
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        suffix = secrets.token_hex(3)
+        team_id = f"tally-auto-{int(time.time())}-{suffix}"
+        worker_name = f"tally-worker-{int(time.time())}-{suffix}"
+        priv_obj = Ed25519PrivateKey.generate()
+        privkey_hex = priv_obj.private_bytes_raw().hex()
+        env_file = self._build_env_file(team_id, privkey_hex)
+        compose_file = self._build_compose_file(team_id)
+        info = self._deploy(worker_name, env_file, compose_file)
         info.team_id = team_id
         info.identity = self._await_identity(info.cvm_id)
         logger.info("worker %s ready: team=%s identity=%s...",
                     info.cvm_id[:8], team_id, (info.identity or "")[:12])
         return info
+
+    def _build_compose_file(self, team_id: str) -> Path:
+        """Generate a per-deploy compose. With Sprint 14's WORKER_PRIVKEY_HEX
+        env-passing model (worker:v10+) the compose doesn't need to differ
+        between deploys for correctness — Phala's app dedup is fine here
+        since each CVM gets its own env + key via the env file. We still
+        write a per-team file just to keep the deploy-time inputs isolated
+        and easy to inspect at /tmp/tally-auto-compose-*.yml."""
+        src = WORKER_DIR / "docker-compose.yml"
+        target = Path("/tmp") / f"tally-auto-compose-{team_id}.yml"
+        target.write_text(src.read_text())
+        return target
 
     def delete(self, cvm_id: str) -> None:
         """Tear down a CVM. Non-fatal if it's already gone."""
@@ -81,23 +103,34 @@ class WorkerPool:
         except subprocess.TimeoutExpired:
             logger.warning("delete CVM %s timed out (may still be in progress on Phala side)", cvm_id[:8])
 
-    def _build_env_file(self, team_id: str) -> Path:
-        """Build a per-deploy env file by inlining scripts/.env (for the Red Pill key)
-        + the auto-generated TEAM_ID. Phala's `phala deploy -e` accepts a path."""
+    def _build_env_file(self, team_id: str, privkey_hex: str) -> Path:
+        """Build a per-deploy env file with TEAM_ID + pre-generated worker
+        private key (hex). Sprint 14: passing the privkey via env removes any
+        dependence on per-CVM disk state — Phala shares /workspace across
+        CVMs in the same app, and the docker-compose ${VAR:-default}
+        interpolation doesn't get the env file's vars at the right phase,
+        so file-based key isolation was unreliable. The env value, by
+        contrast, ends up in the container directly via the `phala deploy -e`
+        flow and is the source of truth for the worker's identity.
+        """
         target = Path("/tmp") / f"tally-auto-{team_id}.env"
         with open(self.scripts_env_path) as src:
             base = src.read()
-        target.write_text(base.rstrip() + f"\nTEAM_ID={team_id}\n")
+        target.write_text(
+            base.rstrip()
+            + f"\nTEAM_ID={team_id}"
+            + f"\nWORKER_PRIVKEY_HEX={privkey_hex}\n"
+        )
         target.chmod(0o600)
         return target
 
-    def _deploy(self, name: str, env_file: Path) -> WorkerInfo:
+    def _deploy(self, name: str, env_file: Path, compose_file: Path) -> WorkerInfo:
         """Run `phala deploy` from the worker spike dir; parse CVM id + app id."""
         if not WORKER_DIR.exists():
             raise RuntimeError(f"worker spike dir missing: {WORKER_DIR}")
         cmd = [
             _phala_binary(), "deploy",
-            "-c", "docker-compose.yml",
+            "-c", str(compose_file),
             "-e", str(env_file),
             "--name", name,
         ]

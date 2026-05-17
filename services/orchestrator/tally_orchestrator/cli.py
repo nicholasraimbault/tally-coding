@@ -97,37 +97,53 @@ def cmd_pool_status(args: argparse.Namespace) -> int:
         r = c.get("/admin/pool/status")
     _handle_resp(r)
     body = r.json()
-    w = body.get("worker")
-    if not w:
-        print("no active worker")
+    workers = body.get("workers", [])
+    if not workers:
+        print("no active workers")
         return 1
-    uptime = int(w.get("uptime_seconds", 0))
-    print(f"active worker:")
-    print(f"  cvm_id:   {w['cvm_id']}")
-    print(f"  team_id:  {w['team_id']}")
-    print(f"  identity: {w['identity'][:12]}...")
-    print(f"  uptime:   {uptime // 60}m {uptime % 60}s")
+    print(f"pool size: {body.get('pool_size', len(workers))}")
+    print(f"{'cvm_id':<10} {'identity':<14} {'team':<28} {'uptime':<10} {'busy':<6} {'fails'}")
+    for w in workers:
+        uptime = int(w.get("uptime_seconds", 0))
+        utxt = f"{uptime // 60}m{uptime % 60:02d}s"
+        busy = "yes" if w.get("busy") else "no" if w.get("present") else "?"
+        fails = w.get("failures") if w.get("failures") is not None else "-"
+        print(f"{w['cvm_id'][:8]:<10} {w['identity'][:12]:<14} {w['team_id'][:26]:<28} {utxt:<10} {busy:<6} {fails}")
     return 0
 
 
 def cmd_pool_rotate(args: argparse.Namespace) -> int:
-    print("provisioning new worker (this takes ~3-5 min)...")
-    # The service exits after responding, so this request may time out at the
-    # transport layer; we still want to read the body if it came through first.
-    try:
-        with _client(args) as c:
-            r = c.post("/admin/pool/rotate", timeout=600)
-    except Exception as e:
-        print(f"warning: connection reset (expected — service restarting): {e}")
-        return 0
+    body = {}
+    if args.identity:
+        body["identity"] = args.identity
+        print(f"rotating worker {args.identity[:12]}... (takes ~3-5 min)")
+    else:
+        print("rotating first worker in pool (takes ~3-5 min)...")
+    with _client(args) as c:
+        r = c.post("/admin/pool/rotate", json=body, timeout=600)
     _handle_resp(r)
-    body = r.json()
-    new = body["new_worker"]
-    print(f"new worker provisioned:")
-    print(f"  cvm_id:   {new['cvm_id']}")
-    print(f"  team_id:  {new['team_id']}")
-    print(f"  identity: {new['identity'][:12]}...")
-    print(f"service exiting in {body.get('respawn_in_seconds', 2)}s; systemd will respawn.")
+    resp = r.json()
+    new = resp["new_worker"]
+    print(f"rotation complete; pool size = {resp['pool_size']}")
+    print(f"  old: cvm={resp['old_worker']['cvm_id'][:8]} identity={resp['old_worker']['identity'][:12]}")
+    print(f"  new: cvm={new['cvm_id'][:8]} identity={new['identity'][:12]}")
+    return 0
+
+
+def cmd_pool_scale(args: argparse.Namespace) -> int:
+    size = args.size
+    print(f"scaling pool to {size} worker(s); may take ~3-5 min per new CVM...")
+    with _client(args) as c:
+        r = c.post("/admin/pool/scale", json={"size": size}, timeout=900)
+    _handle_resp(r)
+    resp = r.json()
+    added = resp.get("added", [])
+    removed = resp.get("removed", [])
+    print(f"scaled {resp.get('before')} -> {resp.get('after')}")
+    if added:
+        print(f"  added: {', '.join(a[:12] for a in added)}")
+    if removed:
+        print(f"  removed: {', '.join(r[:12] for r in removed)}")
     return 0
 
 
@@ -182,10 +198,14 @@ def main() -> int:
 
     pool = sub.add_parser("pool", help="worker pool operations")
     pool_sub = pool.add_subparsers(dest="pool_cmd", required=True)
-    pool_status = pool_sub.add_parser("status", help="show the active worker")
+    pool_status = pool_sub.add_parser("status", help="list all active workers in the pool")
     pool_status.set_defaults(func=cmd_pool_status)
-    pool_rotate = pool_sub.add_parser("rotate", help="provision a new worker; service will respawn")
+    pool_rotate = pool_sub.add_parser("rotate", help="swap one worker for a fresh CVM (no service exit)")
+    pool_rotate.add_argument("--identity", default="", help="b64 pubkey of the worker to rotate (default: first)")
     pool_rotate.set_defaults(func=cmd_pool_rotate)
+    pool_scale = pool_sub.add_parser("scale", help="resize the pool to N workers")
+    pool_scale.add_argument("size", type=int, help="target pool size (>=0, <=16)")
+    pool_scale.set_defaults(func=cmd_pool_scale)
 
     args = parser.parse_args()
     return args.func(args)

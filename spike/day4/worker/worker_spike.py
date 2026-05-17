@@ -112,20 +112,32 @@ def run_event_emitter(
     task_id: str,
 ) -> None:
     """Background thread: pulls events off the queue, MLS-encrypts each one,
-    dispatches as a task:event wake to the orchestrator's bearer."""
+    dispatches as a task:event wake to the orchestrator's bearer.
+
+    Wire envelope (sprint 14): plaintext JSON wrapper around the MLS ciphertext
+    so an orchestrator with N>1 worker sessions can route incoming events to
+    the right session by worker_identity. Field layout:
+        { worker_identity, task_id, seq, encrypted_b64 }
+    The encrypted_b64 field's plaintext is unchanged: {task_id, seq, event}."""
     seq = 0
     while True:
         item = event_queue.get()
         if item is _EMITTER_SHUTDOWN:
             return
         try:
-            payload = json.dumps({"task_id": task_id, "seq": seq, "event": item}).encode("utf-8")
-            ciphertext = session.encrypt(payload)
+            inner = json.dumps({"task_id": task_id, "seq": seq, "event": item}).encode("utf-8")
+            ciphertext = session.encrypt(inner)
+            envelope = {
+                "worker_identity": bearer,
+                "task_id": task_id,
+                "seq": seq,
+                "encrypted_b64": b64url_no_pad(ciphertext),
+            }
             client.dispatch_wake(
                 team_id=team_id,
                 target_identity=target_identity,
                 context_id=EVENT_CONTEXT_ID,
-                payload=b64url_no_pad(ciphertext),
+                payload=b64url_no_pad(json.dumps(envelope).encode("utf-8")),
                 timeout_seconds=60,
                 bearer=bearer,
             )
@@ -380,6 +392,20 @@ def main() -> int:
     workspace.mkdir(parents=True, exist_ok=True)
     Path(mls_state_dir).mkdir(parents=True, exist_ok=True)
 
+    # Sprint 14: when N>1 worker CVMs share an app, Phala may share docker
+    # volumes (or strip per-CVM env substitution) so the file-based key falls
+    # into a single shared `/workspace/worker.key`. If the orchestrator wants
+    # to force a unique identity per CVM, it passes WORKER_PRIVKEY_HEX in the
+    # env file; we use that directly and write it to disk so any later code
+    # path that reads identity_path still works.
+    privkey_hex = os.environ.get("WORKER_PRIVKEY_HEX", "").strip()
+    if privkey_hex:
+        import binascii
+        priv_bytes = binascii.unhexlify(privkey_hex)
+        path = Path(identity_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(priv_bytes)
+        path.chmod(0o600)
     _privkey, pubkey = load_or_create_identity(identity_path)
     bearer = bearer_from_pubkey(pubkey)
 

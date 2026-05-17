@@ -1,13 +1,14 @@
 services:
   worker:
-    image: ghcr.io/nicholasraimbault/tally-spike-day4-worker:v8
+    image: ghcr.io/nicholasraimbault/tally-spike-day4-worker:v10
     environment:
       - REDPILL_API_KEY=${REDPILL_API_KEY}
       - REDPILL_BASE_URL=${REDPILL_BASE_URL:-https://api.redpill.ai/v1}
       - REDPILL_MODEL=${REDPILL_MODEL:-moonshotai/kimi-k2.6}
       - TALLY_WORKERS_URL=${TALLY_WORKERS_URL:-https://tally.nraimbault16.workers.dev}
       - TEAM_ID=${TEAM_ID}
-      - WORKER_IDENTITY_PATH=/workspace/worker.key
+      - WORKER_PRIVKEY_HEX=${WORKER_PRIVKEY_HEX:-}
+      - WORKER_IDENTITY_PATH=${WORKER_IDENTITY_PATH:-/workspace/worker.key}
     volumes:
       - workspace:/workspace
 volumes:
