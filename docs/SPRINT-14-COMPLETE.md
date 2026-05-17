@@ -1,15 +1,19 @@
 # Sprint 14 — N>1 worker pool with concurrent dispatch
 
-**Status: PARTIAL PASS** — Pool of 2 workers boots cleanly with two
+**Status: PASS** — Pool of 2 workers boots cleanly with two
 cryptographically distinct MLS identities, two concurrent event-poller
-loops, and per-handle dispatch locks (the structural prerequisite for
-concurrent task execution). End-to-end "two tasks land on two workers
-in parallel" was not validated in this sprint cycle because the dev
-host went under memory pressure mid-run and OOM-killed the orchestrator
-before both tasks finished — the architecture is in place and the pool
-is ready to accept concurrent work; only the runtime validation step
-got cut short. Reproducing it after a fresh host reboot is a low-risk
-follow-up.
+loops, and per-handle dispatch locks. End-to-end concurrent dispatch
+proven: two tasks submitted back-to-back landed on two different
+workers within the same second, ran in parallel, and both finished
+with `success: true` on their own workspaces.
+
+A memory leak in `run_processor_loop` (described in "Memory leak fix"
+below) initially blocked the E2E — the loop spawned dozens of
+duplicate `process_task` coroutines for the same pending row before
+one of them could mark it `running`, growing the process to ~11 GB
+in 70 s. Fixed by tracking in-flight task ids and capping concurrent
+dispatches at `len(handles)`; service now holds steady at ~80 MB
+under load.
 
 ## What was built
 
@@ -209,6 +213,76 @@ Two distinct App IDs, two distinct Ed25519 identities, two distinct
 team IDs, two concurrent inbox-poller loops. Warm restart from DB-cache
 re-bootstrapped both handles in ~1s (no `phala deploy` needed).
 
+### Concurrent dispatch E2E (11:57-11:58 CDT 2026-05-17)
+
+After applying the memory leak fix (see below), submitted two tasks
+back-to-back and tailed the journal:
+
+```
+11:57:56  ready; pool=2, processor loop started
+11:57:56  running task b9f29d70 on worker jCJqS-vF: greet.py + pytest
+11:57:57  running task fb03732c on worker kvMH73Xc: fact.py + pytest
+11:58:46  task fb03732c completed on worker kvMH73Xc: success=True
+11:58:55  task b9f29d70 completed on worker jCJqS-vF: success=True
+```
+
+Both tasks dispatched within ~1s of each other to **different**
+workers; runtimes overlapped completely (49s and 59s, fully nested).
+Memory peaked at ~80 MB. The `result_json` for each shows its own
+distinct workspace contents:
+
+| task     | worker      | files_created (excerpt)                |
+|----------|-------------|----------------------------------------|
+| fb03732c | kvMH73Xc... | `fact.py`, `test_fact.py`              |
+| b9f29d70 | jCJqS-vF... | `greet.py`, `test_greet.py`            |
+
+No cross-contamination between workspaces; each worker's `/workspace`
+volume is per-app per Phala's CVM model.
+
+### Memory leak fix in `run_processor_loop`
+
+The first E2E attempt OOMed because the processor loop kept
+re-spawning `process_task` for the same pending row each tick before
+the previous spawn could call `db.mark_running`:
+
+```python
+# Before — spawns duplicate coroutines per row, each pinning memory
+while True:
+    free = sum(... not h.lock.locked())
+    if free == 0: await sleep(0.5); continue
+    task = self.db.next_pending()  # returns same row repeatedly
+    asyncio.create_task(self.process_task(task))  # NO yield before re-check
+```
+
+With pool=2 + 2 pending rows, this generated ~30+ duplicate coroutines
+per task in the first few seconds — each held a reference to the same
+MlsSession, each waited on `acquire_idle`, and the working set grew to
+~11 GB in 70 s before the cgroup cap throttled the service into swap
+hell. The fix tracks in-flight task ids and caps concurrent dispatches
+at pool size:
+
+```python
+self._inflight_task_ids: set[str] = set()
+
+async def run_processor_loop(self):
+    while True:
+        if len(self._inflight_task_ids) >= len(self.handles):
+            await asyncio.sleep(0.5); continue
+        task = self.db.next_pending()
+        if task is None or task["id"] in self._inflight_task_ids:
+            await asyncio.sleep(0.5); continue
+        self._inflight_task_ids.add(task["id"])
+        asyncio.create_task(self._wrap_process_task(task))
+
+async def _wrap_process_task(self, task):
+    try: await self.process_task(task)
+    finally: self._inflight_task_ids.discard(task["id"])
+```
+
+Steady-state memory under concurrent load: ~80 MB (idle ~75 MB). The
+systemd unit also gained `MemoryHigh=2G MemoryMax=3G` cgroup limits
+as defense-in-depth so any future leak can't take down the host.
+
 ## Files committed
 
 - `services/orchestrator/tally_orchestrator/service.py` (~+400):
@@ -230,11 +304,12 @@ re-bootstrapped both handles in ~1s (no `phala deploy` needed).
 
 ## Open items
 
-1. **Concurrent dispatch not yet validated end-to-end on a live pool.**
-   Both halves (architecture + 2-worker boot) work; the missing piece
-   is "submit 2 tasks, watch them complete simultaneously on different
-   workers." Next session can re-bootstrap the pool from the DB cache
-   in seconds and run this in a few minutes.
+1. **Stuck `running` rows on restart.** When the orchestrator dies
+   mid-task (OOM, signal), the DB row stays `running` forever — the
+   processor loop's `next_pending` only considers `status='pending'`
+   so the orphan is invisible. A lifespan-init pass that demotes
+   `running` → `pending` (with a fresh `worker_identity=NULL`) would
+   self-heal across restarts. Small follow-up.
 2. **Serial provisioning is slow.** ~3 min per CVM. For a `tally pool
    scale 8`, that's 24 minutes. A fix would batch-create CVMs with
    distinct App IDs by varying the `image` tag per deploy (push aliases
@@ -252,8 +327,8 @@ re-bootstrapped both handles in ~1s (no `phala deploy` needed).
 
 ## Next sprint candidates
 
-1. **Re-run the concurrent E2E** on a fresh boot — 5 minutes of work,
-   closes the only open Sprint 14 item.
+1. **Stuck-task self-heal on startup** — demote orphaned `running`
+   rows to `pending` so a restart re-dispatches them.
 2. **Clerk OIDC** for real multi-user auth.
 3. **Mobile build** of `tally_coding_app`.
 4. **Per-tag image pre-warm** so scale-up doesn't serialize on Phala's

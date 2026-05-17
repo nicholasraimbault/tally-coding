@@ -354,6 +354,7 @@ class Orchestrator:
         self.pollers: dict[str, asyncio.Task] = {}     # keyed by team_id
         self._auto_rotate_threshold = int(os.environ.get("TALLY_AUTO_ROTATE_THRESHOLD", "3"))
         self._rotating: set[str] = set()  # identities currently being rotated
+        self._inflight_task_ids: set[str] = set()  # task IDs currently dispatched
 
     # ── handle lifecycle ──────────────────────────────────────────────────
 
@@ -637,17 +638,32 @@ class Orchestrator:
     async def run_processor_loop(self) -> None:
         """Pull pending tasks; spawn process_task as background tasks so the
         loop is non-blocking. Concurrency caps at len(self.handles) via the
-        per-handle locks inside process_task."""
+        per-handle locks inside process_task.
+
+        Tracks in-flight task ids so we don't re-dispatch the same pending
+        row before the new background task has marked it `running` in the
+        DB — without this guard the loop tail-spawns dozens of duplicate
+        process_task coroutines for a single row in the first few ticks,
+        each waiting on the same handle lock and pinning memory."""
         while True:
-            free = sum(1 for h in self.handles.values() if not h.lock.locked())
-            if free == 0:
+            # Cap concurrent dispatches at pool size — each process_task will
+            # acquire one handle's lock, so spawning more than len(handles)
+            # just produces coroutines waiting on acquire_idle.
+            if len(self._inflight_task_ids) >= len(self.handles):
                 await asyncio.sleep(0.5)
                 continue
             task = self.db.next_pending()
-            if task is None:
+            if task is None or task["id"] in self._inflight_task_ids:
                 await asyncio.sleep(0.5)
                 continue
-            asyncio.create_task(self.process_task(task))
+            self._inflight_task_ids.add(task["id"])
+            asyncio.create_task(self._wrap_process_task(task))
+
+    async def _wrap_process_task(self, task: dict) -> None:
+        try:
+            await self.process_task(task)
+        finally:
+            self._inflight_task_ids.discard(task["id"])
 
     def start_poller(self, handle: WorkerHandle) -> None:
         """One event-poller asyncio task per worker team. Decodes the
