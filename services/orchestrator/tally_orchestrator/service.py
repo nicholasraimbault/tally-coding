@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import sys
 import time
@@ -36,7 +38,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -425,6 +428,37 @@ class Orchestrator:
 
 state: dict[str, Any] = {}
 
+# Bearer-token auth. Token comes from env TALLY_API_TOKEN; if absent, we
+# generate a 32-byte random one at startup, persist it in the DB dir, and
+# print it once. `auto_error=False` lets us return a JSON 401 ourselves
+# instead of FastAPI's plain string.
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _resolve_token(db_dir: Path) -> str:
+    env_token = os.environ.get("TALLY_API_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    state_file = db_dir / "api_token.txt"
+    if state_file.exists():
+        return state_file.read_text().strip()
+    token = secrets.token_urlsafe(32)
+    state_file.write_text(token + "\n")
+    state_file.chmod(0o600)
+    logger.warning("auto-generated TALLY_API_TOKEN=%s (saved to %s)", token, state_file)
+    return token
+
+
+async def require_token(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> None:
+    """FastAPI dependency: 401s any request without a valid Bearer token."""
+    expected: str = state.get("api_token", "")
+    presented = creds.credentials if creds and creds.scheme.lower() == "bearer" else ""
+    # hmac.compare_digest is constant-time vs short-circuit ==.
+    if not expected or not presented or not hmac.compare_digest(expected, presented):
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -437,6 +471,7 @@ async def lifespan(app: FastAPI):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     db = Db(db_path)
+    state["api_token"] = _resolve_token(Path(db_path).parent)
     event_bus = EventBus()
     orchestrator = Orchestrator(
         tally_url=tally_url,
@@ -476,14 +511,14 @@ async def health() -> dict:
     return {"status": "ok", "tasks_in_flight": state["db"].next_pending() is not None}
 
 
-@app.post("/tasks", response_model=TaskResponse)
+@app.post("/tasks", dependencies=[Depends(require_token)], response_model=TaskResponse)
 async def submit_task(body: TaskSubmit) -> TaskResponse:
     task_id = state["db"].create_task(body.description)
     task = state["db"].get_task(task_id)
     return TaskResponse(**task)
 
 
-@app.get("/tasks/{task_id}", response_model=TaskResponse)
+@app.get("/tasks/{task_id}", dependencies=[Depends(require_token)], response_model=TaskResponse)
 async def get_task(task_id: str) -> TaskResponse:
     task = state["db"].get_task(task_id)
     if not task:
@@ -491,12 +526,12 @@ async def get_task(task_id: str) -> TaskResponse:
     return TaskResponse(**task)
 
 
-@app.get("/tasks", response_model=list[TaskResponse])
+@app.get("/tasks", dependencies=[Depends(require_token)], response_model=list[TaskResponse])
 async def list_tasks(limit: int = 100) -> list[TaskResponse]:
     return [TaskResponse(**t) for t in state["db"].list_tasks(limit=limit)]
 
 
-@app.get("/tasks/{task_id}/events")
+@app.get("/tasks/{task_id}/events", dependencies=[Depends(require_token)])
 async def get_task_events(task_id: str, since_seq: int = -1) -> list[dict]:
     """Return events with seq > since_seq, in order. One-shot read (used by
     clients that don't speak SSE). Live clients should use /stream instead."""
@@ -506,7 +541,7 @@ async def get_task_events(task_id: str, since_seq: int = -1) -> list[dict]:
     return state["db"].list_events(task_id, since_seq=since_seq)
 
 
-@app.get("/tasks/{task_id}/stream")
+@app.get("/tasks/{task_id}/stream", dependencies=[Depends(require_token)])
 async def stream_task_events(task_id: str, request: Request, since_seq: int = -1):
     """Server-Sent Events stream. Emits historical events with seq > since_seq
     first (so reconnects don't lose anything), then live events as they arrive
@@ -558,7 +593,7 @@ async def stream_task_events(task_id: str, request: Request, since_seq: int = -1
     return EventSourceResponse(event_source())
 
 
-@app.get("/tasks/{task_id}/files")
+@app.get("/tasks/{task_id}/files", dependencies=[Depends(require_token)])
 async def list_task_files(task_id: str) -> dict:
     """List files in the worker's per-task workspace. Dispatches a fs:list
     wake to the worker over MLS; returns the decrypted entry list."""
@@ -572,7 +607,7 @@ async def list_task_files(task_id: str) -> dict:
     return resp
 
 
-@app.get("/tasks/{task_id}/files/{path:path}")
+@app.get("/tasks/{task_id}/files/{path:path}", dependencies=[Depends(require_token)])
 async def read_task_file(task_id: str, path: str) -> dict:
     """Read one file from the worker's per-task workspace. Path is forwarded
     to the worker which validates against path traversal."""
@@ -588,7 +623,9 @@ async def read_task_file(task_id: str, path: str) -> dict:
 
 def main() -> None:
     import uvicorn
-    host = os.environ.get("HOST", "127.0.0.1")
+    # Default to 0.0.0.0 so LAN devices can reach the service. Override with
+    # HOST=127.0.0.1 to lock down to local-only.
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host=host, port=port, log_level="info")
 

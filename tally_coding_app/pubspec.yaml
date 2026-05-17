@@ -12,6 +12,7 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
   http: ^1.2.0
+  path_provider: ^2.1.4
 
   # Skytale Dart SDK — E2E encryption + agent identity. Currently a skeleton
   # awaiting PR #469 merge; pinned to the branch until then.

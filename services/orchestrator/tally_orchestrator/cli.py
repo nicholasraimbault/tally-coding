@@ -6,8 +6,9 @@ Usage:
     tally task get <id>
     tally task tail <id>
 
-The orchestrator service URL defaults to http://127.0.0.1:8080; override with
-TALLY_ORCH_URL.
+Env vars:
+  TALLY_ORCH_URL    base URL (default: http://127.0.0.1:8080)
+  TALLY_API_TOKEN   bearer token required by the service since sprint 10
 """
 
 from __future__ import annotations
@@ -25,6 +26,19 @@ import httpx
 DEFAULT_URL = os.environ.get("TALLY_ORCH_URL", "http://127.0.0.1:8080")
 
 
+def _client(args: argparse.Namespace) -> httpx.Client:
+    token = args.token or os.environ.get("TALLY_API_TOKEN", "")
+    headers = {"authorization": f"Bearer {token}"} if token else {}
+    return httpx.Client(base_url=args.url, headers=headers, timeout=10)
+
+
+def _handle_resp(r: httpx.Response) -> None:
+    if r.status_code == 401:
+        print("error: 401 unauthorized — set TALLY_API_TOKEN", file=sys.stderr)
+        sys.exit(1)
+    r.raise_for_status()
+
+
 def fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
@@ -35,18 +49,20 @@ def fmt_status(s: str) -> str:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    r = httpx.post(f"{args.url}/tasks", json={"description": args.description}, timeout=10)
-    r.raise_for_status()
+    with _client(args) as c:
+        r = c.post("/tasks", json={"description": args.description})
+    _handle_resp(r)
     task = r.json()
     print(f"submitted task {task['id']}")
     if args.tail:
-        return tail_task(args.url, task["id"])
+        return tail_task(args, task["id"])
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    r = httpx.get(f"{args.url}/tasks", timeout=10)
-    r.raise_for_status()
+    with _client(args) as c:
+        r = c.get("/tasks")
+    _handle_resp(r)
     tasks = r.json()
     if not tasks:
         print("no tasks")
@@ -61,46 +77,49 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_get(args: argparse.Namespace) -> int:
-    r = httpx.get(f"{args.url}/tasks/{args.id}", timeout=10)
+    with _client(args) as c:
+        r = c.get(f"/tasks/{args.id}")
     if r.status_code == 404:
         print(f"task {args.id} not found", file=sys.stderr)
         return 1
-    r.raise_for_status()
+    _handle_resp(r)
     task = r.json()
     print(json.dumps(task, indent=2))
     return 0 if task["status"] == "completed" else 1
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
-    return tail_task(args.url, args.id)
+    return tail_task(args, args.id)
 
 
-def tail_task(url: str, task_id: str, poll_seconds: float = 2.0) -> int:
+def tail_task(args: argparse.Namespace, task_id: str, poll_seconds: float = 2.0) -> int:
     last_status = None
-    while True:
-        r = httpx.get(f"{url}/tasks/{task_id}", timeout=10)
-        if r.status_code == 404:
-            print(f"task {task_id} not found", file=sys.stderr)
-            return 1
-        r.raise_for_status()
-        task = r.json()
-        if task["status"] != last_status:
-            print(f"[{fmt_ts(time.time())}] {fmt_status(task['status'])}")
-            last_status = task["status"]
-        if task["status"] in ("completed", "failed"):
-            print()
-            if task["status"] == "completed":
-                print("result:")
-                print(json.dumps(task["result"], indent=2))
-                return 0
-            print(f"error: {task.get('error')}", file=sys.stderr)
-            return 1
-        time.sleep(poll_seconds)
+    with _client(args) as c:
+        while True:
+            r = c.get(f"/tasks/{task_id}")
+            if r.status_code == 404:
+                print(f"task {task_id} not found", file=sys.stderr)
+                return 1
+            _handle_resp(r)
+            task = r.json()
+            if task["status"] != last_status:
+                print(f"[{fmt_ts(time.time())}] {fmt_status(task['status'])}")
+                last_status = task["status"]
+            if task["status"] in ("completed", "failed"):
+                print()
+                if task["status"] == "completed":
+                    print("result:")
+                    print(json.dumps(task["result"], indent=2))
+                    return 0
+                print(f"error: {task.get('error')}", file=sys.stderr)
+                return 1
+            time.sleep(poll_seconds)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tally", description="Tally orchestration CLI")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"orchestrator service URL (default: {DEFAULT_URL})")
+    parser.add_argument("--token", default="", help="bearer token (or env TALLY_API_TOKEN)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     task = sub.add_parser("task", help="task operations")

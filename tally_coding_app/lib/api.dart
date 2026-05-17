@@ -2,6 +2,12 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+class UnauthorizedException implements Exception {
+  const UnauthorizedException();
+  @override
+  String toString() => 'unauthorized (set or fix the bearer token)';
+}
+
 class Task {
   final String id;
   final String description;
@@ -36,13 +42,18 @@ class Task {
 
 class TallyOrchClient {
   final Uri baseUrl;
+  final String token;
   final http.Client _http;
 
-  TallyOrchClient({required this.baseUrl, http.Client? client})
+  TallyOrchClient({required this.baseUrl, this.token = '', http.Client? client})
       : _http = client ?? http.Client();
 
+  Map<String, String> get _authHeaders =>
+      token.isEmpty ? const {} : {'authorization': 'Bearer $token'};
+
   Future<List<Task>> listTasks({int limit = 100}) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks?limit=$limit'));
+    final resp = await _http.get(baseUrl.resolve('/tasks?limit=$limit'), headers: _authHeaders);
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list tasks failed: ${resp.statusCode} ${resp.body}');
     }
@@ -51,7 +62,8 @@ class TallyOrchClient {
   }
 
   Future<Task> getTask(String id) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$id'));
+    final resp = await _http.get(baseUrl.resolve('/tasks/$id'), headers: _authHeaders);
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('get task failed: ${resp.statusCode} ${resp.body}');
     }
@@ -61,19 +73,27 @@ class TallyOrchClient {
   Future<Task> submitTask(String description) async {
     final resp = await _http.post(
       baseUrl.resolve('/tasks'),
-      headers: {'content-type': 'application/json'},
+      headers: {'content-type': 'application/json', ..._authHeaders},
       body: jsonEncode({'description': description}),
     );
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('submit task failed: ${resp.statusCode} ${resp.body}');
     }
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  void _checkAuth(http.Response resp) {
+    if (resp.statusCode == 401) {
+      throw const UnauthorizedException();
+    }
+  }
+
   /// One-shot fetch of events with seq > sinceSeq. Used as a fallback when SSE
-  /// is unavailable; live clients should prefer [streamEvents].
+  /// is unavailable; live clients should prefer [streamFrames].
   Future<List<Map<String, dynamic>>> listEvents(String taskId, {int sinceSeq = -1}) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'));
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'), headers: _authHeaders);
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list events failed: ${resp.statusCode} ${resp.body}');
     }
@@ -86,8 +106,12 @@ class TallyOrchClient {
   Stream<({String name, Map<String, dynamic> data})> streamFrames(String taskId, {int sinceSeq = -1}) async* {
     final req = http.Request('GET', baseUrl.resolve('/tasks/$taskId/stream?since_seq=$sinceSeq'))
       ..headers['accept'] = 'text/event-stream'
-      ..headers['cache-control'] = 'no-cache';
+      ..headers['cache-control'] = 'no-cache'
+      ..headers.addAll(_authHeaders);
     final resp = await _http.send(req);
+    if (resp.statusCode == 401) {
+      throw const UnauthorizedException();
+    }
     if (resp.statusCode != 200) {
       throw Exception('stream connect failed: ${resp.statusCode}');
     }
@@ -129,7 +153,8 @@ class TallyOrchClient {
   /// Workspace file listing for a completed (or running) task. Returns
   /// {"entries": [{"path", "size", "is_dir"}, ...]}.
   Future<List<Map<String, dynamic>>> listFiles(String taskId) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files'));
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files'), headers: _authHeaders);
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list files failed: ${resp.statusCode} ${resp.body}');
     }
@@ -140,7 +165,8 @@ class TallyOrchClient {
   /// Read a single file from a task's workspace. Returns the decoded body
   /// (server delivers base64; we decode to UTF-8 string here for the viewer).
   Future<({String content, int size, bool truncated})> readFile(String taskId, String path) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files/$path'));
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files/$path'), headers: _authHeaders);
+    _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('read file failed: ${resp.statusCode} ${resp.body}');
     }
