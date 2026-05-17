@@ -88,13 +88,15 @@ def handle_bootstrap_wake(session: MlsSession, payload: bytes) -> tuple[bytes, b
         return json.dumps({"error": f"unknown phase: {phase}"}).encode("utf-8"), False
 
 
-def handle_task_wake(session: MlsSession, payload: bytes, workspace: Path) -> bytes:
-    """Decrypt payload, run task, return MLS-encrypted response bytes."""
+def handle_task_wake(session: MlsSession, payload: bytes, workspace_root: Path, wake_id: str) -> bytes:
+    """Decrypt payload, run task in a fresh per-task workspace, return ciphertext."""
     plaintext_json = session.decrypt(payload).decode("utf-8")
     task_spec = json.loads(plaintext_json)
     task_description = task_spec["task"]
     print(f"[worker] task (decrypted): {task_description[:80]}...", flush=True)
-    result = perform_task(task_description, workspace)
+    task_workspace = workspace_root / f"task-{wake_id[:12]}"
+    task_workspace.mkdir(parents=True, exist_ok=True)
+    result = perform_task(task_description, task_workspace)
     return session.encrypt(json.dumps(result).encode("utf-8"))
 
 
@@ -147,7 +149,7 @@ def main() -> int:
             elif context_id == TASK_CONTEXT_ID:
                 if not session.bootstrapped:
                     raise RuntimeError("task wake received before MLS bootstrap")
-                response_bytes = handle_task_wake(session, payload, workspace)
+                response_bytes = handle_task_wake(session, payload, workspace, wake_id)
             else:
                 raise RuntimeError(f"unknown context_id: {context_id}")
         except Exception as exc:
@@ -156,10 +158,7 @@ def main() -> int:
 
         client.complete_wake(team_id, wake_id, b64url_no_pad(response_bytes), bearer=bearer)
         print(f"[worker] completed wake_id={wake_id[:8]}", flush=True)
-
-        # After completing a task wake, exit (CVM lifecycle).
-        if context_id == TASK_CONTEXT_ID:
-            return 0
+        # Long-lived: keep polling. Container exits on signal (SIGTERM/SIGINT).
 
 
 if __name__ == "__main__":
