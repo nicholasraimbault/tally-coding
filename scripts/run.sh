@@ -258,8 +258,21 @@ ensure_phala_cli() {
     echo "  Or: https://nodejs.org/"
     exit 1
   fi
-  echo ">> Installing phala CLI..."
-  npm install -g phala
+  # Install to a user-owned prefix so we don't need root. On Arch/CachyOS the
+  # default global node_modules path is /usr/lib/node_modules which is
+  # root-owned. ~/.npm-global is the canonical user-local equivalent.
+  local npm_prefix="${HOME}/.npm-global"
+  mkdir -p "${npm_prefix}/bin"
+  echo ">> Installing phala CLI to ${npm_prefix} (user-local, no root)..."
+  npm install --prefix "${npm_prefix}" -g phala
+  # Make the binary discoverable for the rest of this script (PATH may or may
+  # not already include ${npm_prefix}/bin depending on the user's shell rc).
+  export PATH="${npm_prefix}/bin:${PATH}"
+  if ! command -v phala >/dev/null 2>&1; then
+    echo "ERROR: phala installed but not on PATH. Add to your shell rc:"
+    echo "  export PATH=\"${npm_prefix}/bin:\$PATH\""
+    exit 1
+  fi
 }
 
 ensure_phala_authenticated() {
