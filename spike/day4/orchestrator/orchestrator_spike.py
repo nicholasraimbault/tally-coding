@@ -29,18 +29,22 @@ def main() -> int:
     print(f"[orchestrator] dispatching task to worker={worker_identity[:8]}...", flush=True)
 
     payload_obj = {"task": task_description}
-    payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("ascii")
+    # Tally Workers requires url-safe base64 *without* padding ('=' chars rejected).
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload_obj).encode("utf-8")).decode("ascii").rstrip("=")
 
     result = client.dispatch_wake(
         team_id=team_id,
         target_identity=worker_identity,
         context_id="task:start",
         payload=payload_b64,
-        timeout_seconds=1800,  # 30 minutes — coding tasks can take a while
+        timeout_seconds=300,  # Tally Workers hard-caps at 300s (5 min)
         bearer=bearer,
     )
 
-    response_json = base64.b64decode(result["response"]).decode("utf-8")
+    # Response also comes back url-safe-b64 without padding; pad back before decoding.
+    raw = result["response"]
+    raw += "=" * (-len(raw) % 4)
+    response_json = base64.urlsafe_b64decode(raw).decode("utf-8")
     response = json.loads(response_json)
 
     print(f"[orchestrator] wake completed wake_id={result['wake_id']}", flush=True)

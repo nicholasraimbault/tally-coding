@@ -70,7 +70,7 @@ def main() -> int:
     # Ensure team exists + register our handler
     client.team_init(team_id, bearer=bearer)
     client.register(team_id, bearer, bearer=bearer, context_id=WORKER_CONTEXT_ID)
-    print(f"[worker] ready; team={team_id}; identity={bearer[:8]}...", flush=True)
+    print(f"[worker] ready; team={team_id}; identity={bearer}", flush=True)
 
     # Poll loop: handle one task then exit (CVM lifecycle; orchestrator restarts as needed)
     while True:
@@ -84,7 +84,10 @@ def main() -> int:
         print(f"[worker] received wake_id={wake_id[:8]}", flush=True)
 
         try:
-            payload_json = base64.b64decode(wake["payload"]).decode("utf-8")
+            # Tally Workers uses url-safe base64 without padding; pad it back to decode.
+            raw = wake["payload"]
+            raw += "=" * (-len(raw) % 4)
+            payload_json = base64.urlsafe_b64decode(raw).decode("utf-8")
             task_spec = json.loads(payload_json)
             task_description = task_spec["task"]
             print(f"[worker] task: {task_description[:80]}...", flush=True)
@@ -93,7 +96,8 @@ def main() -> int:
             print(f"[worker] task failed: {exc}", flush=True)
             result = {"success": False, "error": str(exc)}
 
-        result_b64 = base64.b64encode(json.dumps(result).encode("utf-8")).decode("ascii")
+        # Same encoding: url-safe b64, padding stripped.
+        result_b64 = base64.urlsafe_b64encode(json.dumps(result).encode("utf-8")).decode("ascii").rstrip("=")
         client.complete_wake(team_id, wake_id, result_b64, bearer=bearer)
         print(f"[worker] completed wake_id={wake_id[:8]}; result={result}", flush=True)
         return 0

@@ -1,7 +1,8 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-spike-day4-orchestrator:v1
+    image: ghcr.io/nicholasraimbault/tally-spike-day4-orchestrator:v3
     environment:
       - TALLY_WORKERS_URL=${TALLY_WORKERS_URL:-https://tally.nraimbault16.workers.dev}
       - TEAM_ID=${TEAM_ID}
       - WORKER_IDENTITY_B64=${WORKER_IDENTITY_B64}
+      - ORCHESTRATOR_IDENTITY_PATH=/tmp/orchestrator.key
