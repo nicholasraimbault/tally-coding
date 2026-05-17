@@ -1,10 +1,35 @@
+# Stage 1: build the skytale-sdk Python wheel from the feat/py-mls-engine
+# branch (PR #470). Once that PR merges to skytale master, swap the branch
+# to a tag/master ref. Until then, the wheel has to be built from source
+# because PyMlsEngine isn't in any released wheel yet.
+FROM python:3.12-slim AS skytale-builder
+
+ARG SKYTALE_BRANCH=feat/py-mls-engine
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates pkg-config libssl-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN pip install --no-cache-dir 'maturin[patchelf]'
+
+RUN git clone --depth 1 --branch ${SKYTALE_BRANCH} \
+    https://github.com/nicholasraimbault/skytale.git /skytale
+
+WORKDIR /skytale/sdk
+RUN maturin build --release --features python --compatibility linux -o /wheels
+
+# Stage 2: actual worker runtime.
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
 
 WORKDIR /app
 
-# Build deps for openhands-ai + git for repo cloning
+# Build deps for openhands-ai
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     build-essential \
@@ -15,16 +40,18 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-dev
 
-# Copy the worker entrypoint + shared tally_coding_core
+# Install the skytale-sdk wheel built in stage 1 into the uv venv.
+COPY --from=skytale-builder /wheels/skytale_sdk-*.whl /tmp/wheels/
+RUN uv pip install --python /app/.venv/bin/python /tmp/wheels/skytale_sdk-*.whl \
+    && rm -rf /tmp/wheels
+
 COPY worker_spike.py /app/
 COPY tally_coding_core /app/tally_coding_core
 
-# Workspace mount
 RUN mkdir -p /workspace
 
 ENV WORKSPACE_DIR=/workspace
 
-# Create non-root user (TEE security hygiene)
 RUN useradd -m -u 1000 appuser \
     && chown -R appuser:appuser /app /workspace
 USER appuser
