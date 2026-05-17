@@ -1,0 +1,43 @@
+services:
+  orchestrator:
+    image: ghcr.io/nicholasraimbault/tally-orch:v1
+    # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
+    # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
+    # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
+    # against each worker every time it reboots.
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - TALLY_API_TOKEN=${TALLY_API_TOKEN}
+      - TALLY_POOL_SIZE=${TALLY_POOL_SIZE:-1}
+      - TALLY_SERIAL_PROVISION=true
+      - TALLY_RECOVERY_TIMEOUT=${TALLY_RECOVERY_TIMEOUT:-600}
+      # Architect creds (Sprint 23 reads these via SCRIPTS_ENV_PATH on
+      # the laptop; in the hosted CVM we pass them inline). The
+      # orchestrator's `lifespan` falls back to reading the same env
+      # vars if SCRIPTS_ENV_PATH isn't set.
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+      - REDPILL_BASE_URL=${REDPILL_BASE_URL:-https://api.redpill.ai/v1}
+      # CVM cold-start can't docker-in-docker provision its own first
+      # worker (Phala blocks dind), so seed a pre-provisioned worker
+      # via these env vars. scripts/seed-cvm-orchestrator-env.py
+      # provisions a worker locally and writes them into .env.prod.
+      - TEAM_ID=${TEAM_ID:-}
+      - WORKER_IDENTITY_B64=${WORKER_IDENTITY_B64:-}
+    volumes:
+      - data:/data
+
+  # CF Tunnel sidecar — gives the CVM a stable public URL at
+  # tally.pronoic.dev without exposing a Phala-provided ingress
+  # (which doesn't exist for arbitrary CVM ports). Shares the
+  # network namespace so the orchestrator is reachable at
+  # http://orchestrator:8080 inside the compose network.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.5.0
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+    depends_on:
+      - orchestrator
+
+volumes:
+  data:

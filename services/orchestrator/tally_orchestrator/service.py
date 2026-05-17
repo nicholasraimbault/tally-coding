@@ -1427,29 +1427,53 @@ async def _resolve_pool(db: Db, pool: WorkerPool, target_size: int) -> list[dict
 
     shortfall = target_size - len(results)
     if shortfall > 0:
-        # Provision in parallel. Each provision pushes its own per-deploy
-        # image tag (Sprint 16) before calling phala deploy, so each lands
-        # in a distinct Phala App ID — no UNIQUE(address) race like the
-        # Sprint 14 serial workaround was avoiding.
-        logger.info("auto-provisioning %d worker(s) in parallel (may take ~3-5min)", shortfall)
-        provisioned = await asyncio.gather(
-            *[asyncio.to_thread(pool.provision) for _ in range(shortfall)],
-            return_exceptions=True,
-        )
-        for r in provisioned:
-            if isinstance(r, BaseException):
-                logger.warning("provision failed: %s", r)
-                continue
-            assert r.identity is not None
-            db.add_active_worker(
-                cvm_id=r.cvm_id, app_id=r.app_id,
-                team_id=r.team_id, identity=r.identity,
+        serial = os.environ.get("TALLY_SERIAL_PROVISION", "").lower() in ("1", "true", "yes")
+        if serial:
+            # Sprint 24: hosted-orchestrator path. Per-deploy image builds
+            # (Sprint 16) require docker-in-docker, which Phala CVMs
+            # block. Without unique-digest images, parallel provisions
+            # race for the same KMS App ID (Sprint 14). Serialize.
+            logger.info("auto-provisioning %d worker(s) serially (may take ~%dmin)",
+                        shortfall, shortfall * 3)
+            for i in range(shortfall):
+                try:
+                    r = await asyncio.to_thread(pool.provision)
+                except Exception as exc:
+                    logger.warning("provision %d/%d failed: %s", i + 1, shortfall, exc)
+                    continue
+                assert r.identity is not None
+                db.add_active_worker(
+                    cvm_id=r.cvm_id, app_id=r.app_id,
+                    team_id=r.team_id, identity=r.identity,
+                )
+                results.append({
+                    "team_id": r.team_id, "identity": r.identity,
+                    "cvm_id": r.cvm_id, "app_id": r.app_id, "from_env": False,
+                })
+                seen.add(r.identity)
+        else:
+            # Sprint 16: parallel with per-deploy image builds. Each
+            # provision pushes a unique-digest image so each lands in a
+            # distinct Phala App ID — no UNIQUE(address) race.
+            logger.info("auto-provisioning %d worker(s) in parallel (may take ~3-5min)", shortfall)
+            provisioned = await asyncio.gather(
+                *[asyncio.to_thread(pool.provision) for _ in range(shortfall)],
+                return_exceptions=True,
             )
-            results.append({
-                "team_id": r.team_id, "identity": r.identity,
-                "cvm_id": r.cvm_id, "app_id": r.app_id, "from_env": False,
-            })
-            seen.add(r.identity)
+            for r in provisioned:
+                if isinstance(r, BaseException):
+                    logger.warning("provision failed: %s", r)
+                    continue
+                assert r.identity is not None
+                db.add_active_worker(
+                    cvm_id=r.cvm_id, app_id=r.app_id,
+                    team_id=r.team_id, identity=r.identity,
+                )
+                results.append({
+                    "team_id": r.team_id, "identity": r.identity,
+                    "cvm_id": r.cvm_id, "app_id": r.app_id, "from_env": False,
+                })
+                seen.add(r.identity)
     return results
 
 
@@ -1509,7 +1533,16 @@ async def lifespan(app: FastAPI):
     identity_path = os.environ.get("ORCH_IDENTITY_PATH", "/tmp/tally-orch/orchestrator.key")
     mls_state_base_dir = os.environ.get("ORCH_MLS_STATE_DIR", "/tmp/tally-orch/mls-state")
     db_path = os.environ.get("ORCH_DB_PATH", "/tmp/tally-orch/tasks.db")
-    scripts_env = os.environ.get("SCRIPTS_ENV_PATH", str(Path(__file__).resolve().parents[3] / "scripts" / ".env"))
+    # `SCRIPTS_ENV_PATH` overrides; default to <repo>/scripts/.env when the
+    # orchestrator runs from a checkout. In the Sprint 24 hosted-CVM image
+    # there is no repo around the install dir (parents[3] is OOB), so fall
+    # back to a path that simply won't exist — Red Pill creds are then
+    # injected via the container's own env vars instead.
+    _scripts_env_default = "/dev/null"
+    _parents = Path(__file__).resolve().parents
+    if len(_parents) > 3:
+        _scripts_env_default = str(_parents[3] / "scripts" / ".env")
+    scripts_env = os.environ.get("SCRIPTS_ENV_PATH", _scripts_env_default)
     target_pool_size = max(1, int(os.environ.get("TALLY_POOL_SIZE", "1")))
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1545,6 +1578,10 @@ async def lifespan(app: FastAPI):
     # Sprint 23: load Red Pill creds from the same scripts/.env that builds
     # worker env files. The architect uses these for the per-task team
     # picker. Missing key → architect calls fall back to Solo Coder.
+    #
+    # Sprint 24: in the hosted-CVM image we pass these as direct env
+    # vars (no scripts/.env available); read them inline as a fallback
+    # so the architect works in both deployment modes.
     try:
         env_lines = Path(scripts_env).read_text().splitlines()
         for line in env_lines:
@@ -1553,13 +1590,16 @@ async def lifespan(app: FastAPI):
                 orchestrator.redpill_key = line.split("=", 1)[1].strip()
             elif line.startswith("REDPILL_BASE_URL="):
                 orchestrator.redpill_base = line.split("=", 1)[1].strip()
-        if orchestrator.redpill_key:
-            logger.info("Tally architect ready (Red Pill at %s)", orchestrator.redpill_base)
-        else:
-            logger.warning("REDPILL_API_KEY not found in %s; architect will fall back to Solo Coder",
-                           scripts_env)
     except OSError as exc:
-        logger.warning("could not read %s for Red Pill creds: %s", scripts_env, exc)
+        logger.debug("scripts_env not readable (%s); falling back to direct env vars", exc)
+    if not orchestrator.redpill_key:
+        orchestrator.redpill_key = os.environ.get("REDPILL_API_KEY") or None
+    if not orchestrator.redpill_base or orchestrator.redpill_base == "https://api.redpill.ai/v1":
+        orchestrator.redpill_base = os.environ.get("REDPILL_BASE_URL", "https://api.redpill.ai/v1")
+    if orchestrator.redpill_key:
+        logger.info("Tally architect ready (Red Pill at %s)", orchestrator.redpill_base)
+    else:
+        logger.warning("REDPILL_API_KEY not set; architect will fall back to Solo Coder")
     state["orchestrator"] = orchestrator
 
     slots = await _resolve_pool(db, pool, target_pool_size)

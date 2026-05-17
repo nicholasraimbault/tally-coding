@@ -10,7 +10,10 @@ venv/
 # Secrets / env files (per-spike .env stays out of git)
 .env
 .env.local
+.env.prod
 spike/*/.env
+services/*/.env
+services/*/.env.*
 
 # OS
 .DS_Store

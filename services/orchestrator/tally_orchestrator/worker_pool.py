@@ -23,7 +23,24 @@ logger = logging.getLogger(__name__)
 
 # Where the worker spike lives (Dockerfile + docker-compose.yml). The pool's
 # phala-deploy invocation runs from this directory.
-WORKER_DIR = Path(__file__).resolve().parents[3] / "spike" / "day4" / "worker"
+#
+# In the laptop checkout this resolves to <repo>/spike/day4/worker.  In the
+# Sprint 24 hosted-CVM image the orchestrator is installed at
+# /app/tally_orchestrator/ with no repo around it, so parents[3] is out of
+# bounds — fall back to TALLY_WORKER_DIR (set by Dockerfile / compose) or
+# the in-image default /app/worker.  Provisioning still requires the
+# worker source to be present; CVM-hosted mode falls through to the
+# TALLY_SERIAL_PROVISION path if it isn't.
+import os as _os
+_env_worker_dir = _os.environ.get("TALLY_WORKER_DIR")
+if _env_worker_dir:
+    WORKER_DIR = Path(_env_worker_dir)
+else:
+    _parents = Path(__file__).resolve().parents
+    if len(_parents) > 3:
+        WORKER_DIR = _parents[3] / "spike" / "day4" / "worker"
+    else:
+        WORKER_DIR = Path("/app/worker")
 
 # Base image that every per-deploy alias tag points at. Sprint 16 pushes a
 # `v10-<team_id>` tag for each provision so parallel deploys end up with
@@ -90,7 +107,19 @@ class WorkerPool:
         worker_name = f"tally-worker-{int(time.time())}-{suffix}"
         priv_obj = Ed25519PrivateKey.generate()
         privkey_hex = priv_obj.private_bytes_raw().hex()
-        image_ref = self._ensure_unique_image_tag(team_id)
+        # Sprint 24: per-deploy image build needs `docker` on PATH. Inside
+        # a Phala CVM, docker-in-docker is blocked; fall back to the base
+        # image. Parallel deploys then risk the Sprint 14/16 KMS race, so
+        # the hosted orchestrator should set TALLY_SERIAL_PROVISION=true
+        # to force the serial codepath (see _resolve_pool / scale_pool).
+        try:
+            image_ref = self._ensure_unique_image_tag(team_id)
+        except RuntimeError as exc:
+            logger.warning(
+                "per-deploy image build unavailable (%s); using base image %s",
+                str(exc).splitlines()[0][:120], BASE_IMAGE,
+            )
+            image_ref = BASE_IMAGE
         env_file = self._build_env_file(team_id, privkey_hex)
         compose_file = self._build_compose_file(team_id, image_ref)
         info = self._deploy(worker_name, env_file, compose_file)
