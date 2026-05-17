@@ -1112,6 +1112,11 @@ class PoolScaleBody(BaseModel):
     size: int
 
 
+class PoolGcBody(BaseModel):
+    dry_run: bool = True
+    older_than_hours: float = 1.0
+
+
 @app.get("/admin/pool/status", dependencies=[Depends(require_token)])
 async def pool_status() -> dict:
     """Return every active worker's metadata + uptime + lock state.
@@ -1188,6 +1193,40 @@ async def pool_scale(body: PoolScaleBody) -> dict:
     logger.info("admin scale: %d -> %d", before, body.size)
     result = await orch.scale_pool(body.size)
     return {"before": before, "after": len(orch.handles), **result}
+
+
+@app.post("/admin/pool/gc", dependencies=[Depends(require_token)])
+async def pool_gc(body: PoolGcBody) -> dict:
+    """Garbage-collect stale GHCR package versions from the Sprint 16
+    per-deploy-build flow.
+
+    Each pool.provision pushes a `v10-tally-auto-<team_id>` tag (one new
+    GHCR package version per CVM). Retired workers' tags never get
+    cleaned up automatically, and overwritten tags leave orphaned
+    untagged versions behind. After ~weeks of churn that's hundreds of
+    stale versions per project.
+
+    Body fields:
+      dry_run: bool (default True) — report what would be removed but
+        don't actually call DELETE.
+      older_than_hours: float (default 1.0) — only remove versions whose
+        `updated_at` is older than this many hours. Guards against
+        deleting a tag whose worker just got retired mid-rotation.
+    """
+    pool: WorkerPool = state["worker_pool"]
+    db: Db = state["db"]
+    keep_team_ids = {w["team_id"] for w in db.list_active_workers()}
+    logger.info(
+        "admin gc: dry_run=%s older_than=%.1fh keep_active=%d",
+        body.dry_run, body.older_than_hours, len(keep_team_ids),
+    )
+    result = await asyncio.to_thread(
+        pool.gc_image_versions,
+        keep_team_ids=keep_team_ids,
+        older_than_seconds=int(body.older_than_hours * 3600),
+        dry_run=body.dry_run,
+    )
+    return result
 
 
 def main() -> None:

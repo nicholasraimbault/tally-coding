@@ -31,6 +31,13 @@ WORKER_DIR = Path(__file__).resolve().parents[3] / "spike" / "day4" / "worker"
 # `image:` is one of the few fields that survives Phala's normalization).
 BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v10"
 
+# GHCR package name for the worker image (used by Sprint 17's GC).
+GHCR_OWNER = "nicholasraimbault"
+GHCR_PACKAGE = "tally-spike-day4-worker"
+# Per-deploy tag prefix (from Sprint 16). GC targets only these — anything
+# without this prefix (e.g. `v10`, `v9`, `v1`) is preserved.
+DEPLOY_TAG_PREFIX = "v10-tally-auto-"
+
 
 def _phala_binary() -> str:
     """Locate the phala CLI. systemd user units inherit the user's PATH;
@@ -159,6 +166,119 @@ class WorkerPool:
         )
         target.write_text(content)
         return target
+
+    def gc_image_versions(
+        self,
+        *,
+        keep_team_ids: set[str],
+        older_than_seconds: int = 3600,
+        dry_run: bool = False,
+    ) -> dict:
+        """Garbage-collect stale package versions from GHCR.
+
+        Two categories of cruft accumulate after Sprint 16's per-deploy
+        build flow:
+
+        1. **Per-deploy tagged versions** (`v10-tally-auto-<team_id>`) whose
+           owning worker has been retired. Each pool.provision pushes one
+           new tag; retired workers' tags linger forever without cleanup.
+        2. **Orphaned untagged versions** — manifests that had a tag at
+           push time but got overwritten by a later push of the same tag.
+           These accumulate silently and don't help anyone.
+
+        `keep_team_ids` is the set of `team_id`s that map to currently
+        active workers — their tags are preserved no matter how old.
+        `older_than_seconds` guards against deleting a tag whose worker
+        just got retired (e.g. mid-rotation). The default 1h is enough
+        for normal turnover.
+
+        Uses `gh api` for the GHCR REST calls — the orchestrator host
+        already has `gh` authed for `docker push` to land. Returns a
+        dict summarising kept / removed / would-remove versions."""
+        # gh is the authenticated GitHub CLI. The keyring token is fine for
+        # listing versions, but DELETE requires `delete:packages` scope
+        # which gh's default auth doesn't have. If
+        # `~/.config/tally-orch/ghcr-token` exists, we point GH_TOKEN at it
+        # (the user creates a PAT with the delete:packages scope via the
+        # zenity flow documented in SPRINT-17-COMPLETE.md).
+        gh = shutil.which("gh")
+        if gh is None:
+            raise RuntimeError("gh CLI not found; cannot reach GHCR API")
+        env = None
+        token_path = Path.home() / ".config" / "tally-orch" / "ghcr-token"
+        if token_path.exists():
+            import os
+            env = {**os.environ, "GH_TOKEN": token_path.read_text().strip()}
+        # List all versions (paginated). Each entry has `id`, `name`
+        # (sha256:...), `created_at`, `updated_at`, and
+        # `metadata.container.tags` (list).
+        res = subprocess.run(
+            [gh, "api", "--paginate",
+             f"/user/packages/container/{GHCR_PACKAGE}/versions"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"gh api list versions failed:\n{res.stderr}")
+        import json
+        versions = json.loads(res.stdout)
+        now_ms = int(time.time() * 1000)
+
+        def _is_older(ts_iso: str) -> bool:
+            # GHCR returns ISO-8601 with trailing Z.
+            from datetime import datetime, timezone
+            dt = datetime.strptime(ts_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            return (now_ms - int(dt.timestamp() * 1000)) > older_than_seconds * 1000
+
+        eligible: list[dict] = []
+        kept_for_active: list[dict] = []
+        kept_for_protected_tag: list[dict] = []
+        kept_for_age: list[dict] = []
+        for v in versions:
+            tags = v.get("metadata", {}).get("container", {}).get("tags", []) or []
+            updated = v.get("updated_at") or v.get("created_at")
+            summary = {"id": v["id"], "digest": v["name"][:19], "tags": tags, "updated": updated}
+            # Tagged version: only auto-deploy tags are GC targets.
+            if tags:
+                has_protected = any(not t.startswith(DEPLOY_TAG_PREFIX) for t in tags)
+                if has_protected:
+                    kept_for_protected_tag.append(summary)
+                    continue
+                # Map tag → team_id (`v10-tally-auto-<team_id>`).
+                # Skip if any tag's team_id is in the active set.
+                team_ids = [t[len(DEPLOY_TAG_PREFIX):] for t in tags]
+                if any(t in keep_team_ids for t in team_ids):
+                    kept_for_active.append(summary)
+                    continue
+            if not _is_older(updated):
+                kept_for_age.append(summary)
+                continue
+            eligible.append(summary)
+
+        removed: list[dict] = []
+        errors: list[dict] = []
+        if not dry_run:
+            for v in eligible:
+                res = subprocess.run(
+                    [gh, "api", "-X", "DELETE",
+                     f"/user/packages/container/{GHCR_PACKAGE}/versions/{v['id']}"],
+                    capture_output=True, text=True, timeout=30, env=env,
+                )
+                if res.returncode != 0:
+                    errors.append({**v, "error": res.stderr.strip()})
+                else:
+                    removed.append(v)
+        return {
+            "dry_run": dry_run,
+            "total_versions": len(versions),
+            "eligible": eligible if dry_run else [],
+            "removed": removed,
+            "errors": errors,
+            "kept": {
+                "active_worker_tag": len(kept_for_active),
+                "protected_tag": len(kept_for_protected_tag),
+                "too_recent": len(kept_for_age),
+            },
+        }
 
     def delete(self, cvm_id: str) -> None:
         """Tear down a CVM. Non-fatal if it's already gone."""

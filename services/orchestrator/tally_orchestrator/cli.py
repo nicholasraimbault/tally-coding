@@ -147,6 +147,39 @@ def cmd_pool_scale(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pool_gc(args: argparse.Namespace) -> int:
+    body = {"dry_run": args.dry_run, "older_than_hours": args.older_than_hours}
+    label = "dry-run" if args.dry_run else "running"
+    print(f"GHCR GC ({label}, older_than={args.older_than_hours}h)...")
+    with _client(args) as c:
+        r = c.post("/admin/pool/gc", json=body, timeout=300)
+    _handle_resp(r)
+    resp = r.json()
+    kept = resp.get("kept", {})
+    print(f"  total versions: {resp.get('total_versions')}")
+    print(f"  kept (active worker tag):  {kept.get('active_worker_tag', 0)}")
+    print(f"  kept (protected tag):      {kept.get('protected_tag', 0)}")
+    print(f"  kept (too recent):         {kept.get('too_recent', 0)}")
+    if args.dry_run:
+        eligible = resp.get("eligible", [])
+        print(f"  eligible for removal:      {len(eligible)}")
+        for v in eligible[:5]:
+            tags = ",".join(v.get("tags", [])) or "<untagged>"
+            print(f"    {v['id']} {v['digest']} {tags} ({v['updated']})")
+        if len(eligible) > 5:
+            print(f"    ... and {len(eligible) - 5} more")
+        print(f"  (re-run without --dry-run to delete)")
+    else:
+        removed = resp.get("removed", [])
+        errors = resp.get("errors", [])
+        print(f"  removed:                   {len(removed)}")
+        if errors:
+            print(f"  errors:                    {len(errors)}")
+            for e in errors[:3]:
+                print(f"    {e['id']}: {e['error'][:80]}")
+    return 0
+
+
 def tail_task(args: argparse.Namespace, task_id: str, poll_seconds: float = 2.0) -> int:
     last_status = None
     with _client(args) as c:
@@ -206,6 +239,10 @@ def main() -> int:
     pool_scale = pool_sub.add_parser("scale", help="resize the pool to N workers")
     pool_scale.add_argument("size", type=int, help="target pool size (>=0, <=16)")
     pool_scale.set_defaults(func=cmd_pool_scale)
+    pool_gc = pool_sub.add_parser("gc", help="garbage-collect stale GHCR image versions")
+    pool_gc.add_argument("--dry-run", action="store_true", help="report what would be removed, but don't delete")
+    pool_gc.add_argument("--older-than-hours", type=float, default=1.0, help="only remove versions older than N hours (default 1.0)")
+    pool_gc.set_defaults(func=cmd_pool_gc)
 
     args = parser.parse_args()
     return args.func(args)
