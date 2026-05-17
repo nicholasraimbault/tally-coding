@@ -451,6 +451,48 @@ def main() -> int:
         print(f"[worker] received wake_id={wake_id[:8]} context={context_id}", flush=True)
 
         payload = b64url_decode(wake["payload"])
+        # Sprint 19: task wakes get acked *before* the work runs, so the
+        # orchestrator's dispatch_wake returns within seconds (not minutes)
+        # and the dispatch lock can release immediately. The actual result
+        # flows back to the orchestrator via the persistent task:event
+        # `kind=result` channel that Sprint 18 introduced — no more
+        # dual delivery, just the event path.
+        if context_id == TASK_CONTEXT_ID:
+            if not session.bootstrapped:
+                print("[worker] task wake received before MLS bootstrap; rejecting", flush=True)
+                err = json.dumps({"ack": False, "error": "session not bootstrapped"}).encode()
+                client.complete_wake(team_id, wake_id, b64url_no_pad(err), bearer=bearer)
+                continue
+            # Ack the wake first (the orchestrator only cares that we're
+            # going to start working). Encrypt the ack against the MLS
+            # session so wire-level intermediaries can't tell whether it's
+            # a successful start or a rejection.
+            try:
+                ack_bytes = session.encrypt(json.dumps({"ack": True}).encode("utf-8"))
+                client.complete_wake(team_id, wake_id, b64url_no_pad(ack_bytes), bearer=bearer)
+                print(f"[worker] acked task wake_id={wake_id[:8]}; starting work", flush=True)
+            except Exception as exc:
+                print(f"[worker] failed to ack task wake: {exc}", flush=True)
+                continue
+            # Run the task synchronously. The result will be pushed onto
+            # the event_queue inside handle_task_wake's finally block and
+            # the emitter thread dispatches it as a task:event with
+            # kind=result. We discard handle_task_wake's returned bytes
+            # because the wake's already acked.
+            try:
+                handle_task_wake(
+                    session=session,
+                    client=client,
+                    team_id=team_id,
+                    bearer=bearer,
+                    payload=payload,
+                    workspace_root=workspace,
+                    wake_id=wake_id,
+                )
+            except Exception as exc:
+                print(f"[worker] task work raised after ack: {exc}", flush=True)
+            continue
+
         try:
             if context_id == BOOTSTRAP_CONTEXT_ID:
                 response_bytes, bootstrapped_now = handle_bootstrap_wake(session, payload)
@@ -460,18 +502,6 @@ def main() -> int:
                         client.register(team_id, bearer, bearer=bearer, context_id=ctx)
                     task_handler_registered = True
                     print("[worker] registered task + fs handlers post-bootstrap", flush=True)
-            elif context_id == TASK_CONTEXT_ID:
-                if not session.bootstrapped:
-                    raise RuntimeError("task wake received before MLS bootstrap")
-                response_bytes = handle_task_wake(
-                    session=session,
-                    client=client,
-                    team_id=team_id,
-                    bearer=bearer,
-                    payload=payload,
-                    workspace_root=workspace,
-                    wake_id=wake_id,
-                )
             elif context_id == FS_LIST_CONTEXT_ID:
                 response_bytes = handle_fs_list_wake(session, payload, workspace)
             elif context_id == FS_READ_CONTEXT_ID:

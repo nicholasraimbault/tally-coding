@@ -225,20 +225,29 @@ class Db:
         )
         return (cursor.rowcount or 0) > 0
 
-    def sweep_recovering(self, older_than_seconds: float, error: str) -> int:
+    def sweep_recovering(self, older_than_seconds: float, error: str) -> list[str]:
         """Demote any `recovering` row older than `older_than_seconds`
-        to `failed` with the given error message. Returns the count.
+        to `failed` with the given error message. Returns the list of
+        demoted task_ids so the orchestrator can clear in_flight_task
+        markers on affected handles (Sprint 19).
 
         Called periodically by `Orchestrator.run_recovery_sweeper`. The
         threshold guards against demoting a task whose result event is
         in flight; a typical OpenHands task is ~30s so 5min is plenty."""
         cutoff = time.time() - older_than_seconds
-        cursor = self._conn.execute(
-            "UPDATE tasks SET status='failed', error=?, updated_at=? "
-            "WHERE status='recovering' AND updated_at < ?",
-            (error, time.time(), cutoff),
-        )
-        return cursor.rowcount or 0
+        rows = self._conn.execute(
+            "SELECT id FROM tasks WHERE status='recovering' AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        demoted_ids = [r[0] for r in rows]
+        if demoted_ids:
+            placeholders = ",".join(["?"] * len(demoted_ids))
+            self._conn.execute(
+                f"UPDATE tasks SET status='failed', error=?, updated_at=? "
+                f"WHERE id IN ({placeholders})",
+                [error, time.time(), *demoted_ids],
+            )
+        return demoted_ids
 
     def insert_event(self, task_id: str, seq: int, event: dict) -> None:
         """Insert a streaming event from the worker. Idempotent on (task_id, seq)."""
@@ -365,10 +374,19 @@ from dataclasses import dataclass, field
 
 @dataclass
 class WorkerHandle:
-    """One worker's view in the orchestrator: identity, MLS session, lock.
-    The lock is held while a task is being dispatched against this worker —
-    the MLS sender ratchet is single-writer, so concurrent encrypts would
-    corrupt state. Concurrency comes from having N WorkerHandles."""
+    """One worker's view in the orchestrator: identity, MLS session, lock,
+    and an in-flight task marker.
+
+    `lock` is held while a task is being *dispatched* (encrypt + wake +
+    decrypt the ack) — the MLS sender ratchet is single-writer, so two
+    concurrent encrypts on the same session corrupt state. Sprint 19
+    made the dispatch *fire-and-forget* (Sprint 18's persisted result
+    event becomes the only completion channel) so the lock is released
+    seconds after dispatch, not minutes.
+
+    `in_flight_task` tracks whether the worker is busy running a task
+    *between dispatch and result-event arrival*. The lock can be free
+    while the worker is still working — `acquire_idle` checks both."""
     identity: str
     team_id: str
     cvm_id: str
@@ -376,6 +394,7 @@ class WorkerHandle:
     session: MlsSession
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     failures: int = 0  # consecutive task failures on this handle
+    in_flight_task: str | None = None  # task_id currently running on this worker
 
 
 class Orchestrator:
@@ -500,17 +519,26 @@ class Orchestrator:
         return b64url_decode(result["response"])
 
     async def acquire_idle(self, timeout: float = 60.0) -> WorkerHandle:
-        """Wait up to `timeout` for any handle to be unlocked, then acquire it.
-        Picks the first idle handle in dict-insertion order (no priority)."""
+        """Wait up to `timeout` for a handle that is both unlocked AND has
+        no in-flight task (Sprint 19). The lock guards MLS sender-ratchet
+        state during a dispatch; `in_flight_task` guards worker busyness
+        across the gap between dispatch-ack and result-event arrival.
+        Picks the first matching handle in dict-insertion order."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for handle in list(self.handles.values()):
-                if not handle.lock.locked():
-                    try:
-                        await asyncio.wait_for(handle.lock.acquire(), timeout=0.01)
-                        return handle
-                    except asyncio.TimeoutError:
-                        continue
+                if handle.lock.locked() or handle.in_flight_task is not None:
+                    continue
+                try:
+                    await asyncio.wait_for(handle.lock.acquire(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    continue
+                # Re-check under the lock — another task may have grabbed
+                # in_flight_task between our check and acquire.
+                if handle.in_flight_task is not None:
+                    handle.lock.release()
+                    continue
+                return handle
             await asyncio.sleep(0.5)
         raise TimeoutError(f"no idle worker available within {timeout}s")
 
@@ -521,10 +549,17 @@ class Orchestrator:
         await self.event_bus.publish(task_id, {"_kind": "status_change", **payload})
 
     async def process_task(self, task: dict) -> None:
-        """Acquire an idle handle, encrypt+dispatch the task via that handle's
-        MLS session, persist result, release. Failures bump the handle's
-        failure counter; consecutive failures across the threshold trigger a
-        per-handle rotation (other handles keep serving traffic)."""
+        """Sprint 19: fire-and-forget dispatch. We hold handle.lock just
+        long enough to encrypt the task + send the wake + decrypt the
+        worker's ack, then release. The actual task result flows back
+        asynchronously via the persistent `kind=result` event channel
+        (Sprint 18) — the event poller handles `mark_recovered` and
+        clears `handle.in_flight_task`.
+
+        Handle.in_flight_task tracks worker busyness across the gap
+        between dispatch-ack and result-event arrival. acquire_idle
+        respects it so we don't pile up multiple tasks on a worker
+        that's still chewing through its current one."""
         try:
             handle = await self.acquire_idle(timeout=int(os.environ.get("TALLY_ACQUIRE_TIMEOUT", "120")))
         except TimeoutError as exc:
@@ -533,10 +568,11 @@ class Orchestrator:
             await self._publish_status(task["id"], "failed", {"error": str(exc)})
             return
         try:
+            handle.in_flight_task = task["id"]
             self.db.set_task_worker(task["id"], handle.identity)
             self.db.mark_running(task["id"])
             await self._publish_status(task["id"], "running")
-            logger.info("running task %s on worker %s: %s",
+            logger.info("dispatching task %s to worker %s: %s",
                         task["id"][:8], handle.identity[:8], task["description"][:60])
             try:
                 payload_obj = {
@@ -545,23 +581,29 @@ class Orchestrator:
                     "orchestrator_bearer": self.bearer,
                 }
                 ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
-                response_bytes = await asyncio.to_thread(
+                # Short ack timeout (30s default) — the worker is expected
+                # to call complete_wake with `{ack: true}` within seconds
+                # of receiving the wake. Anything longer indicates the
+                # worker is unhealthy and this dispatch should fail.
+                ack_bytes = await asyncio.to_thread(
                     self._dispatch_blocking, handle,
                     context_id=TASK_CONTEXT_ID,
                     payload=ciphertext,
-                    timeout_seconds=int(os.environ.get("TALLY_TASK_DISPATCH_TIMEOUT", "300")),
+                    timeout_seconds=int(os.environ.get("TALLY_TASK_ACK_TIMEOUT", "30")),
                 )
-                response_plain = handle.session.decrypt(response_bytes).decode("utf-8")
-                result = json.loads(response_plain)
-                self.db.mark_completed(task["id"], result)
-                await self._publish_status(task["id"], "completed", {"success": result.get("success")})
-                logger.info("task %s completed on worker %s: success=%s",
-                            task["id"][:8], handle.identity[:8], result.get("success"))
-                handle.failures = 0
+                ack_plain = handle.session.decrypt(ack_bytes).decode("utf-8")
+                ack = json.loads(ack_plain)
+                if not ack.get("ack"):
+                    raise RuntimeError(f"worker rejected task: {ack.get('error', 'unknown')}")
+                handle.failures = 0  # successful dispatch
+                logger.info("task %s acked by worker %s; awaiting result event",
+                            task["id"][:8], handle.identity[:8])
             except Exception as exc:
-                logger.exception("task %s on worker %s failed", task["id"][:8], handle.identity[:8])
+                logger.exception("task %s dispatch on worker %s failed",
+                                 task["id"][:8], handle.identity[:8])
                 self.db.mark_failed(task["id"], str(exc))
                 await self._publish_status(task["id"], "failed", {"error": str(exc)})
+                handle.in_flight_task = None  # result will never arrive; free the handle
                 handle.failures += 1
                 if handle.failures >= self._auto_rotate_threshold and handle.identity not in self._rotating:
                     logger.warning("auto-rotating worker %s after %d failures",
@@ -736,22 +778,45 @@ class Orchestrator:
             self._inflight_task_ids.discard(task["id"])
 
     async def run_recovery_sweeper(self) -> None:
-        """Sprint 18: every 60s, demote any `recovering` row older than
-        `TALLY_RECOVERY_TIMEOUT` (default 300s) to `failed`. Without this,
-        a stuck-task whose worker died too would linger as `recovering`
-        forever and lie to /tasks. The default 300s covers normal task
-        runtimes (~30s) with a 10× safety margin."""
+        """Sprint 18+19: every 60s, demote any `recovering` row older
+        than `TALLY_RECOVERY_TIMEOUT` (default 300s) to `failed`, AND
+        clear the in_flight_task marker on any handle whose currently-
+        tracked task got demoted (Sprint 19's fire-and-forget model
+        leaves the handle marked busy across the result-wait, so a
+        worker that silently stops sending result events would keep
+        its handle permanently busy without this sweep).
+
+        Demoting also bumps the affected handle's failure counter and
+        can trigger auto-rotate — silent task loss is a strong signal
+        the worker is unhealthy."""
         timeout_s = float(os.environ.get("TALLY_RECOVERY_TIMEOUT", "300"))
         while True:
             try:
-                n = self.db.sweep_recovering(
+                demoted = self.db.sweep_recovering(
                     older_than_seconds=timeout_s,
                     error=f"no result event arrived within {int(timeout_s)}s",
                 )
-                if n:
+                if demoted:
                     logger.warning(
-                        "recovery sweeper demoted %d stale recovering task(s) to failed", n
+                        "recovery sweeper demoted %d stale recovering task(s) to failed",
+                        len(demoted),
                     )
+                    for handle in list(self.handles.values()):
+                        if handle.in_flight_task in demoted:
+                            logger.warning(
+                                "sweeper clearing in_flight on worker %s (task %s never returned)",
+                                handle.identity[:8], (handle.in_flight_task or "")[:8],
+                            )
+                            handle.in_flight_task = None
+                            handle.failures += 1
+                            if (handle.failures >= self._auto_rotate_threshold
+                                    and handle.identity not in self._rotating):
+                                logger.warning(
+                                    "auto-rotating worker %s after %d sweep-failures",
+                                    handle.identity[:8], handle.failures,
+                                )
+                                self._rotating.add(handle.identity)
+                                asyncio.create_task(self._rotate_handle(handle))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -800,26 +865,29 @@ class Orchestrator:
                                     inner["task_id"],
                                     {"seq": inner["seq"], "received_at": time.time(), **inner["event"]},
                                 )
-                                # Sprint 18: if this event is the worker's
-                                # final result, transition any matching
-                                # `recovering` row to `completed`. The
-                                # write is idempotent: if the task is
-                                # already in a terminal state, mark_recovered
-                                # returns False and we just ack the wake.
+                                # Sprint 18: kind=result events transition
+                                # the task to `completed`. Sprint 19: this
+                                # is now the *primary* result channel (no
+                                # more synchronous response from
+                                # process_task), so we also clear the
+                                # handle's `in_flight_task` marker so a
+                                # new task can dispatch to the same worker.
                                 event = inner.get("event", {}) or {}
                                 if event.get("kind") == "result":
                                     task_id = inner.get("task_id", "")
                                     result = event.get("result", {})
-                                    recovered = self.db.mark_recovered(task_id, result)
-                                    if recovered:
+                                    completed = self.db.mark_recovered(task_id, result)
+                                    if completed:
                                         logger.info(
-                                            "recovered task %s via result event from worker %s",
-                                            task_id[:8], worker_identity[:8],
+                                            "task %s result event from worker %s: success=%s",
+                                            task_id[:8], worker_identity[:8], result.get("success"),
                                         )
                                         await self._publish_status(
                                             task_id, "completed",
-                                            {"success": result.get("success"), "recovered": True},
+                                            {"success": result.get("success")},
                                         )
+                                    if target.in_flight_task == task_id:
+                                        target.in_flight_task = None
                     except Exception as exc:
                         # MLS decrypt failures are expected after an
                         # orchestrator restart: the worker's session
@@ -1237,7 +1305,8 @@ async def pool_status() -> dict:
             **w,
             "uptime_seconds": now - w["created_at"],
             "present": handle is not None,
-            "busy": handle.lock.locked() if handle else None,
+            "busy": (handle.lock.locked() or handle.in_flight_task is not None) if handle else None,
+            "in_flight_task": handle.in_flight_task if handle else None,
             "failures": handle.failures if handle else None,
         })
     return {"workers": workers, "pool_size": len(orch.handles)}

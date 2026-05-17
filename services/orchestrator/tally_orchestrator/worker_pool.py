@@ -29,17 +29,17 @@ WORKER_DIR = Path(__file__).resolve().parents[3] / "spike" / "day4" / "worker"
 # `v10-<team_id>` tag for each provision so parallel deploys end up with
 # distinct App IDs (Phala derives the App ID from the compose hash, and
 # `image:` is one of the few fields that survives Phala's normalization).
-BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v11"
+BASE_IMAGE = "ghcr.io/nicholasraimbault/tally-spike-day4-worker:v12"
 
 # GHCR package name for the worker image (used by Sprint 17's GC).
 GHCR_OWNER = "nicholasraimbault"
 GHCR_PACKAGE = "tally-spike-day4-worker"
 # Per-deploy tag prefix. GC targets only these — anything without this
-# prefix (e.g. `v11`, `v10`, `v9`, `v1`) is preserved. Sprint 18 bumped
-# the base from v10 → v11 but the per-deploy prefix stays `v10-…` for
-# any leftover Sprint 16/17 tags; new per-deploy builds use `v11-…`.
+# prefix (e.g. `v12`, `v11`, `v10`, `v9`, `v1`) is preserved. Each base
+# bump leaves the prior prefix behind for cleanup of leftover tags.
 DEPLOY_TAG_PREFIX_V10 = "v10-tally-auto-"
-DEPLOY_TAG_PREFIX = "v11-tally-auto-"
+DEPLOY_TAG_PREFIX_V11 = "v11-tally-auto-"
+DEPLOY_TAG_PREFIX = "v12-tally-auto-"
 
 
 def _phala_binary() -> str:
@@ -117,7 +117,7 @@ class WorkerPool:
         in ~1s (only the new manifest + tiny layer).
         """
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", team_id)
-        tag_name = f"v11-{safe}"
+        tag_name = f"v12-{safe}"
         new_ref = f"ghcr.io/nicholasraimbault/tally-spike-day4-worker:{tag_name}"
         # Ensure the base image is locally cached so the FROM in the
         # one-line Dockerfile resolves.
@@ -242,19 +242,21 @@ class WorkerPool:
             summary = {"id": v["id"], "digest": v["name"][:19], "tags": tags, "updated": updated}
             # Tagged version: only auto-deploy tags are GC targets.
             if tags:
+                auto_prefixes = (DEPLOY_TAG_PREFIX, DEPLOY_TAG_PREFIX_V11, DEPLOY_TAG_PREFIX_V10)
                 def _is_auto(t: str) -> bool:
-                    return t.startswith(DEPLOY_TAG_PREFIX) or t.startswith(DEPLOY_TAG_PREFIX_V10)
+                    return any(t.startswith(p) for p in auto_prefixes)
                 has_protected = any(not _is_auto(t) for t in tags)
                 if has_protected:
                     kept_for_protected_tag.append(summary)
                     continue
                 # Map tag → team_id (`v{N}-tally-auto-<team_id>`).
                 # Skip if any tag's team_id is in the active set.
-                team_ids = [
-                    (t[len(DEPLOY_TAG_PREFIX):] if t.startswith(DEPLOY_TAG_PREFIX)
-                     else t[len(DEPLOY_TAG_PREFIX_V10):])
-                    for t in tags if _is_auto(t)
-                ]
+                def _team_id(t: str) -> str:
+                    for p in auto_prefixes:
+                        if t.startswith(p):
+                            return t[len(p):]
+                    return ""
+                team_ids = [_team_id(t) for t in tags if _is_auto(t)]
                 if any(t in keep_team_ids for t in team_ids):
                     kept_for_active.append(summary)
                     continue
