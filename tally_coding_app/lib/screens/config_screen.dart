@@ -76,8 +76,10 @@ class _ConfigScreenState extends State<ConfigScreen> {
             TextField(
               controller: _token,
               decoration: InputDecoration(
-                labelText: 'API token',
-                hintText: 'Paste TALLY_API_TOKEN from the service host',
+                labelText: 'Bearer token',
+                hintText: 'Clerk JWT (eyJ…) or admin TALLY_API_TOKEN',
+                helperText: 'Sprint 32: Clerk JWTs scope per-user; admin token sees everything.',
+                helperMaxLines: 2,
                 border: const OutlineInputBorder(),
                 prefixIcon: const Icon(Icons.vpn_key),
                 suffixIcon: IconButton(

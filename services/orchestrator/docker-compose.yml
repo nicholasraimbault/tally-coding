@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v9
+    image: ghcr.io/nicholasraimbault/tally-orch:v12
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -32,6 +32,9 @@ services:
       # bootstrap accepts both env-pinned workers.
       - TEAM_ID_LOCAL=${TEAM_ID_LOCAL:-}
       - WORKER_IDENTITY_B64_LOCAL=${WORKER_IDENTITY_B64_LOCAL:-}
+      # Sprint 32: Clerk publishable key (pk_test_… or pk_live_…) enables
+      # multi-user mode. Empty = admin-token-only (pre-Sprint-32 behaviour).
+      - CLERK_PUBLISHABLE_KEY=${CLERK_PUBLISHABLE_KEY:-}
     volumes:
       - data:/data
 

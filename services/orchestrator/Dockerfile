@@ -64,7 +64,8 @@ RUN pip install --no-cache-dir \
     "httpx>=0.27.0" \
     "sse-starlette>=2.1.0" \
     "cryptography>=42.0" \
-    "python-dotenv>=1.0.0"
+    "python-dotenv>=1.0.0" \
+    "pyjwt[crypto]>=2.10.0"
 
 # Install the skytale-sdk wheel from stage 1.
 COPY --from=skytale-builder /wheels/skytale_sdk-*.whl /tmp/wheels/

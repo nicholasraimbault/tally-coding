@@ -46,6 +46,12 @@ from tally_coding_core.mls import MlsSession
 from tally_coding_core.tally_workers import TallyWorkersClient
 
 from .architect import architect_team
+from .clerk_auth import (
+    ClerkValidator,
+    User as ClerkUser,
+    looks_like_jwt as clerk_looks_like_jwt,
+)
+import jwt
 from .worker_pool import WorkerPool
 
 logger = logging.getLogger("tally.orchestrator")
@@ -180,6 +186,9 @@ class TaskResponse(BaseModel):
     # Sprint 25: Discord-shaped UI needs the architect's team spec to render
     # the members sidebar. Null for legacy single-agent tasks.
     team_spec: dict | None = None
+    # Sprint 32: owner of the task. 'admin' for legacy bearer-token writes,
+    # 'legacy-admin' for pre-Sprint-32 rows, otherwise a Clerk user_id.
+    user_id: str = "legacy-admin"
 
 
 class Db:
@@ -204,6 +213,28 @@ class Db:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN team_spec TEXT")
         except sqlite3.OperationalError:
             pass
+        # Sprint 32: multi-user. Owner of the task (Clerk user_id from
+        # the JWT sub claim, or 'admin' for legacy bearer-token writes).
+        # Existing rows default to 'legacy-admin' so they remain visible
+        # to admin queries but not to any specific Clerk user.
+        try:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN user_id TEXT NOT NULL DEFAULT 'legacy-admin'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute(
+                "ALTER TABLE team_templates ADD COLUMN user_id TEXT NOT NULL DEFAULT 'legacy-admin'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_templates_user ON team_templates(user_id, use_count DESC)"
+        )
         self._seed_agent_roles()
 
     def _seed_agent_roles(self) -> None:
@@ -290,9 +321,15 @@ class Db:
                 (name, desc, model, json.dumps(tools), prompt),
             )
 
-    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity, team_spec"
+    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity, team_spec, user_id"
 
-    def create_task(self, description: str, team_spec: dict | None = None) -> str:
+    def create_task(
+        self,
+        description: str,
+        team_spec: dict | None = None,
+        *,
+        user_id: str = "legacy-admin",
+    ) -> str:
         """Sprint 23: team_spec can be set atomically with task creation so
         the processor loop never sees a `pending` row without its
         team_spec already attached. Without this guard, the architect's
@@ -301,22 +338,37 @@ class Db:
         task_id = uuid.uuid4().hex
         now = time.time()
         self._conn.execute(
-            "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at) "
-            "VALUES (?, ?, 'pending', ?, ?, ?)",
-            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now),
+            "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at, user_id) "
+            "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id),
         )
         return task_id
 
-    def get_task(self, task_id: str) -> dict | None:
-        row = self._conn.execute(
-            f"SELECT {self._TASK_COLS} FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
+    def get_task(self, task_id: str, *, user_id: str | None = None) -> dict | None:
+        """Sprint 32: when user_id is given (non-admin path), the task
+        is only returned if owned by that user. None passes through (admin
+        path or internal callers like the result-event handler)."""
+        if user_id is None:
+            row = self._conn.execute(
+                f"SELECT {self._TASK_COLS} FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                f"SELECT {self._TASK_COLS} FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
         return self._row_to_dict(row) if row else None
 
-    def list_tasks(self, limit: int = 100) -> list[dict]:
-        rows = self._conn.execute(
-            f"SELECT {self._TASK_COLS} FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,),
-        ).fetchall()
+    def list_tasks(self, limit: int = 100, *, user_id: str | None = None) -> list[dict]:
+        if user_id is None:
+            rows = self._conn.execute(
+                f"SELECT {self._TASK_COLS} FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT {self._TASK_COLS} FROM tasks WHERE user_id = ? "
+                f"ORDER BY created_at DESC LIMIT ?", (user_id, limit),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def next_pending(self) -> dict | None:
@@ -520,6 +572,22 @@ class Db:
 
     # ── Sprint 29: saved team templates ─────────────────────────────────────
 
+    _TEMPLATE_COLS = ("name, team_spec, source_task_id, note, created_at, "
+                      "last_used_at, use_count, user_id")
+
+    @staticmethod
+    def _template_row_to_dict(r: tuple) -> dict:
+        return {
+            "name": r[0],
+            "team_spec": json.loads(r[1]),
+            "source_task_id": r[2],
+            "note": r[3],
+            "created_at": r[4],
+            "last_used_at": r[5],
+            "use_count": r[6],
+            "user_id": (r[7] if len(r) > 7 and r[7] else "legacy-admin"),
+        }
+
     def create_template(
         self,
         *,
@@ -527,60 +595,64 @@ class Db:
         team_spec: dict,
         source_task_id: str | None = None,
         note: str | None = None,
+        user_id: str = "legacy-admin",
     ) -> None:
         """Insert a template. Caller handles uniqueness violations
         (sqlite IntegrityError if `name` already exists)."""
         self._conn.execute(
-            "INSERT INTO team_templates (name, team_spec, source_task_id, note, created_at, use_count) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
-            (name, json.dumps(team_spec), source_task_id, note, time.time()),
+            "INSERT INTO team_templates (name, team_spec, source_task_id, note, created_at, use_count, user_id) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (name, json.dumps(team_spec), source_task_id, note, time.time(), user_id),
         )
 
-    def list_templates(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT name, team_spec, source_task_id, note, created_at, last_used_at, use_count "
-            "FROM team_templates ORDER BY use_count DESC, created_at DESC"
-        ).fetchall()
-        return [
-            {
-                "name": r[0],
-                "team_spec": json.loads(r[1]),
-                "source_task_id": r[2],
-                "note": r[3],
-                "created_at": r[4],
-                "last_used_at": r[5],
-                "use_count": r[6],
-            }
-            for r in rows
-        ]
+    def list_templates(self, *, user_id: str | None = None) -> list[dict]:
+        if user_id is None:
+            rows = self._conn.execute(
+                f"SELECT {self._TEMPLATE_COLS} FROM team_templates "
+                "ORDER BY use_count DESC, created_at DESC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT {self._TEMPLATE_COLS} FROM team_templates WHERE user_id = ? "
+                "ORDER BY use_count DESC, created_at DESC", (user_id,),
+            ).fetchall()
+        return [self._template_row_to_dict(r) for r in rows]
 
-    def get_template(self, name: str) -> dict | None:
-        row = self._conn.execute(
-            "SELECT name, team_spec, source_task_id, note, created_at, last_used_at, use_count "
-            "FROM team_templates WHERE name=?", (name,),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "name": row[0],
-            "team_spec": json.loads(row[1]),
-            "source_task_id": row[2],
-            "note": row[3],
-            "created_at": row[4],
-            "last_used_at": row[5],
-            "use_count": row[6],
-        }
+    def get_template(self, name: str, *, user_id: str | None = None) -> dict | None:
+        if user_id is None:
+            row = self._conn.execute(
+                f"SELECT {self._TEMPLATE_COLS} FROM team_templates WHERE name=?", (name,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                f"SELECT {self._TEMPLATE_COLS} FROM team_templates "
+                "WHERE name=? AND user_id=?", (name, user_id),
+            ).fetchone()
+        return self._template_row_to_dict(row) if row else None
 
-    def delete_template(self, name: str) -> bool:
-        cur = self._conn.execute("DELETE FROM team_templates WHERE name=?", (name,))
+    def delete_template(self, name: str, *, user_id: str | None = None) -> bool:
+        if user_id is None:
+            cur = self._conn.execute("DELETE FROM team_templates WHERE name=?", (name,))
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM team_templates WHERE name=? AND user_id=?", (name, user_id),
+            )
         return (cur.rowcount or 0) > 0
 
-    def touch_template(self, name: str) -> None:
-        """Bump last_used_at + use_count. No-op if name isn't a template."""
-        self._conn.execute(
-            "UPDATE team_templates SET last_used_at=?, use_count=use_count+1 WHERE name=?",
-            (time.time(), name),
-        )
+    def touch_template(self, name: str, *, user_id: str | None = None) -> None:
+        """Bump last_used_at + use_count. No-op if name isn't a template
+        (or doesn't belong to the given user_id, when scoped)."""
+        if user_id is None:
+            self._conn.execute(
+                "UPDATE team_templates SET last_used_at=?, use_count=use_count+1 WHERE name=?",
+                (time.time(), name),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE team_templates SET last_used_at=?, use_count=use_count+1 "
+                "WHERE name=? AND user_id=?",
+                (time.time(), name, user_id),
+            )
 
     # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
 
@@ -706,6 +778,10 @@ class Db:
             "updated_at": row[6],
             "worker_identity": row[7] if len(row) > 7 else None,
             "team_spec": json.loads(row[8]) if len(row) > 8 and row[8] else None,
+            # Pre-Sprint-32 rows have NULL user_id (SQLite leaves it NULL
+            # despite the ALTER TABLE … DEFAULT 'legacy-admin' clause when
+            # rows existed at migration time). Normalize on the read path.
+            "user_id": (row[9] if len(row) > 9 and row[9] else "legacy-admin"),
         }
 
 
@@ -1751,12 +1827,51 @@ def _resolve_token(db_dir: Path) -> str:
 async def require_token(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> None:
-    """FastAPI dependency: 401s any request without a valid Bearer token."""
+    """FastAPI dependency: 401s any request without a valid Bearer token.
+
+    Sprint 32 leaves this as the admin-only path; new endpoints prefer
+    `require_user` which accepts EITHER the admin token OR a Clerk JWT.
+    """
     expected: str = state.get("api_token", "")
     presented = creds.credentials if creds and creds.scheme.lower() == "bearer" else ""
     # hmac.compare_digest is constant-time vs short-circuit ==.
     if not expected or not presented or not hmac.compare_digest(expected, presented):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+# ── Sprint 32: per-user auth ──────────────────────────────────────────────────
+
+
+async def require_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> ClerkUser:
+    """Sprint 32 dispatcher: accepts the legacy admin TALLY_API_TOKEN
+    (returns User(id='admin', source='admin')) OR a Clerk JWT (returns
+    User(id=<sub>, source='clerk')). Dispatches by token shape — JWTs
+    always start with `eyJ`, admin tokens are random URL-safe bytes.
+
+    Routes that scope to the calling user filter by `user.id` when
+    `user.source == 'clerk'` and skip the filter for admin.
+    """
+    presented = creds.credentials if creds and creds.scheme.lower() == "bearer" else ""
+    if not presented:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if clerk_looks_like_jwt(presented):
+        validator: ClerkValidator | None = state.get("clerk_validator")
+        if validator is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Clerk not configured on this orchestrator (set CLERK_PUBLISHABLE_KEY)",
+            )
+        try:
+            return validator.validate(presented)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail=f"invalid clerk JWT: {exc}")
+    # Legacy admin token path — constant-time compare against api_token.
+    expected: str = state.get("api_token", "")
+    if not expected or not hmac.compare_digest(expected, presented):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+    return ClerkUser(id="admin", source="admin")
 
 
 async def _resolve_pool(db: Db, pool: WorkerPool, target_size: int) -> list[dict]:
@@ -2016,6 +2131,21 @@ async def lifespan(app: FastAPI):
         logger.warning("REDPILL_API_KEY not set; architect will fall back to Solo Coder")
     state["orchestrator"] = orchestrator
 
+    # Sprint 32: optional Clerk JWT validator. When CLERK_PUBLISHABLE_KEY
+    # is set, /tasks and /templates accept Clerk-issued JWTs alongside
+    # the legacy admin TALLY_API_TOKEN. When unset, only the admin
+    # token works (existing scripts + cron continue to function).
+    clerk_pk = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
+    if clerk_pk:
+        try:
+            state["clerk_validator"] = ClerkValidator(clerk_pk)
+        except Exception as exc:
+            logger.error("Clerk init failed: %s; falling back to admin-token-only", exc)
+            state["clerk_validator"] = None
+    else:
+        state["clerk_validator"] = None
+        logger.info("Clerk not configured (CLERK_PUBLISHABLE_KEY unset); admin-token-only auth")
+
     slots = await _resolve_pool(db, pool, target_pool_size)
     logger.info("bootstrapping pool of %d worker(s) in parallel", len(slots))
     handles = await asyncio.gather(
@@ -2064,8 +2194,11 @@ async def health() -> dict:
     return {"status": "ok", "tasks_in_flight": state["db"].next_pending() is not None}
 
 
-@app.post("/tasks", dependencies=[Depends(require_token)], response_model=TaskResponse)
-async def submit_task(body: TaskSubmit) -> TaskResponse:
+@app.post("/tasks", response_model=TaskResponse)
+async def submit_task(
+    body: TaskSubmit,
+    user: ClerkUser = Depends(require_user),
+) -> TaskResponse:
     db: Db = state["db"]
     orch: Orchestrator = state["orchestrator"]
     # Sprint 22-23: figure out the team BEFORE creating the task row, so
@@ -2085,7 +2218,12 @@ async def submit_task(body: TaskSubmit) -> TaskResponse:
             # model can pick one verbatim (template_used field) or build
             # fresh — we touch the template's use_count + last_used_at
             # below if it picked one.
-            templates = db.list_templates()
+            # Sprint 32: surface only THIS user's saved templates so
+            # one tenant's pytest-team doesn't bleed into another's
+            # team picks. Admin-source callers (legacy bearer) see the
+            # full template pool, matching pre-Sprint-32 behaviour.
+            scope = None if user.source == "admin" else user.id
+            templates = db.list_templates(user_id=scope)
             team_spec = await asyncio.to_thread(
                 architect_team,
                 description=body.description,
@@ -2095,50 +2233,69 @@ async def submit_task(body: TaskSubmit) -> TaskResponse:
                 templates=templates,
             )
             if isinstance(team_spec, dict) and team_spec.get("template_used"):
-                db.touch_template(team_spec["template_used"])
+                db.touch_template(team_spec["template_used"], user_id=scope)
         except Exception as exc:
             logger.exception("architect call raised; falling back to single-agent: %s", exc)
             team_spec = None
     # Atomic insert with team_spec attached — no race window for the
     # processor to pick the task up as single-agent before team_spec
     # lands.
-    task_id = db.create_task(body.description, team_spec=team_spec)
+    task_id = db.create_task(body.description, team_spec=team_spec, user_id=user.id)
     task = db.get_task(task_id)
     return TaskResponse(**task)
 
 
-@app.get("/tasks/{task_id}", dependencies=[Depends(require_token)], response_model=TaskResponse)
-async def get_task(task_id: str) -> TaskResponse:
-    task = state["db"].get_task(task_id)
+@app.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> TaskResponse:
+    scope = None if user.source == "admin" else user.id
+    task = state["db"].get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     return TaskResponse(**task)
 
 
-@app.get("/tasks", dependencies=[Depends(require_token)], response_model=list[TaskResponse])
-async def list_tasks(limit: int = 100) -> list[TaskResponse]:
-    return [TaskResponse(**t) for t in state["db"].list_tasks(limit=limit)]
+@app.get("/tasks", response_model=list[TaskResponse])
+async def list_tasks(
+    limit: int = 100,
+    user: ClerkUser = Depends(require_user),
+) -> list[TaskResponse]:
+    scope = None if user.source == "admin" else user.id
+    return [TaskResponse(**t) for t in state["db"].list_tasks(limit=limit, user_id=scope)]
 
 
-@app.get("/tasks/{task_id}/events", dependencies=[Depends(require_token)])
-async def get_task_events(task_id: str, since_seq: int = -1) -> list[dict]:
+@app.get("/tasks/{task_id}/events")
+async def get_task_events(
+    task_id: str,
+    since_seq: int = -1,
+    user: ClerkUser = Depends(require_user),
+) -> list[dict]:
     """Return events with seq > since_seq, in order. One-shot read (used by
     clients that don't speak SSE). Live clients should use /stream instead."""
-    task = state["db"].get_task(task_id)
+    scope = None if user.source == "admin" else user.id
+    task = state["db"].get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     return state["db"].list_events(task_id, since_seq=since_seq)
 
 
-@app.get("/tasks/{task_id}/stream", dependencies=[Depends(require_token)])
-async def stream_task_events(task_id: str, request: Request, since_seq: int = -1):
+@app.get("/tasks/{task_id}/stream")
+async def stream_task_events(
+    task_id: str,
+    request: Request,
+    since_seq: int = -1,
+    user: ClerkUser = Depends(require_user),
+):
     """Server-Sent Events stream. Emits historical events with seq > since_seq
     first (so reconnects don't lose anything), then live events as they arrive
     via the EventBus. sse_starlette handles client-disconnect detection +
     keep-alive comments."""
     db: Db = state["db"]
     bus: EventBus = state["event_bus"]
-    task = db.get_task(task_id)
+    scope = None if user.source == "admin" else user.id
+    task = db.get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
 
@@ -2182,11 +2339,15 @@ async def stream_task_events(task_id: str, request: Request, since_seq: int = -1
     return EventSourceResponse(event_source())
 
 
-@app.get("/tasks/{task_id}/files", dependencies=[Depends(require_token)])
-async def list_task_files(task_id: str) -> dict:
+@app.get("/tasks/{task_id}/files")
+async def list_task_files(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
     """List files in the worker's per-task workspace. Dispatches a fs:list
     wake to the worker over MLS; returns the decrypted entry list."""
-    task = state["db"].get_task(task_id)
+    scope = None if user.source == "admin" else user.id
+    task = state["db"].get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     orch: Orchestrator = state["orchestrator"]
@@ -2196,11 +2357,16 @@ async def list_task_files(task_id: str) -> dict:
     return resp
 
 
-@app.get("/tasks/{task_id}/files/{path:path}", dependencies=[Depends(require_token)])
-async def read_task_file(task_id: str, path: str) -> dict:
+@app.get("/tasks/{task_id}/files/{path:path}")
+async def read_task_file(
+    task_id: str,
+    path: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
     """Read one file from the worker's per-task workspace. Path is forwarded
     to the worker which validates against path traversal."""
-    task = state["db"].get_task(task_id)
+    scope = None if user.source == "admin" else user.id
+    task = state["db"].get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     orch: Orchestrator = state["orchestrator"]
@@ -2287,8 +2453,11 @@ class TemplateCreate(BaseModel):
     note: str | None = None
 
 
-@app.post("/templates", dependencies=[Depends(require_token)])
-async def create_template(body: TemplateCreate) -> dict:
+@app.post("/templates")
+async def create_template(
+    body: TemplateCreate,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
     """Promote a team to a named template. Two source paths:
       - Sprint 29: pass `source_task_id`; copy that task's team_spec.
       - Sprint 30: pass `team_spec` directly from the visual builder.
@@ -2296,10 +2465,11 @@ async def create_template(body: TemplateCreate) -> dict:
     Exactly one must be supplied; both is 400.
     """
     db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
     if (body.source_task_id is None) == (body.team_spec is None):
         raise HTTPException(400, "pass exactly one of source_task_id or team_spec")
     if body.source_task_id is not None:
-        task = db.get_task(body.source_task_id)
+        task = db.get_task(body.source_task_id, user_id=scope)
         if task is None:
             raise HTTPException(404, f"task {body.source_task_id} not found")
         team_spec = task.get("team_spec")
@@ -2331,32 +2501,38 @@ async def create_template(body: TemplateCreate) -> dict:
             team_spec=team_spec,
             source_task_id=body.source_task_id,
             note=(body.note or None),
+            user_id=user.id,
         )
     except sqlite3.IntegrityError:
         raise HTTPException(409, f"template `{clean_name}` already exists")
     source_label = (body.source_task_id or "builder")[:8]
-    logger.info("template saved: name=%r source=%s agents=%d",
-                clean_name, source_label, len((team_spec.get("agents") or [])))
+    logger.info("template saved: name=%r source=%s agents=%d owner=%s",
+                clean_name, source_label,
+                len((team_spec.get("agents") or [])), user.id)
     return {"name": clean_name, "team_spec": team_spec}
 
 
-@app.get("/templates", dependencies=[Depends(require_token)])
-async def list_templates() -> dict:
-    """List saved templates with usage stats. Sorted by use_count desc."""
-    return {"templates": state["db"].list_templates()}
+@app.get("/templates")
+async def list_templates(user: ClerkUser = Depends(require_user)) -> dict:
+    """List saved templates with usage stats. Sorted by use_count desc.
+    Clerk users see only their own templates; admin sees all."""
+    scope = None if user.source == "admin" else user.id
+    return {"templates": state["db"].list_templates(user_id=scope)}
 
 
-@app.get("/templates/{name}", dependencies=[Depends(require_token)])
-async def get_template(name: str) -> dict:
-    t = state["db"].get_template(name)
+@app.get("/templates/{name}")
+async def get_template(name: str, user: ClerkUser = Depends(require_user)) -> dict:
+    scope = None if user.source == "admin" else user.id
+    t = state["db"].get_template(name, user_id=scope)
     if t is None:
         raise HTTPException(404, f"template `{name}` not found")
     return t
 
 
-@app.delete("/templates/{name}", dependencies=[Depends(require_token)])
-async def delete_template(name: str) -> dict:
-    if not state["db"].delete_template(name):
+@app.delete("/templates/{name}")
+async def delete_template(name: str, user: ClerkUser = Depends(require_user)) -> dict:
+    scope = None if user.source == "admin" else user.id
+    if not state["db"].delete_template(name, user_id=scope):
         raise HTTPException(404, f"template `{name}` not found")
     return {"deleted": name}
 
