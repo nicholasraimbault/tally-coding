@@ -56,8 +56,13 @@ def architect_team(
     redpill_key: str,
     redpill_base: str = "https://api.redpill.ai/v1",
     model: str = ARCHITECT_MODEL,
+    templates: list[dict] | None = None,
 ) -> dict:
     """Ask Tally to build a custom team for this task.
+
+    Sprint 29: `templates` is an optional list of saved teams the user
+    has promoted from previous tasks. The architect can pick one verbatim
+    (setting `template_used`) when it's a clean match, or build fresh.
 
     Returns a dict in the shape `_start_team` consumes. On any failure
     (network, bad JSON, unknown role, empty list), returns the fallback
@@ -70,7 +75,8 @@ def architect_team(
         logger.warning("architect called with empty description; using fallback")
         return dict(FALLBACK_TEAM)
     palette_names = {r["name"] for r in palette}
-    prompt = _build_prompt(description, palette)
+    template_names = {t["name"] for t in (templates or [])}
+    prompt = _build_prompt(description, palette, templates or [])
     try:
         raw = _call_redpill(
             prompt=prompt,
@@ -91,13 +97,23 @@ def architect_team(
         logger.warning("architect returned invalid team_spec; using fallback. raw[:200]=%r",
                        raw[:200] if raw else "")
         return dict(FALLBACK_TEAM)
-    logger.info("architect picked %d agent(s): %s",
-                len(cleaned["agents"]),
-                " → ".join(a["role"] for a in cleaned["agents"]))
+    # Sprint 29: carry forward template_used IFF the model named a real
+    # template AND the team matches that template's shape (cheap sanity
+    # check; the orchestrator validates fully before bumping use_count).
+    template_used = parsed.get("template_used")
+    if isinstance(template_used, str) and template_used in template_names:
+        cleaned["template_used"] = template_used
+        logger.info("architect picked %d agent(s) via template `%s`: %s",
+                    len(cleaned["agents"]), template_used,
+                    " → ".join(a["role"] for a in cleaned["agents"]))
+    else:
+        logger.info("architect picked %d agent(s): %s",
+                    len(cleaned["agents"]),
+                    " → ".join(a["role"] for a in cleaned["agents"]))
     return cleaned
 
 
-def _build_prompt(description: str, palette: list[dict]) -> str:
+def _build_prompt(description: str, palette: list[dict], templates: list[dict]) -> str:
     """Build the architect prompt. Asks for *strict* JSON output —
     `_extract_json` tolerates a leading paragraph of reasoning if the
     model can't help itself, but pulling the JSON out is cheaper when
@@ -106,6 +122,32 @@ def _build_prompt(description: str, palette: list[dict]) -> str:
     for r in palette:
         role_lines.append(f"- **{r['name']}**: {r['description']}")
     roles_block = "\n".join(role_lines)
+    # Sprint 29: surface saved templates. The architect can reuse one
+    # verbatim (set `template_used`) or take inspiration and emit a
+    # fresh team. Limit per-template payload so the prompt doesn't
+    # balloon when the user has dozens of saved teams.
+    templates_block = ""
+    if templates:
+        rows: list[str] = []
+        for t in templates[:12]:  # cap
+            spec = t.get("team_spec") or {}
+            agents = spec.get("agents") or []
+            agent_summary = " → ".join(a.get("role", "?") for a in agents) or "?"
+            note = t.get("note") or ""
+            uses = t.get("use_count", 0)
+            label = f"- **{t['name']}** ({agent_summary}; used {uses}×)"
+            if note:
+                label += f" — {note[:120]}"
+            rows.append(label)
+        templates_block = (
+            "\n\nSaved teams (promoted from prior successful tasks):\n"
+            + "\n".join(rows)
+            + "\n\nIf one of these saved teams is a CLEAN MATCH for the current task,"
+              " reuse it: emit its agents/stages/workflow verbatim AND set"
+              ' `"template_used": "<name>"` in the output. Otherwise build fresh and'
+              " omit `template_used`. Prefer fresh-build when the task shape is novel —"
+              " forced reuse is worse than a tailored team."
+        )
     return f"""You are Tally, the team architect for a privacy-first AI coding platform. You read a coding task and build a custom team of agents from the available palette below. Output JSON ONLY (no prose before or after).
 
 Available agent roles:
@@ -151,7 +193,7 @@ Optional per-agent fields:
   - `"local_if_available"` — prefer local; fall back to TEE if local isn't online. Good default for Tester (runs against the user's real environment).
   - `"any"` (or absent) — let the orchestrator decide.
 
-Output `worker_affinity` only when you have a real reason; defaults are fine for most tasks.
+Output `worker_affinity` only when you have a real reason; defaults are fine for most tasks.{templates_block}
 
 Task: {description}
 

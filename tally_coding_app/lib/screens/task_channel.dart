@@ -165,12 +165,50 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
             glyph: '#',
             name: t?.id.substring(0, 8) ?? widget.taskId.substring(0, 8),
             description: t?.description ?? 'Loading…',
-            trailing: t == null ? null : _StatusBadge(status: t.status),
+            trailing: t == null ? null : _HeaderTrailing(
+              task: t,
+              onSaveTemplate: () => _promptSaveTemplate(t),
+            ),
           ),
           Expanded(child: _body(t)),
         ],
       ),
     );
+  }
+
+  Future<void> _promptSaveTemplate(Task t) async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => const _SaveTemplateDialog(),
+    );
+    if (result == null || !mounted) return;
+    final parts = result.split('\n');
+    final name = parts.first.trim();
+    final note = parts.length > 1 ? parts.sublist(1).join('\n').trim() : null;
+    try {
+      await widget.client.saveTemplate(
+        name: name,
+        sourceTaskId: t.id,
+        note: note?.isEmpty == true ? null : note,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Saved team as `$name`'),
+          backgroundColor: const Color(0xFF57F287),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Save failed: $e'),
+          backgroundColor: const Color(0xFFED4245),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   Widget _body(Task? t) {
@@ -196,9 +234,15 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
           if (t.teamSpec != null) ...[
             _SystemMessage(
               icon: Icons.auto_awesome,
-              text: 'Tally picked '
-                  '${(t.teamSpec!['agents'] as List).length} agent(s): '
-                  '${(t.teamSpec!['workflow'] as String?) ?? "(no workflow)"}',
+              text: () {
+                final agents = (t.teamSpec!['agents'] as List).length;
+                final flow = (t.teamSpec!['workflow'] as String?) ?? '(no workflow)';
+                final template = t.teamSpec!['template_used'] as String?;
+                final base = 'Tally picked $agents agent(s): $flow';
+                return template != null && template.isNotEmpty
+                    ? '$base · via template `$template`'
+                    : base;
+              }(),
               timestamp: t.createdAt,
             ),
             const SizedBox(height: 16),
@@ -743,6 +787,127 @@ class _BlinkingCursorState extends State<_BlinkingCursor> with SingleTickerProvi
         opacity: _ctrl,
         child: Text('▌', style: TextStyle(color: widget.color, fontSize: 11)),
       );
+}
+
+/// Sprint 29: header trailing controls — status badge + "save this team"
+/// bookmark for completed multi-agent tasks.
+class _HeaderTrailing extends StatelessWidget {
+  final Task task;
+  final VoidCallback onSaveTemplate;
+  const _HeaderTrailing({required this.task, required this.onSaveTemplate});
+
+  @override
+  Widget build(BuildContext context) {
+    final canSave = task.isTerminal && task.teamSpec != null;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (canSave)
+          IconButton(
+            tooltip: 'Save this team as a template',
+            icon: const Icon(Icons.bookmark_add_outlined, size: 18,
+                color: Color(0xFF8E9297)),
+            onPressed: onSaveTemplate,
+          ),
+        _StatusBadge(status: task.status),
+      ],
+    );
+  }
+}
+
+class _SaveTemplateDialog extends StatefulWidget {
+  const _SaveTemplateDialog();
+  @override
+  State<_SaveTemplateDialog> createState() => _SaveTemplateDialogState();
+}
+
+class _SaveTemplateDialogState extends State<_SaveTemplateDialog> {
+  final _nameCtrl = TextEditingController();
+  final _noteCtrl = TextEditingController();
+
+  void _save() {
+    final name = _nameCtrl.text.trim();
+    if (name.isEmpty) return;
+    Navigator.of(context).pop('$name\n${_noteCtrl.text}');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: const Color(0xFF2B2D31),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Save this team as a template',
+                style: TextStyle(color: Colors.white, fontSize: 16,
+                    fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                "Tally will reuse this team verbatim when a future task is a "
+                "clean match, otherwise it'll build fresh.",
+                style: TextStyle(color: Color(0xFF8E9297), fontSize: 12, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _nameCtrl,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  labelText: 'Name',
+                  labelStyle: TextStyle(color: Color(0xFF8E9297)),
+                  hintText: 'e.g. fast-pytest, fullstack-fe-be',
+                  hintStyle: TextStyle(color: Color(0xFF4F545C)),
+                  border: OutlineInputBorder(),
+                ),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _noteCtrl,
+                minLines: 1,
+                maxLines: 3,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: const InputDecoration(
+                  labelText: 'Note (optional)',
+                  labelStyle: TextStyle(color: Color(0xFF8E9297)),
+                  hintText: 'When does this team shine?',
+                  hintStyle: TextStyle(color: Color(0xFF4F545C)),
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Cancel',
+                        style: TextStyle(color: Color(0xFF8E9297))),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF7C5CFC),
+                    ),
+                    icon: const Icon(Icons.bookmark_add, size: 16),
+                    label: const Text('Save'),
+                    onPressed: _save,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _StatusBadge extends StatelessWidget {

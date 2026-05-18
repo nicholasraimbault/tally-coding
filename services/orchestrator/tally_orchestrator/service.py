@@ -119,6 +119,21 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS idx_agents_task     ON agents(task_id);
 CREATE INDEX IF NOT EXISTS idx_agents_status   ON agents(status);
 
+-- Sprint 29: saved team templates. A user can promote a successful
+-- task's team_spec to a named template; the architect considers
+-- saved templates when picking a team for future tasks. Emergent
+-- feature per the locked UX memo — not a foundational primitive.
+CREATE TABLE IF NOT EXISTS team_templates (
+    name           TEXT PRIMARY KEY,
+    team_spec      TEXT NOT NULL,        -- JSON {agents, stages, workflow, reasoning}
+    source_task_id TEXT,                  -- which task this was promoted from
+    note           TEXT,                  -- optional user-supplied description
+    created_at     REAL NOT NULL,
+    last_used_at   REAL,
+    use_count      INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (source_task_id) REFERENCES tasks(id)
+);
+
 -- Sprint 26.5 (open-items round): durable artifact map so a mid-task
 -- orchestrator restart can rehydrate the in-memory `_task_artifacts`
 -- and seed the next agent correctly. Without this, an orch restart
@@ -501,6 +516,70 @@ class Db:
         self._conn.execute(
             "INSERT OR IGNORE INTO events (task_id, seq, event_json, received_at) VALUES (?, ?, ?, ?)",
             (task_id, seq, json.dumps(event), time.time()),
+        )
+
+    # ── Sprint 29: saved team templates ─────────────────────────────────────
+
+    def create_template(
+        self,
+        *,
+        name: str,
+        team_spec: dict,
+        source_task_id: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Insert a template. Caller handles uniqueness violations
+        (sqlite IntegrityError if `name` already exists)."""
+        self._conn.execute(
+            "INSERT INTO team_templates (name, team_spec, source_task_id, note, created_at, use_count) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (name, json.dumps(team_spec), source_task_id, note, time.time()),
+        )
+
+    def list_templates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT name, team_spec, source_task_id, note, created_at, last_used_at, use_count "
+            "FROM team_templates ORDER BY use_count DESC, created_at DESC"
+        ).fetchall()
+        return [
+            {
+                "name": r[0],
+                "team_spec": json.loads(r[1]),
+                "source_task_id": r[2],
+                "note": r[3],
+                "created_at": r[4],
+                "last_used_at": r[5],
+                "use_count": r[6],
+            }
+            for r in rows
+        ]
+
+    def get_template(self, name: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT name, team_spec, source_task_id, note, created_at, last_used_at, use_count "
+            "FROM team_templates WHERE name=?", (name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": row[0],
+            "team_spec": json.loads(row[1]),
+            "source_task_id": row[2],
+            "note": row[3],
+            "created_at": row[4],
+            "last_used_at": row[5],
+            "use_count": row[6],
+        }
+
+    def delete_template(self, name: str) -> bool:
+        cur = self._conn.execute("DELETE FROM team_templates WHERE name=?", (name,))
+        return (cur.rowcount or 0) > 0
+
+    def touch_template(self, name: str) -> None:
+        """Bump last_used_at + use_count. No-op if name isn't a template."""
+        self._conn.execute(
+            "UPDATE team_templates SET last_used_at=?, use_count=use_count+1 WHERE name=?",
+            (time.time(), name),
         )
 
     # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
@@ -2002,13 +2081,21 @@ async def submit_task(body: TaskSubmit) -> TaskResponse:
     if team_spec is None and orch.redpill_key:
         try:
             palette = db.list_agent_roles()
+            # Sprint 29: surface saved templates to the architect. The
+            # model can pick one verbatim (template_used field) or build
+            # fresh — we touch the template's use_count + last_used_at
+            # below if it picked one.
+            templates = db.list_templates()
             team_spec = await asyncio.to_thread(
                 architect_team,
                 description=body.description,
                 palette=palette,
                 redpill_key=orch.redpill_key,
                 redpill_base=orch.redpill_base,
+                templates=templates,
             )
+            if isinstance(team_spec, dict) and team_spec.get("template_used"):
+                db.touch_template(team_spec["template_used"])
         except Exception as exc:
             logger.exception("architect call raised; falling back to single-agent: %s", exc)
             team_spec = None
@@ -2185,6 +2272,68 @@ async def get_task_team(task_id: str) -> dict:
         "team_spec": db.get_task_team_spec(task_id),
         "agents": db.list_agents(task_id),
     }
+
+
+# ── Sprint 29: team templates ──────────────────────────────────────────────
+
+
+class TemplateCreate(BaseModel):
+    name: str
+    source_task_id: str
+    note: str | None = None
+
+
+@app.post("/templates", dependencies=[Depends(require_token)])
+async def create_template(body: TemplateCreate) -> dict:
+    """Promote a completed task's team_spec to a named template. Tally
+    will weigh saved templates when picking a team for future tasks."""
+    db: Db = state["db"]
+    task = db.get_task(body.source_task_id)
+    if task is None:
+        raise HTTPException(404, f"task {body.source_task_id} not found")
+    team_spec = task.get("team_spec")
+    if not team_spec:
+        raise HTTPException(400, "task has no team_spec to save")
+    if not body.name or not body.name.strip():
+        raise HTTPException(400, "name is required")
+    # Light input sanitization: 64-char cap, no surrounding whitespace,
+    # no `/` (URL-segment hygiene), no controls.
+    clean_name = body.name.strip()
+    if len(clean_name) > 64 or "/" in clean_name or any(ord(c) < 32 for c in clean_name):
+        raise HTTPException(400, "name must be ≤64 chars and contain no `/` or control chars")
+    try:
+        db.create_template(
+            name=clean_name,
+            team_spec=team_spec,
+            source_task_id=body.source_task_id,
+            note=(body.note or None),
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"template `{clean_name}` already exists")
+    logger.info("template saved: name=%r source_task=%s agents=%d",
+                clean_name, body.source_task_id[:8], len((team_spec.get("agents") or [])))
+    return {"name": clean_name, "team_spec": team_spec}
+
+
+@app.get("/templates", dependencies=[Depends(require_token)])
+async def list_templates() -> dict:
+    """List saved templates with usage stats. Sorted by use_count desc."""
+    return {"templates": state["db"].list_templates()}
+
+
+@app.get("/templates/{name}", dependencies=[Depends(require_token)])
+async def get_template(name: str) -> dict:
+    t = state["db"].get_template(name)
+    if t is None:
+        raise HTTPException(404, f"template `{name}` not found")
+    return t
+
+
+@app.delete("/templates/{name}", dependencies=[Depends(require_token)])
+async def delete_template(name: str) -> dict:
+    if not state["db"].delete_template(name):
+        raise HTTPException(404, f"template `{name}` not found")
+    return {"deleted": name}
 
 
 @app.get("/admin/agent_roles", dependencies=[Depends(require_token)])

@@ -98,6 +98,53 @@ class TallyOrchClient {
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// Sprint 29: promote a completed task's team_spec to a named template.
+  /// Returns the saved template payload on success.
+  Future<Map<String, dynamic>> saveTemplate({
+    required String name,
+    required String sourceTaskId,
+    String? note,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/templates'),
+      headers: {'content-type': 'application/json', ..._authHeaders},
+      body: jsonEncode({
+        'name': name,
+        'source_task_id': sourceTaskId,
+        if (note != null && note.isNotEmpty) 'note': note,
+      }),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode == 409) {
+      throw Exception('template `$name` already exists');
+    }
+    if (resp.statusCode != 200) {
+      throw Exception('save template failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<List<Map<String, dynamic>>> listTemplates() async {
+    final resp = await _http.get(baseUrl.resolve('/templates'), headers: _authHeaders);
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('list templates failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return (body['templates'] as List).cast<Map<String, dynamic>>();
+  }
+
+  Future<void> deleteTemplate(String name) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/templates/$name'),
+      headers: _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('delete template failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
   void _checkAuth(http.Response resp) {
     if (resp.statusCode == 401) {
       throw const UnauthorizedException();
