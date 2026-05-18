@@ -132,30 +132,127 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     setState(() => _selected = TaskSelected(result.id));
   }
 
+  /// Sprint 31: width threshold below which the shell collapses from
+  /// four panes to one. Wide → keep desktop layout; narrow → AppBar +
+  /// drawer (channels) + bottom sheet (members). 1100px lands on a
+  /// natural break — phones / portrait tablets are below, desktops +
+  /// landscape tablets above.
+  static const double _narrowBreakpoint = 1100;
+  /// `--dart-define=TALLY_FORCE_NARROW=true` forces the narrow layout
+  /// regardless of window width — used by Sprint 31's smoke test on a
+  /// machine without an Android emulator + a maximized desktop window.
+  static const bool _forceNarrow =
+      bool.fromEnvironment('TALLY_FORCE_NARROW', defaultValue: false);
+
   @override
   Widget build(BuildContext context) {
+    return LayoutBuilder(builder: (context, constraints) {
+      final isNarrow = _forceNarrow || constraints.maxWidth < _narrowBreakpoint;
+      return isNarrow ? _buildNarrow(context) : _buildWide(context);
+    });
+  }
+
+  Widget _buildWide(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Scaffold(
-      body: Row(
-        children: [
-          _ServerRail(
-            onSignOut: () => resetTallyConfig(context),
-            onOpenBuilder: () => _openBuilder(context),
+      body: SafeArea(
+        child: Row(
+          children: [
+            _ServerRail(
+              onSignOut: () => resetTallyConfig(context),
+              onOpenBuilder: () => _openBuilder(context),
+            ),
+            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+            _ChannelList(
+              tasks: _tasks,
+              selected: _selected,
+              loading: _loading && _tasks.isEmpty,
+              error: _error,
+              onSelect: (sel) => setState(() => _selected = sel),
+              onRetry: _fetch,
+            ),
+            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+            Expanded(child: _mainPane()),
+            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+            _MembersPanel(selected: _selected, tasks: _tasks),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNarrow(BuildContext context) {
+    final channelTitle = switch (_selected) {
+      GeneralSelected() => '#general',
+      TaskSelected(taskId: final id) => '#${id.substring(0, 8)}',
+    };
+    return Scaffold(
+      backgroundColor: const Color(0xFF313338),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1E1F22),
+        foregroundColor: Colors.white,
+        title: Text(channelTitle,
+            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+        actions: [
+          IconButton(
+            tooltip: 'Members / agents',
+            icon: const Icon(Icons.people),
+            onPressed: () => _showMembersSheet(context),
           ),
-          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-          _ChannelList(
-            tasks: _tasks,
-            selected: _selected,
-            loading: _loading && _tasks.isEmpty,
-            error: _error,
-            onSelect: (sel) => setState(() => _selected = sel),
-            onRetry: _fetch,
-          ),
-          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-          Expanded(child: _mainPane()),
-          Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-          _MembersPanel(selected: _selected, tasks: _tasks),
         ],
+      ),
+      drawer: _NarrowDrawer(
+        tasks: _tasks,
+        selected: _selected,
+        loading: _loading && _tasks.isEmpty,
+        error: _error,
+        onSelect: (sel) {
+          setState(() => _selected = sel);
+          Navigator.of(context).pop();
+        },
+        onRetry: _fetch,
+        onOpenBuilder: () {
+          Navigator.of(context).pop();
+          _openBuilder(context);
+        },
+        onSignOut: () => resetTallyConfig(context),
+      ),
+      body: SafeArea(top: false, child: _mainPane()),
+    );
+  }
+
+  void _showMembersSheet(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF2B2D31),
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        minChildSize: 0.3,
+        maxChildSize: 0.9,
+        expand: false,
+        builder: (ctx, scroll) {
+          return Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                width: 32,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF4F545C),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Expanded(
+                child: _MembersPanel(
+                  selected: _selected,
+                  tasks: _tasks,
+                  scrollController: scroll,
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -262,6 +359,9 @@ class _ChannelList extends StatelessWidget {
   final String? error;
   final ValueChanged<ChannelSelection> onSelect;
   final VoidCallback onRetry;
+  /// Sprint 31: when null the list fills its parent (drawer mode);
+  /// when set it pins to that width (desktop left rail = 240).
+  final double? width;
   const _ChannelList({
     required this.tasks,
     required this.selected,
@@ -269,12 +369,13 @@ class _ChannelList extends StatelessWidget {
     required this.error,
     required this.onSelect,
     required this.onRetry,
+    this.width = 240,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 240,
+      width: width,
       color: const Color(0xFF2B2D31),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -448,12 +549,21 @@ class _ChannelTile extends StatelessWidget {
 class _MembersPanel extends StatelessWidget {
   final ChannelSelection selected;
   final List<Task> tasks;
-  const _MembersPanel({required this.selected, required this.tasks});
+  /// Sprint 31: in the modal bottom sheet variant, the inner list
+  /// needs to participate in the DraggableScrollableSheet's scroll.
+  /// When null (desktop right rail), the panel uses its own scrolling.
+  final ScrollController? scrollController;
+  const _MembersPanel({
+    required this.selected,
+    required this.tasks,
+    this.scrollController,
+  });
 
   @override
   Widget build(BuildContext context) {
+    final isSheet = scrollController != null;
     return Container(
-      width: 240,
+      width: isSheet ? null : 240,
       color: const Color(0xFF2B2D31),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -481,6 +591,7 @@ class _MembersPanel extends StatelessWidget {
   Widget _body(BuildContext context) {
     if (selected is GeneralSelected) {
       return ListView(
+        controller: scrollController,
         children: const [
           _MemberTile(
             role: tallyMember,
@@ -503,6 +614,7 @@ class _MembersPanel extends StatelessWidget {
       );
     }
     return ListView.builder(
+      controller: scrollController,
       itemCount: agents.length,
       itemBuilder: (context, i) {
         final a = agents[i];
@@ -656,6 +768,78 @@ class _MemberTile extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Sprint 31: drawer variant of the channel list for narrow layouts.
+/// Wraps `_ChannelList` with a footer of the server-rail actions
+/// (builder + sign-out) so all design-time + admin entry points stay
+/// reachable on a phone.
+class _NarrowDrawer extends StatelessWidget {
+  final List<Task> tasks;
+  final ChannelSelection selected;
+  final bool loading;
+  final String? error;
+  final ValueChanged<ChannelSelection> onSelect;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenBuilder;
+  final VoidCallback onSignOut;
+  const _NarrowDrawer({
+    required this.tasks,
+    required this.selected,
+    required this.loading,
+    required this.error,
+    required this.onSelect,
+    required this.onRetry,
+    required this.onOpenBuilder,
+    required this.onSignOut,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Drawer(
+      backgroundColor: const Color(0xFF2B2D31),
+      child: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: _ChannelList(
+                tasks: tasks,
+                selected: selected,
+                loading: loading,
+                error: error,
+                onSelect: onSelect,
+                onRetry: onRetry,
+                width: null,
+              ),
+            ),
+            Container(height: 1, color: const Color(0xFF1E1F22)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextButton.icon(
+                      icon: const Icon(Icons.settings, size: 16,
+                          color: Color(0xFF99AAB5)),
+                      label: const Text('Team builder',
+                          style: TextStyle(color: Color(0xFFC4C9CE))),
+                      onPressed: onOpenBuilder,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Sign out / reconnect',
+                    icon: const Icon(Icons.logout, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onSignOut,
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );
