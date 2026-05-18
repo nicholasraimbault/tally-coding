@@ -85,11 +85,14 @@ class TallyOrchClient {
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<Task> submitTask(String description) async {
+  Future<Task> submitTask(String description, {Map<String, dynamic>? teamSpec}) async {
     final resp = await _http.post(
       baseUrl.resolve('/tasks'),
       headers: {'content-type': 'application/json', ..._authHeaders},
-      body: jsonEncode({'description': description}),
+      body: jsonEncode({
+        'description': description,
+        if (teamSpec != null) 'team_spec': teamSpec,
+      }),
     );
     _checkAuth(resp);
     if (resp.statusCode != 200) {
@@ -99,18 +102,24 @@ class TallyOrchClient {
   }
 
   /// Sprint 29: promote a completed task's team_spec to a named template.
-  /// Returns the saved template payload on success.
+  /// Sprint 30: alternatively pass a hand-built team_spec straight from
+  /// the visual builder. Exactly one of [sourceTaskId] or [teamSpec]
+  /// must be provided.
   Future<Map<String, dynamic>> saveTemplate({
     required String name,
-    required String sourceTaskId,
+    String? sourceTaskId,
+    Map<String, dynamic>? teamSpec,
     String? note,
   }) async {
+    assert((sourceTaskId == null) ^ (teamSpec == null),
+        'pass exactly one of sourceTaskId or teamSpec');
     final resp = await _http.post(
       baseUrl.resolve('/templates'),
       headers: {'content-type': 'application/json', ..._authHeaders},
       body: jsonEncode({
         'name': name,
-        'source_task_id': sourceTaskId,
+        if (sourceTaskId != null) 'source_task_id': sourceTaskId,
+        if (teamSpec != null) 'team_spec': teamSpec,
         if (note != null && note.isNotEmpty) 'note': note,
       }),
     );
@@ -122,6 +131,24 @@ class TallyOrchClient {
       throw Exception('save template failed: ${resp.statusCode} ${resp.body}');
     }
     return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Sprint 30: agent role palette for the visual team builder. Returns
+  /// the orchestrator's `agent_roles` table — name + description +
+  /// default_model + tools (list) + system_prompt. The builder uses
+  /// `name` for the dropdown and `default_model` to pre-fill new
+  /// agents.
+  Future<List<Map<String, dynamic>>> listAgentRoles() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/admin/agent_roles'),
+      headers: _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('list agent roles failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return (body['roles'] as List).cast<Map<String, dynamic>>();
   }
 
   Future<List<Map<String, dynamic>>> listTemplates() async {

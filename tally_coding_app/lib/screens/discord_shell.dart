@@ -24,6 +24,7 @@ import '../api.dart';
 import '../main.dart';
 import 'general_channel.dart';
 import 'task_channel.dart';
+import 'team_builder.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
 /// the architect chat; otherwise it's a task ID.
@@ -119,13 +120,28 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     setState(() => _selected = TaskSelected(t.id));
   }
 
+  /// Sprint 30: server rail ⚙ → push the team builder. When the builder
+  /// runs a task (returns a Task), jump to that channel.
+  Future<void> _openBuilder(BuildContext context) async {
+    final result = await Navigator.of(context).push<Task>(
+      MaterialPageRoute(builder: (_) => TeamBuilderScreen(client: widget.client)),
+    );
+    if (result == null || !mounted) return;
+    await _fetch();
+    if (!mounted) return;
+    setState(() => _selected = TaskSelected(result.id));
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Scaffold(
       body: Row(
         children: [
-          _ServerRail(onSignOut: () => resetTallyConfig(context)),
+          _ServerRail(
+            onSignOut: () => resetTallyConfig(context),
+            onOpenBuilder: () => _openBuilder(context),
+          ),
           Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
           _ChannelList(
             tasks: _tasks,
@@ -160,10 +176,12 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   }
 }
 
-/// Leftmost narrow rail. One server (this team) + a settings button.
+/// Leftmost narrow rail. One server (this team) + a settings button +
+/// Sprint 30's team builder entry.
 class _ServerRail extends StatelessWidget {
   final VoidCallback onSignOut;
-  const _ServerRail({required this.onSignOut});
+  final VoidCallback onOpenBuilder;
+  const _ServerRail({required this.onSignOut, required this.onOpenBuilder});
 
   @override
   Widget build(BuildContext context) {
@@ -181,6 +199,11 @@ class _ServerRail extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           const Divider(color: Color(0xFF2B2D31), thickness: 2, indent: 16, endIndent: 16),
+          IconButton(
+            tooltip: 'Team builder',
+            icon: const Icon(Icons.settings, color: Color(0xFF99AAB5)),
+            onPressed: onOpenBuilder,
+          ),
           const Spacer(),
           IconButton(
             tooltip: 'Sign out / reconnect',

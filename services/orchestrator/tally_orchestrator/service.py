@@ -2279,21 +2279,45 @@ async def get_task_team(task_id: str) -> dict:
 
 class TemplateCreate(BaseModel):
     name: str
-    source_task_id: str
+    # Sprint 29 path: promote an existing task's team_spec.
+    source_task_id: str | None = None
+    # Sprint 30 path: save a hand-built team_spec straight from the
+    # visual builder — no preceding task required.
+    team_spec: dict | None = None
     note: str | None = None
 
 
 @app.post("/templates", dependencies=[Depends(require_token)])
 async def create_template(body: TemplateCreate) -> dict:
-    """Promote a completed task's team_spec to a named template. Tally
-    will weigh saved templates when picking a team for future tasks."""
+    """Promote a team to a named template. Two source paths:
+      - Sprint 29: pass `source_task_id`; copy that task's team_spec.
+      - Sprint 30: pass `team_spec` directly from the visual builder.
+
+    Exactly one must be supplied; both is 400.
+    """
     db: Db = state["db"]
-    task = db.get_task(body.source_task_id)
-    if task is None:
-        raise HTTPException(404, f"task {body.source_task_id} not found")
-    team_spec = task.get("team_spec")
-    if not team_spec:
-        raise HTTPException(400, "task has no team_spec to save")
+    if (body.source_task_id is None) == (body.team_spec is None):
+        raise HTTPException(400, "pass exactly one of source_task_id or team_spec")
+    if body.source_task_id is not None:
+        task = db.get_task(body.source_task_id)
+        if task is None:
+            raise HTTPException(404, f"task {body.source_task_id} not found")
+        team_spec = task.get("team_spec")
+        if not team_spec:
+            raise HTTPException(400, "task has no team_spec to save")
+    else:
+        team_spec = body.team_spec
+        # Light shape check — agents must be a non-empty list of dicts
+        # with `role` set. The architect's validator does deeper
+        # checks, but at this point we just need a sane on-disk shape.
+        if not isinstance(team_spec, dict):
+            raise HTTPException(400, "team_spec must be an object")
+        agents = team_spec.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise HTTPException(400, "team_spec.agents must be a non-empty list")
+        for a in agents:
+            if not isinstance(a, dict) or not isinstance(a.get("role"), str):
+                raise HTTPException(400, "each agent needs a `role` string")
     if not body.name or not body.name.strip():
         raise HTTPException(400, "name is required")
     # Light input sanitization: 64-char cap, no surrounding whitespace,
@@ -2310,8 +2334,9 @@ async def create_template(body: TemplateCreate) -> dict:
         )
     except sqlite3.IntegrityError:
         raise HTTPException(409, f"template `{clean_name}` already exists")
-    logger.info("template saved: name=%r source_task=%s agents=%d",
-                clean_name, body.source_task_id[:8], len((team_spec.get("agents") or [])))
+    source_label = (body.source_task_id or "builder")[:8]
+    logger.info("template saved: name=%r source=%s agents=%d",
+                clean_name, source_label, len((team_spec.get("agents") or [])))
     return {"name": clean_name, "team_spec": team_spec}
 
 
