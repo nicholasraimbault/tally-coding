@@ -199,6 +199,71 @@ class TallyOrchClient {
     }
   }
 
+  /// Sprint 34: rename / edit / replace a template in place.  All
+  /// fields optional; pass only what changes.  409 on name collision.
+  Future<Map<String, dynamic>> patchTemplate(
+    String name, {
+    String? newName,
+    Map<String, dynamic>? teamSpec,
+    String? note,
+  }) async {
+    final body = <String, dynamic>{};
+    if (newName != null) body['new_name'] = newName;
+    if (teamSpec != null) body['team_spec'] = teamSpec;
+    if (note != null) body['note'] = note;
+    final resp = await _http.patch(
+      baseUrl.resolve('/templates/$name'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode == 409) {
+      throw Exception('a template named `$newName` already exists');
+    }
+    if (resp.statusCode != 200) {
+      throw Exception('patch template failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Sprint 34: mint or return the existing share token for a template.
+  /// The returned URL is anonymous-readable; rotate via [revokeShareToken].
+  Future<String> shareTemplate(String name) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/templates/$name/share'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('share template failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return baseUrl.resolve(body['share_path'] as String).toString();
+  }
+
+  Future<void> revokeShareToken(String name) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/templates/$name/share'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200 && resp.statusCode != 404) {
+      throw Exception('revoke share failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
+  /// Sprint 35: poll /health to learn whether the worker pool is ready.
+  /// Returns a flat snapshot: pool_ready, pool_target, pool_joined,
+  /// pool_last_error.  Doesn't require auth (the orchestrator's /health
+  /// is public).
+  Future<Map<String, dynamic>> health() async {
+    final resp = await _http.get(baseUrl.resolve('/health'));
+    if (resp.statusCode != 200) {
+      throw Exception('health failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   void _checkAuth(http.Response resp) {
     if (resp.statusCode == 401) {
       throw const UnauthorizedException();

@@ -275,11 +275,23 @@ class Db:
             )
         except sqlite3.OperationalError:
             pass
+        # Sprint 34: share-with-link.  Opaque token granting read-only
+        # access to the team_spec without an account.  Nullable until
+        # the owner explicitly generates one; unique when set so a
+        # leaked token can be rotated.
+        try:
+            self._conn.execute("ALTER TABLE team_templates ADD COLUMN share_token TEXT")
+        except sqlite3.OperationalError:
+            pass
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC)"
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_templates_user ON team_templates(user_id, use_count DESC)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_share_token "
+            "ON team_templates(share_token) WHERE share_token IS NOT NULL"
         )
         self._seed_agent_roles()
 
@@ -619,7 +631,7 @@ class Db:
     # ── Sprint 29: saved team templates ─────────────────────────────────────
 
     _TEMPLATE_COLS = ("name, team_spec, source_task_id, note, created_at, "
-                      "last_used_at, use_count, user_id")
+                      "last_used_at, use_count, user_id, share_token")
 
     @staticmethod
     def _template_row_to_dict(r: tuple) -> dict:
@@ -632,6 +644,10 @@ class Db:
             "last_used_at": r[5],
             "use_count": r[6],
             "user_id": (r[7] if len(r) > 7 and r[7] else "legacy-admin"),
+            # Sprint 34: opaque share token (nullable).  Owners can
+            # generate one to share a read-only link with teammates;
+            # leaked tokens can be rotated via DELETE /templates/{name}/share.
+            "share_token": (r[8] if len(r) > 8 else None),
         }
 
     def create_template(
@@ -699,6 +715,115 @@ class Db:
                 "WHERE name=? AND user_id=?",
                 (time.time(), name, user_id),
             )
+
+    # ── Sprint 34: update + share-with-link ────────────────────────────────
+
+    def update_template(
+        self,
+        name: str,
+        *,
+        user_id: str | None = None,
+        new_name: str | None = None,
+        team_spec: dict | None = None,
+        note: str | None = None,
+    ) -> dict | None:
+        """Patch a template in place.  Any of ``new_name``, ``team_spec``,
+        ``note`` may be omitted to leave that column alone.
+
+        Returns the updated row as a dict on success, ``None`` when the
+        template doesn't exist (or doesn't belong to ``user_id`` when
+        scoped).  Raises ``sqlite3.IntegrityError`` if ``new_name``
+        collides with another template — caller maps to 409.
+        """
+        updates: list[str] = []
+        params: list = []
+        if new_name is not None:
+            updates.append("name = ?")
+            params.append(new_name)
+        if team_spec is not None:
+            updates.append("team_spec = ?")
+            params.append(json.dumps(team_spec))
+        if note is not None:
+            updates.append("note = ?")
+            # Treat empty string as "clear the note" — consistent with
+            # the create endpoint's `(body.note or None)` collapse.
+            params.append(note or None)
+        if not updates:
+            # No-op patch returns the row unchanged.
+            return self.get_template(name, user_id=user_id)
+        # WHERE clause: scope to user_id when given.
+        where = "name = ?"
+        params.append(name)
+        if user_id is not None:
+            where += " AND user_id = ?"
+            params.append(user_id)
+        cur = self._conn.execute(
+            f"UPDATE team_templates SET {', '.join(updates)} WHERE {where}",
+            params,
+        )
+        if (cur.rowcount or 0) == 0:
+            return None
+        final_name = new_name or name
+        return self.get_template(final_name, user_id=user_id)
+
+    def ensure_share_token(
+        self, name: str, *, user_id: str | None = None
+    ) -> str | None:
+        """Return the existing share_token for the template, or generate +
+        store a new one if it has none yet.  ``None`` when the template
+        doesn't exist (or isn't owned by ``user_id``).
+
+        Token shape: 32 base64url chars (~192 bits).  Stored as-is; the
+        only auth check is `share_token = ?` against the indexed column,
+        so the token IS the credential.  Leaks are mitigated by
+        ``delete_share_token`` which rotates.
+        """
+        existing = self.get_template(name, user_id=user_id)
+        if existing is None:
+            return None
+        if existing.get("share_token"):
+            return existing["share_token"]
+        # Cryptographically random token; 24 bytes → 32 base64url chars.
+        import secrets
+        token = secrets.token_urlsafe(24)
+        cur = self._conn.execute(
+            "UPDATE team_templates SET share_token = ? WHERE name = ? "
+            + ("AND user_id = ?" if user_id is not None else ""),
+            ((token, name, user_id) if user_id is not None else (token, name)),
+        )
+        if (cur.rowcount or 0) == 0:
+            # Concurrent delete between get_template and UPDATE — bail.
+            return None
+        return token
+
+    def delete_share_token(self, name: str, *, user_id: str | None = None) -> bool:
+        """Revoke the share token.  Subsequent
+        ``ensure_share_token`` generates a fresh one.  Returns True if a
+        token was cleared, False if there was nothing to clear or the
+        template wasn't found / owned by ``user_id``.
+        """
+        sql = (
+            "UPDATE team_templates SET share_token = NULL "
+            "WHERE name = ? AND share_token IS NOT NULL"
+        )
+        params: tuple = (name,)
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params = (name, user_id)
+        cur = self._conn.execute(sql, params)
+        return (cur.rowcount or 0) > 0
+
+    def get_template_by_share_token(self, token: str) -> dict | None:
+        """Anonymous read by share token.  Used by GET /shared-templates/{token}.
+        Returns ``None`` if the token doesn't match any template (or was
+        revoked)."""
+        if not token:
+            return None
+        row = self._conn.execute(
+            f"SELECT {self._TEMPLATE_COLS} FROM team_templates WHERE share_token = ?",
+            (token,),
+        ).fetchone()
+        return self._template_row_to_dict(row) if row else None
 
     # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
 
@@ -2335,39 +2460,88 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Clerk Billing webhook not configured; /webhooks/clerk will 503")
 
-    slots = await _resolve_pool(db, pool, target_pool_size)
-    logger.info("bootstrapping pool of %d worker(s) in parallel", len(slots))
-    handles = await asyncio.gather(
-        *[_bootstrap_slot(orchestrator, db, pool, w) for w in slots]
-    )
-    ok = [h for h in handles if h is not None]
-    if not ok:
-        raise RuntimeError(
-            f"no workers bootstrapped (target={target_pool_size}); "
-            "systemd will respawn for a fresh attempt"
-        )
-    if len(ok) < target_pool_size:
-        logger.warning("only %d/%d workers bootstrapped; will run degraded",
-                       len(ok), target_pool_size)
-    for h in ok:
-        orchestrator.start_poller(h)
+    # Sprint 35: split the worker-pool bootstrap off the lifespan critical
+    # path so HTTP comes up immediately.  Routes that *need* a worker
+    # (POST /tasks) gate on ``state["pool_ready"]`` and return 503 with
+    # a Retry-After hint until the pool finishes joining MLS.  Routes
+    # that don't need workers (/health, /billing/usage, /webhooks/clerk,
+    # /tasks GETs, /templates) stay available throughout the bootstrap
+    # window.  Previous behaviour blocked the entire HTTP surface for
+    # ~4 minutes of worker-handshake time which made Clerk webhooks
+    # retry unnecessarily and bricked the operator UX during redeploys.
+    state["pool_ready"] = False
+    state["pool_status"] = {
+        "target_size": target_pool_size,
+        "joined": 0,
+        "last_error": None,
+    }
 
-    processor_task = asyncio.create_task(orchestrator.run_processor_loop())
-    state["processor_task"] = processor_task
+    async def _bootstrap_pool_in_background() -> None:
+        try:
+            slots = await _resolve_pool(db, pool, target_pool_size)
+            logger.info(
+                "bootstrapping pool of %d worker(s) in parallel (background)",
+                len(slots),
+            )
+            handles = await asyncio.gather(
+                *[_bootstrap_slot(orchestrator, db, pool, w) for w in slots]
+            )
+            ok = [h for h in handles if h is not None]
+            state["pool_status"]["joined"] = len(ok)
+            if not ok:
+                state["pool_status"]["last_error"] = (
+                    f"no workers bootstrapped (target={target_pool_size})"
+                )
+                logger.error(state["pool_status"]["last_error"]
+                             + "; /tasks will 503 until the next pool attempt")
+                # Don't crash the lifespan — the operator can restart the
+                # worker CVMs without taking the orchestrator down too.
+                return
+            if len(ok) < target_pool_size:
+                logger.warning(
+                    "only %d/%d workers bootstrapped; running degraded",
+                    len(ok), target_pool_size,
+                )
+            for h in ok:
+                orchestrator.start_poller(h)
+            # Processor loop dispatches tasks to workers; only starts now
+            # that handles exist.
+            state["processor_task"] = asyncio.create_task(
+                orchestrator.run_processor_loop()
+            )
+            state["pool_ready"] = True
+            logger.info(
+                "pool ready: %d worker(s) joined; processor loop running",
+                len(orchestrator.handles),
+            )
+        except Exception as exc:
+            state["pool_status"]["last_error"] = repr(exc)
+            logger.exception("pool bootstrap raised: %s", exc)
+
+    # Sweeper + backup don't depend on workers — start them eagerly so
+    # the recovery clock keeps ticking even during a pool outage.
     sweeper_task = asyncio.create_task(orchestrator.run_recovery_sweeper())
     state["sweeper_task"] = sweeper_task
     backup_task = asyncio.create_task(run_nightly_backup())  # Sprint 24.5
     state["backup_task"] = backup_task
+    state["pool_bootstrap_task"] = asyncio.create_task(_bootstrap_pool_in_background())
     logger.info(
-        "ready; pool=%d, processor + recovery sweeper + nightly backup started",
-        len(orchestrator.handles),
+        "HTTP up; sweeper + nightly backup started; pool bootstrap kicked off "
+        "in background (target=%d)",
+        target_pool_size,
     )
     try:
         yield
     finally:
         for team_id in list(orchestrator.pollers.keys()):
             orchestrator.stop_poller(team_id)
-        for t in (processor_task, sweeper_task, backup_task):
+        # Sprint 35: processor_task only exists after pool bootstrap; the
+        # bootstrap task itself might still be in flight if shutdown
+        # arrives during a redeploy window.  Cancel whatever's set.
+        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "backup_task"):
+            t = state.get(key)
+            if t is None:
+                continue
             t.cancel()
             try:
                 await t
@@ -2380,7 +2554,27 @@ app = FastAPI(title="Tally Orchestrator", lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "tasks_in_flight": state["db"].next_pending() is not None}
+    """Sprint 35: surface pool readiness alongside basic liveness so
+    operators + the Flutter shell can render a "workers warming up"
+    banner during cold-start instead of staring at a generic 503.
+
+    Returns:
+      status:           "ok"      — always (we're alive serving HTTP)
+      pool_ready:       bool      — workers joined and processor loop running
+      pool_target:      int       — desired pool size from TALLY_POOL_SIZE
+      pool_joined:      int       — workers that completed MLS bootstrap
+      pool_last_error:  str|None  — last bootstrap failure reason (cleared on success)
+      tasks_in_flight:  bool      — preserved from earlier versions
+    """
+    pool_status = state.get("pool_status") or {}
+    return {
+        "status": "ok",
+        "pool_ready": bool(state.get("pool_ready")),
+        "pool_target": pool_status.get("target_size", 0),
+        "pool_joined": pool_status.get("joined", 0),
+        "pool_last_error": pool_status.get("last_error"),
+        "tasks_in_flight": state["db"].next_pending() is not None,
+    }
 
 
 @app.get("/whoami")
@@ -2401,6 +2595,23 @@ async def submit_task(
     body: TaskSubmit,
     user: ClerkUser = Depends(require_user),
 ) -> TaskResponse:
+    # Sprint 35: gate on pool readiness.  Until the worker pool finishes
+    # joining MLS, dispatching a task has nothing to land on — return
+    # 503 with Retry-After so clients (and the Flutter shell) can show
+    # a "workers warming up" hint and try again automatically.
+    if not state.get("pool_ready"):
+        ps = state.get("pool_status") or {}
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "pool_not_ready",
+                "pool_target": ps.get("target_size", 0),
+                "pool_joined": ps.get("joined", 0),
+                "last_error": ps.get("last_error"),
+                "retry_after_seconds": 5,
+            },
+            headers={"Retry-After": "5"},
+        )
     db: Db = state["db"]
     orch: Orchestrator = state["orchestrator"]
     # Sprint 22-23: figure out the team BEFORE creating the task row, so
@@ -2767,6 +2978,121 @@ async def delete_template(name: str, user: ClerkUser = Depends(require_user)) ->
     if not state["db"].delete_template(name, user_id=scope):
         raise HTTPException(404, f"template `{name}` not found")
     return {"deleted": name}
+
+
+# ── Sprint 34: template edit + share-with-link ────────────────────────────────
+
+
+class TemplatePatch(BaseModel):
+    """Partial update.  Every field is optional; omitted = leave alone."""
+    new_name: str | None = None
+    team_spec: dict | None = None
+    note: str | None = None
+
+
+@app.patch("/templates/{name}")
+async def update_template(
+    name: str,
+    body: TemplatePatch,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Patch an existing template's name / team_spec / note.
+
+    All three fields are optional — pass only what you want changed.
+    Rename collisions return 409.  Owner-scoped (admin sees all)."""
+    db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
+    # Sanitise new_name if provided (same rules as create_template).
+    new_name: str | None = None
+    if body.new_name is not None:
+        clean = body.new_name.strip()
+        if not clean:
+            raise HTTPException(400, "new_name is empty after strip")
+        if len(clean) > 64 or "/" in clean or any(ord(c) < 32 for c in clean):
+            raise HTTPException(
+                400, "new_name must be ≤64 chars and contain no `/` or control chars",
+            )
+        new_name = clean
+    # Light shape check on team_spec when supplied.
+    if body.team_spec is not None:
+        agents = body.team_spec.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise HTTPException(400, "team_spec.agents must be a non-empty list")
+        for a in agents:
+            if not isinstance(a, dict) or not isinstance(a.get("role"), str):
+                raise HTTPException(400, "each agent needs a `role` string")
+    try:
+        updated = db.update_template(
+            name,
+            user_id=scope,
+            new_name=new_name,
+            team_spec=body.team_spec,
+            note=body.note,
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"template `{new_name}` already exists")
+    if updated is None:
+        raise HTTPException(404, f"template `{name}` not found")
+    logger.info("template patched: name=%r new_name=%r owner=%s",
+                name, new_name, user.id)
+    return updated
+
+
+@app.post("/templates/{name}/share")
+async def share_template(
+    name: str, user: ClerkUser = Depends(require_user)
+) -> dict:
+    """Mint (or return the existing) share token for this template.
+
+    The returned ``share_url`` is a public, anonymous-readable link
+    that resolves to a read-only view of the team_spec via
+    ``GET /shared-templates/{token}``.  Idempotent: calling twice
+    returns the same token until ``DELETE /templates/{name}/share``
+    rotates it."""
+    db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
+    token = db.ensure_share_token(name, user_id=scope)
+    if token is None:
+        raise HTTPException(404, f"template `{name}` not found")
+    # The orchestrator doesn't know its public base URL; clients
+    # construct the share URL themselves from the token + their
+    # configured base URL.  We surface the token + a relative path
+    # so the Flutter app can build the canonical URL.
+    return {"name": name, "share_token": token, "share_path": f"/shared-templates/{token}"}
+
+
+@app.delete("/templates/{name}/share")
+async def revoke_share_token(
+    name: str, user: ClerkUser = Depends(require_user)
+) -> dict:
+    """Revoke the current share token.  Returns 404 if there's nothing
+    to revoke (template missing or no token set).  After revocation,
+    ``POST /templates/{name}/share`` mints a fresh one."""
+    db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
+    if not db.delete_share_token(name, user_id=scope):
+        raise HTTPException(404, f"no active share token for `{name}`")
+    return {"name": name, "revoked": True}
+
+
+@app.get("/shared-templates/{token}")
+async def get_shared_template(token: str) -> dict:
+    """Anonymous read-only template view.  No bearer required — the
+    token is the credential.  Returns a stripped view: the user_id
+    and source_task_id are omitted so the link doesn't leak
+    cross-tenant metadata."""
+    db: Db = state["db"]
+    t = db.get_template_by_share_token(token)
+    if t is None:
+        raise HTTPException(404, "shared template not found or token revoked")
+    # Strip per-tenant metadata from the public view.
+    return {
+        "name": t["name"],
+        "team_spec": t["team_spec"],
+        "note": t["note"],
+        "created_at": t["created_at"],
+        "use_count": t["use_count"],
+    }
 
 
 # ── Sprint 33-rest: Clerk Billing + quotas ────────────────────────────────────

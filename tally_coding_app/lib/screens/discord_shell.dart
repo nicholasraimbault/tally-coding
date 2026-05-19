@@ -26,6 +26,7 @@ import 'billing_screen.dart';
 import 'general_channel.dart';
 import 'task_channel.dart';
 import 'team_builder.dart';
+import 'templates_screen.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
 /// the architect chat; otherwise it's a task ID.
@@ -58,7 +59,15 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   bool _loading = true;
   String? _error;
   Timer? _refresh;
+  Timer? _healthRefresh;
   late ChannelSelection _selected;
+  // Sprint 35: pool readiness from /health, polled every 5s while not
+  // ready so the banner disappears within a few seconds of bootstrap
+  // completing without needing the user to touch anything.
+  bool? _poolReady;
+  int _poolTarget = 0;
+  int _poolJoined = 0;
+  String? _poolLastError;
 
   @override
   void initState() {
@@ -67,12 +76,20 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ? TaskSelected(widget.initialTaskId!)
         : const GeneralSelected();
     _fetch();
+    _pollHealth();
     _refresh = Timer.periodic(const Duration(seconds: 4), (_) => _fetch());
+    _healthRefresh = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) {
+        if (_poolReady != true) _pollHealth();
+      },
+    );
   }
 
   @override
   void dispose() {
     _refresh?.cancel();
+    _healthRefresh?.cancel();
     super.dispose();
   }
 
@@ -91,6 +108,22 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         _loading = false;
         _error = e.toString();
       });
+    }
+  }
+
+  Future<void> _pollHealth() async {
+    try {
+      final h = await widget.client.health();
+      if (!mounted) return;
+      setState(() {
+        _poolReady = h['pool_ready'] as bool? ?? true;
+        _poolTarget = (h['pool_target'] as num?)?.toInt() ?? 0;
+        _poolJoined = (h['pool_joined'] as num?)?.toInt() ?? 0;
+        _poolLastError = h['pool_last_error'] as String?;
+      });
+    } catch (_) {
+      // Network error: leave previous state; the banner will surface if
+      // pool was already known-not-ready, otherwise it stays hidden.
     }
   }
 
@@ -145,6 +178,15 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     );
   }
 
+  /// Sprint 34: server rail 📋 → saved templates catalogue.
+  Future<void> _openTemplates(BuildContext context) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => TemplatesScreen(client: widget.client),
+      ),
+    );
+  }
+
   /// Sprint 31: width threshold below which the shell collapses from
   /// four panes to one. Wide → keep desktop layout; narrow → AppBar +
   /// drawer (channels) + bottom sheet (members). 1100px lands on a
@@ -169,26 +211,39 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     final cs = Theme.of(context).colorScheme;
     return Scaffold(
       body: SafeArea(
-        child: Row(
+        child: Column(
           children: [
-            _ServerRail(
-              onSignOut: () => resetTallyConfig(context),
-              onOpenBuilder: () => _openBuilder(context),
-              onOpenBilling: () => _openBilling(context),
+            if (_poolReady == false)
+              _PoolWarmingBanner(
+                target: _poolTarget,
+                joined: _poolJoined,
+                lastError: _poolLastError,
+              ),
+            Expanded(
+              child: Row(
+                children: [
+                  _ServerRail(
+                    onSignOut: () => resetTallyConfig(context),
+                    onOpenBuilder: () => _openBuilder(context),
+                    onOpenBilling: () => _openBilling(context),
+                    onOpenTemplates: () => _openTemplates(context),
+                  ),
+                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+                  _ChannelList(
+                    tasks: _tasks,
+                    selected: _selected,
+                    loading: _loading && _tasks.isEmpty,
+                    error: _error,
+                    onSelect: (sel) => setState(() => _selected = sel),
+                    onRetry: _fetch,
+                  ),
+                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+                  Expanded(child: _mainPane()),
+                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
+                  _MembersPanel(selected: _selected, tasks: _tasks),
+                ],
+              ),
             ),
-            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-            _ChannelList(
-              tasks: _tasks,
-              selected: _selected,
-              loading: _loading && _tasks.isEmpty,
-              error: _error,
-              onSelect: (sel) => setState(() => _selected = sel),
-              onRetry: _fetch,
-            ),
-            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-            Expanded(child: _mainPane()),
-            Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-            _MembersPanel(selected: _selected, tasks: _tasks),
           ],
         ),
       ),
@@ -233,9 +288,26 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           Navigator.of(context).pop();
           _openBilling(context);
         },
+        onOpenTemplates: () {
+          Navigator.of(context).pop();
+          _openTemplates(context);
+        },
         onSignOut: () => resetTallyConfig(context),
       ),
-      body: SafeArea(top: false, child: _mainPane()),
+      body: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            if (_poolReady == false)
+              _PoolWarmingBanner(
+                target: _poolTarget,
+                joined: _poolJoined,
+                lastError: _poolLastError,
+              ),
+            Expanded(child: _mainPane()),
+          ],
+        ),
+      ),
     );
   }
 
@@ -291,16 +363,82 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   }
 }
 
+/// Sprint 35: top-of-shell banner shown while the orchestrator's
+/// worker pool is still bootstrapping (or has failed to bootstrap).
+/// Lets the user see WHY task submission is currently 503'ing without
+/// having to read CVM logs.  Hides itself the moment pool_ready flips
+/// to true (driven by the 5 s /health poll).
+class _PoolWarmingBanner extends StatelessWidget {
+  final int target;
+  final int joined;
+  final String? lastError;
+  const _PoolWarmingBanner({
+    required this.target,
+    required this.joined,
+    required this.lastError,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final hasError = lastError != null;
+    final color = hasError ? const Color(0xFFED4245) : const Color(0xFFFAA61A);
+    final icon = hasError ? Icons.error_outline : Icons.hourglass_top;
+    final headline = hasError
+        ? 'Workers offline — orchestrator is retrying.'
+        : 'Workers warming up ($joined / $target joined)…';
+    return Container(
+      width: double.infinity,
+      color: color.withValues(alpha: 0.18),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  headline,
+                  style: TextStyle(color: color, fontWeight: FontWeight.w600, fontSize: 13),
+                ),
+                if (hasError && lastError != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    lastError!,
+                    style: const TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ] else ...[
+                  const SizedBox(height: 2),
+                  const Text(
+                    "Task submission will fail until at least one worker joins. Reads + billing keep working.",
+                    style: TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Leftmost narrow rail. One server (this team) + a settings button +
-/// Sprint 30's team builder entry + Sprint 33's billing entry.
+/// Sprint 30's team builder entry + Sprint 33's billing entry +
+/// Sprint 34's templates catalogue entry.
 class _ServerRail extends StatelessWidget {
   final VoidCallback onSignOut;
   final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
+  final VoidCallback onOpenTemplates;
   const _ServerRail({
     required this.onSignOut,
     required this.onOpenBuilder,
     required this.onOpenBilling,
+    required this.onOpenTemplates,
   });
 
   @override
@@ -323,6 +461,11 @@ class _ServerRail extends StatelessWidget {
             tooltip: 'Team builder',
             icon: const Icon(Icons.settings, color: Color(0xFF99AAB5)),
             onPressed: onOpenBuilder,
+          ),
+          IconButton(
+            tooltip: 'Saved templates',
+            icon: const Icon(Icons.bookmark_border, color: Color(0xFF99AAB5)),
+            onPressed: onOpenTemplates,
           ),
           IconButton(
             tooltip: 'Billing & usage',
@@ -815,6 +958,7 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onRetry;
   final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
+  final VoidCallback onOpenTemplates;
   final VoidCallback onSignOut;
   const _NarrowDrawer({
     required this.tasks,
@@ -825,6 +969,7 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onRetry,
     required this.onOpenBuilder,
     required this.onOpenBilling,
+    required this.onOpenTemplates,
     required this.onSignOut,
   });
 
@@ -859,6 +1004,12 @@ class _NarrowDrawer extends StatelessWidget {
                           style: TextStyle(color: Color(0xFFC4C9CE))),
                       onPressed: onOpenBuilder,
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'Saved templates',
+                    icon: const Icon(Icons.bookmark_border, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onOpenTemplates,
                   ),
                   IconButton(
                     tooltip: 'Billing & usage',
