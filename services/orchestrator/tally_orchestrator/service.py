@@ -51,6 +51,7 @@ from .clerk_auth import (
     User as ClerkUser,
     looks_like_jwt as clerk_looks_like_jwt,
 )
+from .clerk_backend import ClerkBackendClient
 from .clerk_billing import ClerkBillingClient
 from .credentials import CredentialsManager, fernet_key_help, redact_token
 from .github_push import (
@@ -2797,6 +2798,18 @@ async def lifespan(app: FastAPI):
         logger.info("Credentials manager ready (Fernet master key loaded)")
     else:
         logger.info("CREDENTIALS_KEY not configured; /github/* routes will 503")
+    # Sprint 38.5: Clerk Backend API client.  When CLERK_SECRET_KEY is
+    # set, the push endpoint tries Clerk-mediated GitHub OAuth before
+    # falling back to a stored PAT — users who signed in via "Continue
+    # with GitHub" don't have to paste anything.
+    clerk_backend = ClerkBackendClient()
+    state["clerk_backend"] = clerk_backend
+    if clerk_backend.configured:
+        logger.info("Clerk Backend API client ready (sk_..%s)",
+                    clerk_backend.secret_key[-4:])
+    else:
+        logger.info("CLERK_SECRET_KEY not configured; /projects/{id}/push "
+                    "will only use stored PATs (no Clerk-mediated OAuth)")
     if clerk_billing.webhook_enabled:
         logger.info("Clerk Billing webhook enabled (whsec_...%s)",
                     clerk_billing.webhook_secret[-4:])
@@ -3505,29 +3518,33 @@ async def push_project_to_github(
     user: ClerkUser = Depends(require_user),
 ) -> dict:
     """Push the project's HEAD artifact set to ``owner/repo`` as a
-    new branch.  The PAT is decrypted, used in-memory only, and
-    never logged.
+    new branch.
 
+    Sprint 38.5 — credential source priority:
+
+      1. **Clerk-mediated GitHub OAuth** (preferred): fetched at push
+         time from Clerk's Backend API.  Zero user friction for anyone
+         signed in via "Continue with GitHub".  Requires the Clerk
+         GitHub provider to grant ``repo`` scope.
+      2. **Stored PAT** (fallback): the Fernet-encrypted PAT from
+         Sprint 38.  Used when:
+           - Clerk Backend isn't configured (``CLERK_SECRET_KEY`` unset),
+           - the user has no GitHub OAuth connection, or
+           - the Clerk OAuth token push failed with 401 (insufficient
+             scope) and a PAT IS stored.
+
+    The Flutter UI surfaces both states via ``GET /github/connection-status``.
     Errors map to:
-      - 400: malformed inputs (bad repo, empty branch, etc.)
-      - 401: GitHub rejected the PAT.
-      - 404: project not found / not owned, OR no PAT stored.
+      - 400: malformed inputs (bad repo, empty branch, etc.).
+      - 401: every available credential rejected by GitHub.
+      - 404: project not found / not owned, OR no credentials available.
       - 502: any other git push failure.
     """
-    cm = _require_credentials_configured()
     db: Db = state["db"]
     scope = None if user.source == "admin" else user.id
     project = db.get_project(project_id, user_id=scope)
     if project is None:
         raise HTTPException(404, f"project `{project_id}` not found")
-
-    ciphertext = db.get_credential(user_id=user.id, kind="github_pat")
-    if ciphertext is None:
-        raise HTTPException(
-            404,
-            "no GitHub token stored for this user. "
-            "POST /github/token with your PAT first.",
-        )
 
     # Validate the repo shape early so we don't even decrypt the PAT
     # if the input is garbage.
@@ -3536,50 +3553,138 @@ async def push_project_to_github(
     except GithubPushError as exc:
         raise HTTPException(400, exc.user_facing)
 
-    try:
-        pat = cm.decrypt(ciphertext)
-    except Exception as exc:
-        logger.exception("decrypt failed for user=%s: %s", user.id, exc)
-        raise HTTPException(
-            502,
-            "failed to decrypt stored PAT — has CREDENTIALS_KEY rotated?",
-        )
-
     artifacts = db.load_project_artifacts(project_id)
     if not artifacts:
         raise HTTPException(400, "project has no files in HEAD to push")
 
-    try:
-        result = await asyncio.to_thread(
-            push_project,
-            project_name=project["name"],
-            artifacts=artifacts,
-            repo=repo,
-            branch=body.branch,
-            commit_message=body.commit_message,
-            pat=pat,
-        )
-    except GithubPushAuthError as exc:
-        raise HTTPException(401, exc.user_facing)
-    except GithubPushRepoError as exc:
-        raise HTTPException(404, exc.user_facing)
-    except GithubPushError as exc:
-        logger.warning("push failed for user=%s project=%s: %s", user.id, project_id, exc)
-        raise HTTPException(502, exc.user_facing)
-    finally:
-        # Best-effort scrub — Python ints/strs are immutable so we
-        # can't zeroize, but we drop the reference so the GC can.
-        del pat
+    # Build the credential queue.  Try Clerk-mediated OAuth first;
+    # PAT is the fallback.
+    clerk_backend: ClerkBackendClient = state.get("clerk_backend")  # type: ignore
+    cm: CredentialsManager = state.get("credentials")  # type: ignore
 
-    logger.info(
-        "pushed project=%s for user=%s → %s @ %s (sha=%s)",
-        project_id, user.id, result.repo, result.branch, result.commit_sha[:8],
-    )
+    credentials_to_try: list[tuple[str, str]] = []  # [(source_label, token), ...]
+
+    if user.source != "admin" and clerk_backend is not None and clerk_backend.configured:
+        try:
+            oauth_token, oauth_scopes = await asyncio.to_thread(
+                clerk_backend.fetch_github_token, user.id,
+            )
+            if oauth_token:
+                logger.info(
+                    "push %s: Clerk GitHub OAuth token available for user=%s scopes=%s",
+                    project_id, user.id, oauth_scopes,
+                )
+                credentials_to_try.append(("clerk_oauth", oauth_token))
+        except Exception as exc:
+            logger.warning("Clerk OAuth fetch raised; falling through to PAT: %s", exc)
+
+    if cm is not None and cm.configured:
+        ciphertext = db.get_credential(user_id=user.id, kind="github_pat")
+        if ciphertext is not None:
+            try:
+                pat = cm.decrypt(ciphertext)
+                credentials_to_try.append(("stored_pat", pat))
+            except Exception as exc:
+                logger.exception("decrypt failed for user=%s: %s", user.id, exc)
+
+    if not credentials_to_try:
+        raise HTTPException(
+            404,
+            "no GitHub credentials available for this user. "
+            "Sign in with GitHub (granting `repo` scope), or POST a PAT "
+            "to /github/token.",
+        )
+
+    last_auth_err: str | None = None
+    last_other_err: Exception | None = None
+
+    for source_label, token in credentials_to_try:
+        try:
+            result = await asyncio.to_thread(
+                push_project,
+                project_name=project["name"],
+                artifacts=artifacts,
+                repo=repo,
+                branch=body.branch,
+                commit_message=body.commit_message,
+                pat=token,
+            )
+            logger.info(
+                "pushed project=%s for user=%s via %s → %s @ %s (sha=%s)",
+                project_id, user.id, source_label,
+                result.repo, result.branch, result.commit_sha[:8],
+            )
+            return {
+                "repo": result.repo,
+                "branch": result.branch,
+                "commit_sha": result.commit_sha,
+                "branch_url": result.branch_url,
+                "credential_source": source_label,
+            }
+        except GithubPushAuthError as exc:
+            last_auth_err = exc.user_facing
+            logger.info(
+                "push %s: %s rejected by GitHub; trying next credential",
+                project_id, source_label,
+            )
+            continue
+        except GithubPushRepoError as exc:
+            # Repo-not-found is terminal — won't fix by switching credential.
+            raise HTTPException(404, exc.user_facing)
+        except GithubPushError as exc:
+            last_other_err = exc
+            continue
+
+    # Exhausted all sources without a success.
+    if last_auth_err is not None:
+        raise HTTPException(
+            401,
+            last_auth_err + " (Clerk OAuth token may lack `repo` scope — "
+            "either reconnect GitHub with `repo` scope at sign-in, "
+            "or POST a PAT to /github/token as a fallback.)",
+        )
+    detail = str(last_other_err) if last_other_err else "all credential sources failed"
+    raise HTTPException(502, detail)
+
+
+@app.get("/github/connection-status")
+async def github_connection_status(
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 38.5: surface which credential sources are available to
+    this user, without revealing tokens.  Drives the Flutter "GitHub
+    connected via sign-in / Connect manually" UI.
+
+    Returns:
+      - ``clerk_oauth_available``: True when Clerk Backend is configured
+        AND the user has a GitHub OAuth connection.  We don't try to
+        validate the token's scopes here (would require a GitHub API
+        call); the push endpoint surfaces the real result.
+      - ``pat_stored``: True when a Fernet-encrypted PAT row exists.
+    """
+    db: Db = state["db"]
+    clerk_backend: ClerkBackendClient = state.get("clerk_backend")  # type: ignore
+    cm: CredentialsManager = state.get("credentials")  # type: ignore
+
+    clerk_oauth_available = False
+    oauth_scopes: list[str] = []
+    if user.source != "admin" and clerk_backend is not None and clerk_backend.configured:
+        try:
+            token, oauth_scopes = await asyncio.to_thread(
+                clerk_backend.fetch_github_token, user.id,
+            )
+            clerk_oauth_available = token is not None
+        except Exception as exc:
+            logger.debug("Clerk OAuth status probe failed: %s", exc)
+
+    pat_stored = False
+    if cm is not None and cm.configured:
+        pat_stored = db.has_credential(user_id=user.id, kind="github_pat")
+
     return {
-        "repo": result.repo,
-        "branch": result.branch,
-        "commit_sha": result.commit_sha,
-        "branch_url": result.branch_url,
+        "clerk_oauth_available": clerk_oauth_available,
+        "clerk_oauth_scopes": oauth_scopes,
+        "pat_stored": pat_stored,
     }
 
 

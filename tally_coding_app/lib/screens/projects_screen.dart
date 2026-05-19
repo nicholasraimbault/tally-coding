@@ -28,7 +28,9 @@ class ProjectsScreen extends StatefulWidget {
 class _ProjectsScreenState extends State<ProjectsScreen> {
   Future<List<Map<String, dynamic>>>? _list;
   String? _activeId;
-  bool? _githubConnected;
+  // Sprint 38.5: tri-state — Clerk OAuth auto-connected, manual PAT,
+  // or nothing.  Drives which chip variant we render.
+  _GithubConnection _githubConn = _GithubConnection.unknown;
 
   @override
   void initState() {
@@ -44,23 +46,68 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
 
   Future<void> _refreshGithubStatus() async {
     try {
-      final has = await widget.client.hasGithubToken();
+      final status = await widget.client.githubConnectionStatus();
       if (!mounted) return;
-      setState(() => _githubConnected = has);
+      final clerkOauth = status['clerk_oauth_available'] as bool? ?? false;
+      final patStored = status['pat_stored'] as bool? ?? false;
+      setState(() {
+        if (clerkOauth) {
+          _githubConn = _GithubConnection.clerkOauth;
+        } else if (patStored) {
+          _githubConn = _GithubConnection.pat;
+        } else {
+          _githubConn = _GithubConnection.none;
+        }
+      });
     } catch (_) {
       if (!mounted) return;
-      setState(() => _githubConnected = false);
+      setState(() => _githubConn = _GithubConnection.none);
     }
   }
 
+  bool get _isGithubConnected =>
+      _githubConn == _GithubConnection.clerkOauth ||
+      _githubConn == _GithubConnection.pat;
+
   Future<void> _openGithubDialog() async {
-    if (_githubConnected == true) {
-      // Already connected — offer to disconnect.
+    // Sprint 38.5 — three states:
+    //   clerkOauth: auto-connected via Clerk sign-in (no action needed
+    //               unless they want to add a PAT fallback).
+    //   pat:        manually connected via PAT (offer disconnect).
+    //   none:       not connected (offer PAT paste; explain OAuth path).
+    if (_githubConn == _GithubConnection.clerkOauth) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF2B2D31),
+          title: const Text('GitHub auto-connected', style: TextStyle(color: Colors.white)),
+          content: const Text(
+            "You signed in with GitHub, so Tally pushes directly using "
+            "that connection — no PAT needed. If the push fails because "
+            "your GitHub OAuth grant doesn't include `repo` scope, you "
+            "can add a fallback PAT below.",
+            style: TextStyle(color: Color(0xFFB9BBBE)),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Done')),
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                _openPatDialog();
+              },
+              child: const Text('Add fallback PAT'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    if (_githubConn == _GithubConnection.pat) {
       final disconnect = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
           backgroundColor: const Color(0xFF2B2D31),
-          title: const Text('GitHub connected', style: TextStyle(color: Colors.white)),
+          title: const Text('GitHub connected (PAT)', style: TextStyle(color: Colors.white)),
           content: const Text(
             'Your GitHub PAT is stored encrypted on the orchestrator. '
             'Disconnect to revoke and remove it.',
@@ -80,7 +127,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
         try {
           await widget.client.deleteGithubToken();
           if (!mounted) return;
-          setState(() => _githubConnected = false);
+          await _refreshGithubStatus();
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('GitHub disconnected')),
           );
@@ -91,6 +138,11 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
       }
       return;
     }
+    // none → explain options + offer PAT paste
+    _openPatDialog();
+  }
+
+  Future<void> _openPatDialog() async {
     final pat = await showDialog<String>(
       context: context,
       builder: (ctx) => const _ConnectGithubDialog(),
@@ -99,7 +151,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
     try {
       await widget.client.setGithubToken(pat.trim());
       if (!mounted) return;
-      setState(() => _githubConnected = true);
+      await _refreshGithubStatus();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('GitHub PAT stored (encrypted).')),
       );
@@ -110,7 +162,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
   }
 
   Future<void> _pushToGithub(Map<String, dynamic> p) async {
-    if (_githubConnected != true) {
+    if (!_isGithubConnected) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Connect GitHub first (chip in the top bar).')),
       );
@@ -240,7 +292,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
         foregroundColor: Colors.white,
         title: const Text('Projects'),
         actions: [
-          _GithubChip(connected: _githubConnected, onTap: _openGithubDialog),
+          _GithubChip(connection: _githubConn, onTap: _openGithubDialog),
           IconButton(icon: const Icon(Icons.refresh), onPressed: _refresh),
         ],
       ),
@@ -547,15 +599,37 @@ class _NewProjectDialogState extends State<_NewProjectDialog> {
   }
 }
 
+enum _GithubConnection { unknown, none, clerkOauth, pat }
+
 class _GithubChip extends StatelessWidget {
-  final bool? connected;
+  final _GithubConnection connection;
   final VoidCallback onTap;
-  const _GithubChip({required this.connected, required this.onTap});
+  const _GithubChip({required this.connection, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
-    final isConnected = connected == true;
-    final color = isConnected ? const Color(0xFF57F287) : const Color(0xFF99AAB5);
+    final (color, icon, label) = switch (connection) {
+      _GithubConnection.clerkOauth => (
+        const Color(0xFF57F287),
+        Icons.verified,
+        'GitHub auto-connected',
+      ),
+      _GithubConnection.pat => (
+        const Color(0xFF57F287),
+        Icons.check_circle,
+        'GitHub connected (PAT)',
+      ),
+      _GithubConnection.none => (
+        const Color(0xFF99AAB5),
+        Icons.code,
+        'Connect GitHub',
+      ),
+      _GithubConnection.unknown => (
+        const Color(0xFF52555A),
+        Icons.cloud_outlined,
+        'Checking…',
+      ),
+    };
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
       child: InkWell(
@@ -571,10 +645,10 @@ class _GithubChip extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(isConnected ? Icons.check_circle : Icons.code, color: color, size: 14),
+              Icon(icon, color: color, size: 14),
               const SizedBox(width: 6),
               Text(
-                isConnected ? 'GitHub connected' : 'Connect GitHub',
+                label,
                 style: TextStyle(color: color, fontWeight: FontWeight.w600, fontSize: 12),
               ),
             ],

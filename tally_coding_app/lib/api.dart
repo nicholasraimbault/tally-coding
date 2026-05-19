@@ -230,6 +230,21 @@ class TallyOrchClient {
     return body['has_token'] as bool? ?? false;
   }
 
+  /// Sprint 38.5: which credential sources can push for the caller?
+  /// Returns `{clerk_oauth_available, clerk_oauth_scopes, pat_stored}`.
+  /// Drives the "GitHub auto-connected" UX.
+  Future<Map<String, dynamic>> githubConnectionStatus() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/github/connection-status'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('github connection-status failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   Future<void> setGithubToken(String pat) async {
     final resp = await _http.post(
       baseUrl.resolve('/github/token'),

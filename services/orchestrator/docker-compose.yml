@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v19
+    image: ghcr.io/nicholasraimbault/tally-orch:v20
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -44,6 +44,12 @@ services:
       # `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
       # Optional: empty = /github/* routes 503; everything else works.
       - CREDENTIALS_KEY=${CREDENTIALS_KEY:-}
+      # Sprint 38.5: Clerk Backend API secret key (sk_test_… / sk_live_…).
+      # When set, /projects/{id}/push fetches the user's GitHub OAuth
+      # token directly from Clerk so users who signed in via "Continue
+      # with GitHub" don't need to paste a PAT.  Falls back to the
+      # stored PAT (S38) on failure.  Optional: empty = PAT-only flow.
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY:-}
     volumes:
       - data:/data
 
