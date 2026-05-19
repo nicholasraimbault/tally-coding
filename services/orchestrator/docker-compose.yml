@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v14
+    image: ghcr.io/nicholasraimbault/tally-orch:v15
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -35,13 +35,10 @@ services:
       # Sprint 32: Clerk publishable key (pk_test_… or pk_live_…) enables
       # multi-user mode. Empty = admin-token-only (pre-Sprint-32 behaviour).
       - CLERK_PUBLISHABLE_KEY=${CLERK_PUBLISHABLE_KEY:-}
-      # Sprint 33: Stripe billing. All four optional. Empty = quotas
-      # work but /billing/checkout + /billing/webhook 503; free tier
-      # caps still enforce.
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
-      - STRIPE_PRICE_PRO=${STRIPE_PRICE_PRO:-}
-      - STRIPE_PRICE_TEAM=${STRIPE_PRICE_TEAM:-}
+      # Sprint 33-rest: Clerk Billing webhook signing secret (whsec_… from
+      # the dashboard's Webhooks page). Optional: empty = /webhooks/clerk
+      # 503s but JWT-claim plan sync still works on every request.
+      - CLERK_WEBHOOK_SECRET=${CLERK_WEBHOOK_SECRET:-}
     volumes:
       - data:/data
 

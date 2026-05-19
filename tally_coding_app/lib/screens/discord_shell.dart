@@ -22,6 +22,7 @@ import 'package:flutter/material.dart';
 import '../agent_roles.dart';
 import '../api.dart';
 import '../main.dart';
+import 'billing_screen.dart';
 import 'general_channel.dart';
 import 'task_channel.dart';
 import 'team_builder.dart';
@@ -132,6 +133,18 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     setState(() => _selected = TaskSelected(result.id));
   }
 
+  /// Sprint 33-rest: server rail 💳 → push the billing screen.
+  Future<void> _openBilling(BuildContext context) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => BillingScreen(
+          client: widget.client,
+          publishableKey: clerkPublishableKey,
+        ),
+      ),
+    );
+  }
+
   /// Sprint 31: width threshold below which the shell collapses from
   /// four panes to one. Wide → keep desktop layout; narrow → AppBar +
   /// drawer (channels) + bottom sheet (members). 1100px lands on a
@@ -161,6 +174,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             _ServerRail(
               onSignOut: () => resetTallyConfig(context),
               onOpenBuilder: () => _openBuilder(context),
+              onOpenBilling: () => _openBilling(context),
             ),
             Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
             _ChannelList(
@@ -214,6 +228,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         onOpenBuilder: () {
           Navigator.of(context).pop();
           _openBuilder(context);
+        },
+        onOpenBilling: () {
+          Navigator.of(context).pop();
+          _openBilling(context);
         },
         onSignOut: () => resetTallyConfig(context),
       ),
@@ -274,11 +292,16 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
 }
 
 /// Leftmost narrow rail. One server (this team) + a settings button +
-/// Sprint 30's team builder entry.
+/// Sprint 30's team builder entry + Sprint 33's billing entry.
 class _ServerRail extends StatelessWidget {
   final VoidCallback onSignOut;
   final VoidCallback onOpenBuilder;
-  const _ServerRail({required this.onSignOut, required this.onOpenBuilder});
+  final VoidCallback onOpenBilling;
+  const _ServerRail({
+    required this.onSignOut,
+    required this.onOpenBuilder,
+    required this.onOpenBilling,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -300,6 +323,11 @@ class _ServerRail extends StatelessWidget {
             tooltip: 'Team builder',
             icon: const Icon(Icons.settings, color: Color(0xFF99AAB5)),
             onPressed: onOpenBuilder,
+          ),
+          IconButton(
+            tooltip: 'Billing & usage',
+            icon: const Icon(Icons.credit_card, color: Color(0xFF99AAB5)),
+            onPressed: onOpenBilling,
           ),
           const Spacer(),
           IconButton(
@@ -786,6 +814,7 @@ class _NarrowDrawer extends StatelessWidget {
   final ValueChanged<ChannelSelection> onSelect;
   final VoidCallback onRetry;
   final VoidCallback onOpenBuilder;
+  final VoidCallback onOpenBilling;
   final VoidCallback onSignOut;
   const _NarrowDrawer({
     required this.tasks,
@@ -795,6 +824,7 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onSelect,
     required this.onRetry,
     required this.onOpenBuilder,
+    required this.onOpenBilling,
     required this.onSignOut,
   });
 
@@ -829,6 +859,12 @@ class _NarrowDrawer extends StatelessWidget {
                           style: TextStyle(color: Color(0xFFC4C9CE))),
                       onPressed: onOpenBuilder,
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'Billing & usage',
+                    icon: const Icon(Icons.credit_card, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onOpenBilling,
                   ),
                   IconButton(
                     tooltip: 'Sign out / reconnect',

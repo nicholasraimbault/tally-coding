@@ -266,6 +266,30 @@ class TallyOrchClient {
     }
   }
 
+  /// Sprint 33-rest: usage + plan summary for the calling user.  Drives
+  /// the in-app billing screen.  Returns:
+  ///   {
+  ///     "user_id": "...",
+  ///     "plan": "free" | "pro" | "team" | "unlimited",
+  ///     "plan_label": "Free",
+  ///     "period_start": <unix ts>,
+  ///     "tasks": {"used": int, "cap": int},
+  ///     "agent_seconds": {"used": int, "cap": int},
+  ///     "billing_payer_id": "..." | null,
+  ///     "billing_subscription_id": "..." | null,
+  ///   }
+  Future<Map<String, dynamic>> billingUsage() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/billing/usage'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('billing usage failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   /// Workspace file listing for a completed (or running) task. Returns
   /// {"entries": [{"path", "size", "is_dir"}, ...]}.
   Future<List<Map<String, dynamic>>> listFiles(String taskId) async {

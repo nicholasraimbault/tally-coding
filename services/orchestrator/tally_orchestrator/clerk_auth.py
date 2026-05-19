@@ -35,11 +35,17 @@ class User:
       - `clerk`: validated Clerk JWT; `id` is the Clerk user_id (sub).
       - `admin`: legacy TALLY_API_TOKEN; `id` is 'admin'. Admin can
         read/write any user's data + reach /admin/* endpoints.
+
+    Sprint 33-rest: the `plan` field carries the Clerk Billing plan
+    slug extracted from the JWT's `pla` claim ("free" | "pro" |
+    "team"), or None when the claim is absent (legacy admin token).
+    The orchestrator uses this for opportunistic quota-row syncing.
     """
     id: str
     source: str          # "clerk" | "admin"
     email: str | None = None
     github: str | None = None
+    plan: str | None = None
 
 
 _JWKS_TTL_S = 600  # 10 min: Clerk's JWKS is stable in practice.
@@ -98,11 +104,18 @@ class ClerkValidator:
             or (claims.get("external_accounts") or {}).get("github")
             or None
         )
+        # Sprint 33-rest: Clerk Billing puts the active plan into
+        # `pla` ("u:pro" / "o:team") on v2 session tokens.  We let
+        # `clerk_billing.parse_plan_claim` normalise the slug so
+        # this module doesn't grow plan-vocabulary knowledge.
+        from .clerk_billing import parse_plan_claim
+        plan = parse_plan_claim(claims.get("pla"))
         return User(
             id=sub,
             source="clerk",
             email=email if isinstance(email, str) else None,
             github=github if isinstance(github, str) else None,
+            plan=plan,
         )
 
 

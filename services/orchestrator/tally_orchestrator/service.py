@@ -51,7 +51,7 @@ from .clerk_auth import (
     User as ClerkUser,
     looks_like_jwt as clerk_looks_like_jwt,
 )
-from .stripe_billing import BillingClient
+from .clerk_billing import ClerkBillingClient
 import jwt
 from .worker_pool import WorkerPool
 
@@ -756,16 +756,26 @@ class Db:
         windows later; today we want simple-and-correct enforcement."""
         return time.time()
 
-    def get_or_create_quota(self, user_id: str) -> dict:
+    def get_or_create_quota(self, user_id: str, plan_hint: str | None = None) -> dict:
         """Idempotent. Default plan: 'unlimited' for admin/legacy-admin
-        (so they never trip caps), 'free' for everyone else."""
+        (so they never trip caps), 'free' for everyone else.
+
+        Sprint 33-rest: ``plan_hint`` is the plan slug read off the
+        caller's Clerk JWT (``pla`` claim).  When provided and
+        different from the stored plan, we update opportunistically
+        — Clerk's session token is the source of truth, so this
+        catches plan upgrades the webhook may not have delivered yet.
+        Admin / legacy-admin rows ignore the hint (they're forever
+        'unlimited').
+        """
         row = self._conn.execute(
             "SELECT plan, stripe_customer_id, stripe_subscription_id, "
             "period_start, period_tasks_used, period_agent_seconds_used, updated_at "
             "FROM quotas WHERE user_id=?", (user_id,),
         ).fetchone()
+        is_admin = user_id in ("admin", "legacy-admin")
         if row is None:
-            plan = "unlimited" if user_id in ("admin", "legacy-admin") else "free"
+            plan = "unlimited" if is_admin else (plan_hint or "free")
             now = self._period_start_now()
             self._conn.execute(
                 "INSERT INTO quotas (user_id, plan, period_start, updated_at) "
@@ -778,8 +788,16 @@ class Db:
                 "period_start": now, "period_tasks_used": 0,
                 "period_agent_seconds_used": 0, "updated_at": now,
             }
+        stored_plan = row[0]
+        if plan_hint and not is_admin and plan_hint != stored_plan:
+            now = time.time()
+            self._conn.execute(
+                "UPDATE quotas SET plan=?, updated_at=? WHERE user_id=?",
+                (plan_hint, now, user_id),
+            )
+            stored_plan = plan_hint
         return {
-            "user_id": user_id, "plan": row[0],
+            "user_id": user_id, "plan": stored_plan,
             "stripe_customer_id": row[1], "stripe_subscription_id": row[2],
             "period_start": row[3], "period_tasks_used": row[4],
             "period_agent_seconds_used": row[5], "updated_at": row[6],
@@ -2303,16 +2321,19 @@ async def lifespan(app: FastAPI):
         state["clerk_validator"] = None
         logger.info("Clerk not configured (CLERK_PUBLISHABLE_KEY unset); admin-token-only auth")
 
-    # Sprint 33: Stripe billing client. Disabled (graceful 503 on
-    # /billing/checkout + /billing/webhook) when STRIPE_SECRET_KEY is
-    # missing — quotas + the free-tier 429s still work without Stripe.
-    billing = BillingClient()
-    state["billing"] = billing
-    if billing.enabled:
-        logger.info("Stripe billing enabled (prices: pro=%s team=%s)",
-                    billing.price_pro or "—", billing.price_team or "—")
+    # Sprint 33-rest: Clerk Billing replaces direct Stripe.  We only
+    # own the webhook secret + parser; the customer/subscription
+    # state lives in Clerk.  /webhooks/clerk returns 503 when
+    # CLERK_WEBHOOK_SECRET is unset (development tier without
+    # billing wired up).  Quotas + the free-tier 429s still work
+    # because the plan flows from the user's JWT `pla` claim.
+    clerk_billing = ClerkBillingClient()
+    state["clerk_billing"] = clerk_billing
+    if clerk_billing.webhook_enabled:
+        logger.info("Clerk Billing webhook enabled (whsec_...%s)",
+                    clerk_billing.webhook_secret[-4:])
     else:
-        logger.info("Stripe not configured; /billing/checkout + /billing/webhook will 503")
+        logger.info("Clerk Billing webhook not configured; /webhooks/clerk will 503")
 
     slots = await _resolve_pool(db, pool, target_pool_size)
     logger.info("bootstrapping pool of %d worker(s) in parallel", len(slots))
@@ -2422,7 +2443,7 @@ async def submit_task(
     # virtue of get_or_create_quota assigning 'unlimited'. Everyone
     # else: check `period_tasks_used` against the plan's cap before
     # we burn the architect's LLM call cost on a 429.
-    quota = db.get_or_create_quota(user.id)
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
     plan_caps = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
     if quota["period_tasks_used"] >= plan_caps["tasks"]:
         raise HTTPException(
@@ -2433,7 +2454,11 @@ async def submit_task(
                 "cap": plan_caps["tasks"],
                 "used": quota["period_tasks_used"],
                 "metric": "tasks_per_period",
-                "upgrade_url": "/billing/checkout",
+                # Sprint 33-rest: clients should open the Clerk-hosted
+                # PricingTable widget (in-app via clerk_flutter) to
+                # upgrade; no orchestrator-side checkout endpoint
+                # exists anymore.
+                "upgrade_action": "open_pricing_table",
             },
         )
     # Atomic insert with team_spec attached — no race window for the
@@ -2744,19 +2769,20 @@ async def delete_template(name: str, user: ClerkUser = Depends(require_user)) ->
     return {"deleted": name}
 
 
-# ── Sprint 33: billing + quotas ──────────────────────────────────────────────
-
-
-class CheckoutBody(BaseModel):
-    plan: str  # "pro" | "team"
+# ── Sprint 33-rest: Clerk Billing + quotas ────────────────────────────────────
 
 
 @app.get("/billing/usage")
 async def billing_usage(user: ClerkUser = Depends(require_user)) -> dict:
     """Return current period usage + plan caps for the calling user.
-    Drives the Flutter UI's "Usage" surface."""
+    Drives the Flutter UI's "Usage" surface.
+
+    Sprint 33-rest: opportunistically syncs the stored plan against
+    the JWT's `pla` claim before reading, so the response reflects
+    the freshest plan even if the webhook hasn't landed yet.
+    """
     db: Db = state["db"]
-    q = db.get_or_create_quota(user.id)
+    q = db.get_or_create_quota(user.id, plan_hint=user.plan)
     caps = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
     return {
         "user_id": user.id,
@@ -2768,100 +2794,81 @@ async def billing_usage(user: ClerkUser = Depends(require_user)) -> dict:
             "used": q["period_agent_seconds_used"],
             "cap": caps["agent_seconds"],
         },
-        "stripe_customer_id": q["stripe_customer_id"],
-        "stripe_subscription_id": q["stripe_subscription_id"],
+        # Sprint 33-rest: these columns now hold Clerk Billing IDs
+        # (payer id + subscriptionItem id) rather than Stripe IDs.
+        # The column names are kept for migration-stability; the
+        # response keys carry the generic semantic.
+        "billing_payer_id": q["stripe_customer_id"],
+        "billing_subscription_id": q["stripe_subscription_id"],
     }
 
 
-@app.post("/billing/checkout")
-async def billing_checkout(
-    body: CheckoutBody,
-    user: ClerkUser = Depends(require_user),
-) -> dict:
-    """Mint a Stripe Checkout session URL for the requested plan.
-    Returns 503 if Stripe isn't configured on this orchestrator
-    (development tier). Returns 400 for unknown plans or admin-source
-    callers (admins don't subscribe; they bypass quotas)."""
-    billing: BillingClient = state["billing"]
-    if not billing.enabled:
-        raise HTTPException(
-            503,
-            "Stripe not configured on this orchestrator. "
-            "Set STRIPE_SECRET_KEY + STRIPE_PRICE_PRO + STRIPE_PRICE_TEAM.",
-        )
-    if user.source == "admin":
-        raise HTTPException(400, "admin users bypass quotas; no subscription needed")
-    if body.plan not in {"pro", "team"}:
-        raise HTTPException(400, f"unknown plan: {body.plan!r}; expected 'pro' or 'team'")
-    if not billing.price_for_plan(body.plan):
-        raise HTTPException(
-            503, f"plan={body.plan} has no STRIPE_PRICE_* env var configured",
-        )
-    try:
-        session = await asyncio.to_thread(
-            billing.create_checkout_session,
-            user_id=user.id, email=user.email, plan=body.plan,
-        )
-    except Exception as exc:
-        logger.exception("Stripe checkout creation failed: %s", exc)
-        raise HTTPException(502, f"Stripe error: {exc}")
-    return {"checkout_url": session.url, "session_id": session.session_id}
+@app.post("/webhooks/clerk")
+async def clerk_webhook(request: Request) -> dict:
+    """Sprint 33-rest: Clerk Billing webhook delivery.
 
+    Clerk signs every webhook with svix.  ``CLERK_WEBHOOK_SECRET``
+    (the ``whsec_…`` value from the dashboard) feeds the HMAC-SHA256
+    verifier; bad signatures yield 400.
 
-@app.post("/billing/webhook")
-async def billing_webhook(request: Request) -> dict:
-    """Stripe webhook: customer.subscription.{created,updated,deleted}
-    + invoice.payment_succeeded. No bearer required (Stripe doesn't
-    send one); HMAC signature in `Stripe-Signature` is the auth."""
-    billing: BillingClient = state["billing"]
-    if not billing.enabled:
-        raise HTTPException(503, "Stripe not configured on this orchestrator")
-    if not billing.webhook_secret:
-        raise HTTPException(503, "STRIPE_WEBHOOK_SECRET not configured")
+    Handled event types (all under ``subscriptionItem.*``):
+      - ``subscriptionItem.created`` / ``subscriptionItem.active`` /
+        ``subscriptionItem.updated`` — sync the user's plan + record
+        the subscription id.
+      - ``subscriptionItem.canceled`` — flip the user back to ``free``.
+
+    Other events (``paymentAttempt.*``, ``subscription.past_due``,
+    etc.) are accepted-and-ignored so Clerk doesn't retry forever.
+
+    JWT-claim sync runs on every request, so the webhook is only
+    load-bearing for state changes that happen *between* user
+    sessions (failed renewal, admin-side cancel, etc.).
+    """
+    billing: ClerkBillingClient = state["clerk_billing"]
+    if not billing.webhook_enabled:
+        raise HTTPException(503, "CLERK_WEBHOOK_SECRET not configured on this orchestrator")
     payload = await request.body()
-    sig = request.headers.get("Stripe-Signature", "")
     try:
-        event = billing.validate_webhook(payload=payload, signature=sig)
-    except Exception as exc:
-        logger.warning("Stripe webhook validation failed: %s", exc)
+        billing.verify_svix_signature(
+            payload=payload,
+            svix_id=request.headers.get("svix-id", ""),
+            svix_timestamp=request.headers.get("svix-timestamp", ""),
+            svix_signature=request.headers.get("svix-signature", ""),
+        )
+    except ValueError as exc:
+        logger.warning("Clerk webhook verify failed: %s", exc)
         raise HTTPException(400, f"invalid signature: {exc}")
-    event_type = event.get("type", "")
-    obj = (event.get("data") or {}).get("object", {})
+    try:
+        raw_event = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"bad json: {exc}")
+    if not isinstance(raw_event, dict):
+        raise HTTPException(400, "expected JSON object")
+
+    evt = billing.parse_event(raw_event)
     db: Db = state["db"]
-    if event_type in ("customer.subscription.created", "customer.subscription.updated"):
-        user_id = (obj.get("metadata") or {}).get("tally_user_id")
-        plan = (obj.get("metadata") or {}).get("plan", "pro")
-        if user_id:
-            status = obj.get("status", "")
-            new_plan = plan if status in ("active", "trialing") else "free"
-            db.set_user_plan(
-                user_id,
-                plan=new_plan,
-                stripe_customer_id=obj.get("customer"),
-                stripe_subscription_id=obj.get("id"),
-            )
-            logger.info("subscription %s → user=%s plan=%s (sub=%s)",
-                        event_type, user_id, new_plan, obj.get("id"))
-    elif event_type == "customer.subscription.deleted":
-        user_id = (obj.get("metadata") or {}).get("tally_user_id")
-        if user_id:
-            db.set_user_plan(
-                user_id, plan="free",
-                stripe_customer_id=obj.get("customer"),
-                stripe_subscription_id=None,
-            )
-            logger.info("subscription canceled → user=%s back to free", user_id)
-    elif event_type == "invoice.payment_succeeded":
-        # New billing period: reset the user's usage counters.
-        sub_id = obj.get("subscription")
-        if sub_id:
-            row = db._conn.execute(
-                "SELECT user_id FROM quotas WHERE stripe_subscription_id=?", (sub_id,),
-            ).fetchone()
-            if row:
-                db.reset_quota_period(row[0])
-                logger.info("new period for user=%s (sub=%s)", row[0], sub_id)
-    return {"received": True, "event": event_type}
+
+    if not evt.user_id:
+        # Unknown event shape or user_id missing — accept-and-no-op
+        # so Clerk doesn't retry; log for visibility.
+        logger.info("clerk webhook: skipping %s (no user_id)", evt.type)
+        return {"received": True, "event": evt.type, "applied": False}
+
+    if evt.type.startswith("subscriptionItem."):
+        new_plan = evt.plan or "free"
+        db.set_user_plan(
+            evt.user_id,
+            plan=new_plan,
+            stripe_customer_id=None,  # Clerk owns payer state; no separate id
+            stripe_subscription_id=evt.subscription_id,
+        )
+        logger.info("clerk webhook %s → user=%s plan=%s sub=%s",
+                    evt.type, evt.user_id, new_plan, evt.subscription_id)
+        return {"received": True, "event": evt.type, "applied": True}
+
+    # Other event families (paymentAttempt.*, etc.): accepted, not acted on.
+    logger.debug("clerk webhook: ignored event_type=%s", evt.type)
+    return {"received": True, "event": evt.type, "applied": False}
 
 
 @app.get("/admin/agent_roles", dependencies=[Depends(require_token)])

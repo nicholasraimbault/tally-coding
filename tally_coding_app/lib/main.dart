@@ -11,8 +11,10 @@ import 'screens/discord_shell.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
-/// silently falling back to admin-only auth.
-const _kClerkPublishableKey = String.fromEnvironment(
+/// silently falling back to admin-only auth.  Exposed as a public
+/// top-level so the billing screen can decode the Clerk frontend
+/// API host for the hosted-portal URL.
+const clerkPublishableKey = String.fromEnvironment(
   'CLERK_PUBLISHABLE_KEY',
   defaultValue: 'pk_test_ZWFnZXItc2hyaW1wLTM2LmNsZXJrLmFjY291bnRzLmRldiQ',
 );
@@ -91,7 +93,7 @@ class TallyApp extends StatelessWidget {
     );
     return ClerkAuth(
       config: ClerkAuthConfig(
-        publishableKey: _kClerkPublishableKey,
+        publishableKey: clerkPublishableKey,
         redirectionGenerator: _redirectFor,
         // Sprint 32.5: on Linux desktops without DBus activation, the
         // OAuth redirect spawns a *new* instance of the app with the
