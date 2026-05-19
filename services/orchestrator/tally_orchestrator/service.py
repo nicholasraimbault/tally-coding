@@ -3197,11 +3197,20 @@ async def clerk_webhook(request: Request) -> dict:
     return {"received": True, "event": evt.type, "applied": False}
 
 
-@app.get("/admin/agent_roles", dependencies=[Depends(require_token)])
-async def list_agent_roles() -> dict:
+@app.get("/admin/agent_roles")
+async def list_agent_roles(user: ClerkUser = Depends(require_user)) -> dict:
     """The agent palette. Static today (seeded once at orchestrator boot);
     the Discord-shaped Flutter UI uses this to show role glyphs / names
-    in the members sidebar without hardcoding the list."""
+    in the members sidebar without hardcoding the list.
+
+    Auth: any authenticated user (admin OR Clerk JWT).  The palette
+    is the same for everyone — no per-tenant data — and the team
+    builder is one of the first surfaces a signed-in user touches,
+    so gating it on the admin token would break the core UX.
+    The ``/admin/`` URL prefix is historical; the endpoint is not
+    admin-only.
+    """
+    del user  # auth-gated only; no per-user filtering.
     return {"roles": state["db"].list_agent_roles()}
 
 
