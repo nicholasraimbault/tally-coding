@@ -20,6 +20,8 @@ class Task {
   /// single-agent submissions). Shape:
   /// `{agents: [{role, model, spec, agent_idx}], workflow, reasoning}`.
   final Map<String, dynamic>? teamSpec;
+  /// Sprint 37: persistent-project id (null on one-off tasks).
+  final String? projectId;
 
   Task({
     required this.id,
@@ -30,6 +32,7 @@ class Task {
     required this.createdAt,
     required this.updatedAt,
     this.teamSpec,
+    this.projectId,
   });
 
   factory Task.fromJson(Map<String, dynamic> j) => Task(
@@ -41,6 +44,7 @@ class Task {
         createdAt: (j['created_at'] as num).toDouble(),
         updatedAt: (j['updated_at'] as num).toDouble(),
         teamSpec: j['team_spec'] as Map<String, dynamic>?,
+        projectId: j['project_id'] as String?,
       );
 
   bool get isTerminal => status == 'completed' || status == 'failed';
@@ -112,13 +116,18 @@ class TallyOrchClient {
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
-  Future<Task> submitTask(String description, {Map<String, dynamic>? teamSpec}) async {
+  Future<Task> submitTask(
+    String description, {
+    Map<String, dynamic>? teamSpec,
+    String? projectId,
+  }) async {
     final resp = await _http.post(
       baseUrl.resolve('/tasks'),
       headers: {'content-type': 'application/json', ...(await _authHeaders)},
       body: jsonEncode({
         'description': description,
         if (teamSpec != null) 'team_spec': teamSpec,
+        if (projectId != null) 'project_id': projectId,
       }),
     );
     _checkAuth(resp);
@@ -126,6 +135,83 @@ class TallyOrchClient {
       throw Exception('submit task failed: ${resp.statusCode} ${resp.body}');
     }
     return Task.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+  }
+
+  // ── Sprint 37: persistent projects ────────────────────────────────────────
+
+  Future<List<Map<String, dynamic>>> listProjects() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/projects'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('list projects failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return (body['projects'] as List).cast<Map<String, dynamic>>();
+  }
+
+  Future<Map<String, dynamic>> getProject(String id) async {
+    final resp = await _http.get(
+      baseUrl.resolve('/projects/$id'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('get project failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> createProject({
+    required String name,
+    String? description,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/projects'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({
+        'name': name,
+        if (description != null) 'description': description,
+      }),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('create project failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> patchProject(
+    String id, {
+    String? name,
+    String? description,
+  }) async {
+    final body = <String, dynamic>{};
+    if (name != null) body['name'] = name;
+    if (description != null) body['description'] = description;
+    final resp = await _http.patch(
+      baseUrl.resolve('/projects/$id'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('patch project failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<void> deleteProject(String id) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/projects/$id'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('delete project failed: ${resp.statusCode} ${resp.body}');
+    }
   }
 
   /// Sprint 29: promote a completed task's team_spec to a named template.

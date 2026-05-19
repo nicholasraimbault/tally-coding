@@ -24,6 +24,7 @@ import '../api.dart';
 import '../main.dart';
 import 'billing_screen.dart';
 import 'general_channel.dart';
+import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'team_builder.dart';
 import 'templates_screen.dart';
@@ -68,6 +69,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   int _poolTarget = 0;
   int _poolJoined = 0;
   String? _poolLastError;
+  // Sprint 37: id of the user's current "active project".  Null = one-off
+  // task mode (legacy behaviour).  Threaded into the composer so newly
+  // submitted tasks inherit the project's HEAD artifact set.
+  String? _activeProjectId;
 
   @override
   void initState() {
@@ -187,6 +192,21 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     );
   }
 
+  /// Sprint 37: server rail 📁 → projects catalogue.  Setting an active
+  /// project re-renders the composer with the project context so new
+  /// tasks inherit its HEAD artifact set.
+  Future<void> _openProjects(BuildContext context) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => ProjectsScreen(
+          client: widget.client,
+          activeProjectId: _activeProjectId,
+          onSelectActive: (id) => setState(() => _activeProjectId = id),
+        ),
+      ),
+    );
+  }
+
   /// Sprint 31: width threshold below which the shell collapses from
   /// four panes to one. Wide → keep desktop layout; narrow → AppBar +
   /// drawer (channels) + bottom sheet (members). 1100px lands on a
@@ -227,6 +247,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     onOpenBuilder: () => _openBuilder(context),
                     onOpenBilling: () => _openBilling(context),
                     onOpenTemplates: () => _openTemplates(context),
+                    onOpenProjects: () => _openProjects(context),
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   _ChannelList(
@@ -292,6 +313,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           Navigator.of(context).pop();
           _openTemplates(context);
         },
+        onOpenProjects: () {
+          Navigator.of(context).pop();
+          _openProjects(context);
+        },
         onSignOut: () => resetTallyConfig(context),
       ),
       body: SafeArea(
@@ -353,6 +378,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           client: widget.client,
           recentTasks: _tasks,
           onTaskSubmitted: _onTaskSubmitted,
+          activeProjectId: _activeProjectId,
         ),
       TaskSelected(taskId: final id) => TaskChannelScreen(
           key: ValueKey(id),
@@ -434,11 +460,13 @@ class _ServerRail extends StatelessWidget {
   final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
+  final VoidCallback onOpenProjects;
   const _ServerRail({
     required this.onSignOut,
     required this.onOpenBuilder,
     required this.onOpenBilling,
     required this.onOpenTemplates,
+    required this.onOpenProjects,
   });
 
   @override
@@ -461,6 +489,11 @@ class _ServerRail extends StatelessWidget {
             tooltip: 'Team builder',
             icon: const Icon(Icons.settings, color: Color(0xFF99AAB5)),
             onPressed: onOpenBuilder,
+          ),
+          IconButton(
+            tooltip: 'Projects',
+            icon: const Icon(Icons.folder_outlined, color: Color(0xFF99AAB5)),
+            onPressed: onOpenProjects,
           ),
           IconButton(
             tooltip: 'Saved templates',
@@ -959,6 +992,7 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
+  final VoidCallback onOpenProjects;
   final VoidCallback onSignOut;
   const _NarrowDrawer({
     required this.tasks,
@@ -970,6 +1004,7 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onOpenBuilder,
     required this.onOpenBilling,
     required this.onOpenTemplates,
+    required this.onOpenProjects,
     required this.onSignOut,
   });
 
@@ -1004,6 +1039,12 @@ class _NarrowDrawer extends StatelessWidget {
                           style: TextStyle(color: Color(0xFFC4C9CE))),
                       onPressed: onOpenBuilder,
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'Projects',
+                    icon: const Icon(Icons.folder_outlined, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onOpenProjects,
                   ),
                   IconButton(
                     tooltip: 'Saved templates',

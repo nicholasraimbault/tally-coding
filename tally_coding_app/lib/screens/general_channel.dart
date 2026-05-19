@@ -15,11 +15,17 @@ class GeneralChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
   final List<Task> recentTasks;
   final ValueChanged<Task> onTaskSubmitted;
+  /// Sprint 37: when set, the composer submits tasks into this project
+  /// so the first agent inherits HEAD artifacts.  Surfaced as a small
+  /// "Submitting into: <project>" indicator above the composer so the
+  /// user can see what context the next task will inherit.
+  final String? activeProjectId;
   const GeneralChannelScreen({
     super.key,
     required this.client,
     required this.recentTasks,
     required this.onTaskSubmitted,
+    this.activeProjectId,
   });
 
   @override
@@ -39,7 +45,11 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
       _error = null;
     });
     try {
-      final t = await widget.client.submitTask(desc, teamSpec: teamSpec);
+      final t = await widget.client.submitTask(
+        desc,
+        teamSpec: teamSpec,
+        projectId: widget.activeProjectId,
+      );
       if (overrideDescription == null) _ctrl.clear();
       if (!mounted) return;
       setState(() => _submitting = false);
@@ -74,6 +84,8 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
               ),
             ),
           ),
+          if (widget.activeProjectId != null)
+            _ActiveProjectStrip(projectId: widget.activeProjectId!),
           _Composer(
             controller: _ctrl,
             submitting: _submitting,
@@ -81,6 +93,45 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
             onSubmit: _submit,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Sprint 37: small banner just above the composer that reminds the
+/// user their next task will land inside an active project (and
+/// therefore inherit the project's HEAD artifact set).  Hidden when
+/// no project is active — the composer is the default surface for
+/// one-off tasks.
+class _ActiveProjectStrip extends StatelessWidget {
+  final String projectId;
+  const _ActiveProjectStrip({required this.projectId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF7C5CFC).withValues(alpha: 0.18),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.folder, size: 14, color: Color(0xFF7C5CFC)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                "Submitting into project — first agent inherits HEAD artifacts.",
+                style: const TextStyle(
+                  color: Color(0xFFDCDDDE),
+                  fontSize: 11,
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

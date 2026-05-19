@@ -156,6 +156,36 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
 
+-- Sprint 37: persistent project workspaces.  A user can group tasks
+-- under a project; the project's HEAD artifact set seeds the first
+-- agent of every task in the project, and successful task artifacts
+-- merge back into the project HEAD (last-writer-wins per path).
+-- This is what enables iterating on a real codebase across multiple
+-- Tally runs instead of starting from /workspaces/task-XXX every time.
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    description TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at DESC);
+
+-- Project HEAD artifact set.  Parallel structure to task_artifacts
+-- minus the per-agent column (project HEAD has no notion of which
+-- task produced which file — the project history lives in the tasks
+-- table, not here).
+CREATE TABLE IF NOT EXISTS project_artifacts (
+    project_id  TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    b64_content TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    PRIMARY KEY (project_id, path),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_artifacts ON project_artifacts(project_id);
+
 -- Sprint 33: per-user quotas. One row per Clerk user (plus
 -- 'admin'/'legacy-admin' for those paths). Plans are name-only;
 -- the caps come from the QUOTA_PLANS dict in service.py — keeps the
@@ -219,6 +249,10 @@ class TaskSubmit(BaseModel):
     # reasoning: str?}. Sprint 23 wires Tally to produce this when the
     # client doesn't supply one.
     team_spec: dict | None = None
+    # Sprint 37: optional persistent-project grouping. When set, the
+    # first agent's workspace seeds from the project's HEAD artifact
+    # set, and final task artifacts merge back into HEAD on success.
+    project_id: str | None = None
 
 
 class TaskResponse(BaseModel):
@@ -235,6 +269,8 @@ class TaskResponse(BaseModel):
     # Sprint 32: owner of the task. 'admin' for legacy bearer-token writes,
     # 'legacy-admin' for pre-Sprint-32 rows, otherwise a Clerk user_id.
     user_id: str = "legacy-admin"
+    # Sprint 37: persistent project the task belongs to (nullable).
+    project_id: str | None = None
 
 
 class Db:
@@ -283,6 +319,17 @@ class Db:
             self._conn.execute("ALTER TABLE team_templates ADD COLUMN share_token TEXT")
         except sqlite3.OperationalError:
             pass
+        # Sprint 37: persistent projects.  Tasks can belong to a project;
+        # the project's HEAD artifact set seeds the first agent of every
+        # task in the project.  Nullable so legacy / one-off tasks
+        # continue to work unchanged.
+        try:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DESC)"
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC)"
         )
@@ -379,7 +426,7 @@ class Db:
                 (name, desc, model, json.dumps(tools), prompt),
             )
 
-    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity, team_spec, user_id"
+    _TASK_COLS = "id, description, status, result_json, error, created_at, updated_at, worker_identity, team_spec, user_id, project_id"
 
     def create_task(
         self,
@@ -387,18 +434,25 @@ class Db:
         team_spec: dict | None = None,
         *,
         user_id: str = "legacy-admin",
+        project_id: str | None = None,
     ) -> str:
         """Sprint 23: team_spec can be set atomically with task creation so
         the processor loop never sees a `pending` row without its
         team_spec already attached. Without this guard, the architect's
         ~3-5s LLM call lets the processor pick up the task as single-agent
-        before the spec lands (race observed in Sprint 23 validation)."""
+        before the spec lands (race observed in Sprint 23 validation).
+
+        Sprint 37: ``project_id`` (optional) groups tasks under a
+        persistent workspace.  The orchestrator hydrates the first
+        agent's seed_files from the project's HEAD artifact set, and
+        merges the task's final artifacts back into HEAD on success.
+        """
         task_id = uuid.uuid4().hex
         now = time.time()
         self._conn.execute(
-            "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at, user_id) "
-            "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
-            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id),
+            "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at, user_id, project_id) "
+            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
+            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
         )
         return task_id
 
@@ -825,6 +879,162 @@ class Db:
         ).fetchone()
         return self._template_row_to_dict(row) if row else None
 
+    # ── Sprint 37: persistent project workspaces ────────────────────────────
+
+    @staticmethod
+    def _project_row_to_dict(r: tuple, file_count: int = 0) -> dict:
+        return {
+            "id": r[0],
+            "user_id": r[1],
+            "name": r[2],
+            "description": r[3],
+            "created_at": r[4],
+            "updated_at": r[5],
+            "file_count": file_count,
+        }
+
+    def create_project(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        description: str | None = None,
+    ) -> str:
+        """Insert a new project, return its generated id."""
+        project_id = f"proj_{secrets.token_urlsafe(9)}"
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO projects (id, user_id, name, description, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (project_id, user_id, name, description or None, now, now),
+        )
+        return project_id
+
+    def list_projects(self, *, user_id: str | None = None) -> list[dict]:
+        """List projects, optionally scoped to one user.  Each row
+        carries a ``file_count`` computed from project_artifacts."""
+        if user_id is None:
+            rows = self._conn.execute(
+                "SELECT p.id, p.user_id, p.name, p.description, p.created_at, p.updated_at, "
+                "COALESCE(c.n, 0) FROM projects p "
+                "LEFT JOIN (SELECT project_id, COUNT(*) n FROM project_artifacts GROUP BY project_id) c "
+                "ON c.project_id = p.id "
+                "ORDER BY p.updated_at DESC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT p.id, p.user_id, p.name, p.description, p.created_at, p.updated_at, "
+                "COALESCE(c.n, 0) FROM projects p "
+                "LEFT JOIN (SELECT project_id, COUNT(*) n FROM project_artifacts GROUP BY project_id) c "
+                "ON c.project_id = p.id WHERE p.user_id = ? "
+                "ORDER BY p.updated_at DESC", (user_id,),
+            ).fetchall()
+        return [self._project_row_to_dict(r[:6], file_count=r[6]) for r in rows]
+
+    def get_project(self, project_id: str, *, user_id: str | None = None) -> dict | None:
+        if user_id is None:
+            row = self._conn.execute(
+                "SELECT id, user_id, name, description, created_at, updated_at "
+                "FROM projects WHERE id=?", (project_id,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT id, user_id, name, description, created_at, updated_at "
+                "FROM projects WHERE id=? AND user_id=?", (project_id, user_id),
+            ).fetchone()
+        if row is None:
+            return None
+        file_count = self._conn.execute(
+            "SELECT COUNT(*) FROM project_artifacts WHERE project_id=?",
+            (project_id,),
+        ).fetchone()[0]
+        return self._project_row_to_dict(row, file_count=file_count)
+
+    def delete_project(self, project_id: str, *, user_id: str | None = None) -> bool:
+        """Delete the project AND its artifact set.  Tasks that
+        reference it keep ``project_id`` set (orphan reference) so we
+        don't accidentally lose audit visibility on what ran where."""
+        if user_id is None:
+            self._conn.execute(
+                "DELETE FROM project_artifacts WHERE project_id=?", (project_id,),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM projects WHERE id=?", (project_id,),
+            )
+        else:
+            # Verify ownership before deleting artifacts.
+            owner = self._conn.execute(
+                "SELECT user_id FROM projects WHERE id=?", (project_id,),
+            ).fetchone()
+            if owner is None or owner[0] != user_id:
+                return False
+            self._conn.execute(
+                "DELETE FROM project_artifacts WHERE project_id=?", (project_id,),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM projects WHERE id=? AND user_id=?", (project_id, user_id),
+            )
+        return (cur.rowcount or 0) > 0
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> dict | None:
+        """Rename and/or update the description.  Returns the updated
+        row, or ``None`` if the project doesn't exist / isn't owned."""
+        if name is None and description is None:
+            return self.get_project(project_id, user_id=user_id)
+        updates: list[str] = []
+        params: list = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description or None)
+        updates.append("updated_at = ?")
+        params.append(time.time())
+        where = "id = ?"
+        params.append(project_id)
+        if user_id is not None:
+            where += " AND user_id = ?"
+            params.append(user_id)
+        cur = self._conn.execute(
+            f"UPDATE projects SET {', '.join(updates)} WHERE {where}", params,
+        )
+        if (cur.rowcount or 0) == 0:
+            return None
+        return self.get_project(project_id, user_id=user_id)
+
+    def upsert_project_artifacts(self, project_id: str, snap: dict[str, str]) -> None:
+        """Merge a {path: b64} snapshot into the project's HEAD.
+        Last-writer-wins per path."""
+        if not snap:
+            return
+        now = time.time()
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO project_artifacts "
+            "(project_id, path, b64_content, ts) VALUES (?, ?, ?, ?)",
+            [(project_id, path, b64, now) for path, b64 in snap.items()],
+        )
+        # Bump project updated_at so the list sorts by activity.
+        self._conn.execute(
+            "UPDATE projects SET updated_at=? WHERE id=?", (now, project_id),
+        )
+
+    def load_project_artifacts(self, project_id: str) -> dict[str, str]:
+        """Hydrate the project's HEAD as {path: b64}.  Used to seed
+        the first agent of a task that belongs to this project."""
+        rows = self._conn.execute(
+            "SELECT path, b64_content FROM project_artifacts WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
 
     def upsert_artifacts(self, task_id: str, agent_idx: int | None, snap: dict[str, str]) -> None:
@@ -1064,6 +1274,10 @@ class Db:
             # despite the ALTER TABLE … DEFAULT 'legacy-admin' clause when
             # rows existed at migration time). Normalize on the read path.
             "user_id": (row[9] if len(row) > 9 and row[9] else "legacy-admin"),
+            # Sprint 37: persistent project (nullable).  Pre-S37 tasks
+            # have NULL here; the orchestrator treats them as one-off
+            # tasks just like before.
+            "project_id": (row[10] if len(row) > 10 else None),
         }
 
 
@@ -1217,6 +1431,37 @@ class Orchestrator:
         # last agent's result on restart if needed (Sprint 18's
         # recovery semantics already handle the at-least-once case).
         self._task_artifacts: dict[str, dict[str, str]] = {}
+
+    def _seed_files_for_task(self, task: dict) -> dict[str, str]:
+        """Sprint 37: return the seed_files snapshot to hand to the
+        next agent of ``task``.
+
+        - Sequence-aware: subsequent agents in a sequential workflow
+          see the cumulative ``_task_artifacts[task_id]`` (Sprint 26).
+        - Project-aware: the very first agent on a project-scoped task
+          (no entries yet in ``_task_artifacts``) is seeded with the
+          project's HEAD snapshot, so the team starts from the real
+          working codebase instead of an empty workspace.
+        - Free-tier-safe: if the project is missing or has no
+          artifacts yet, we fall through to the empty dict.
+        """
+        existing = self._task_artifacts.get(task["id"])
+        if existing:
+            return existing
+        project_id = task.get("project_id")
+        if not project_id:
+            return {}
+        seed = self.db.load_project_artifacts(project_id)
+        if seed:
+            # Cache the in-memory copy so subsequent agents pick it up
+            # via the same dict (and the per-agent merge layers cleanly).
+            self._task_artifacts[task["id"]] = dict(seed)
+            logger.info(
+                "task %s: hydrated %d file(s) from project=%s HEAD",
+                task["id"][:8], len(seed), project_id,
+            )
+            return seed
+        return {}
 
     # ── handle lifecycle ──────────────────────────────────────────────────
 
@@ -1518,7 +1763,12 @@ class Orchestrator:
                     },
                     # Sprint 26: hand the agent its predecessors' files.
                     # Empty on the first agent in a team.
-                    "seed_files": self._task_artifacts.get(task["id"], {}),
+                    # Sprint 37: when the task belongs to a project, the
+                    # first agent inherits the project's HEAD artifacts
+                    # so the team can iterate on real code instead of
+                    # starting from scratch.  Hydrated lazily — once per
+                    # task — on first dispatch.
+                    "seed_files": self._seed_files_for_task(task),
                 }
                 ciphertext = handle.session.encrypt(json.dumps(payload_obj).encode("utf-8"))
                 ack_bytes = await asyncio.to_thread(
@@ -1945,7 +2195,22 @@ class Orchestrator:
             ],
         }
         self.db.mark_completed(task_id, aggregate)
-        artifact_count = len(self._task_artifacts.pop(task_id, {}))  # Sprint 26: free memory
+        # Sprint 37: when the task belongs to a project AND the run
+        # succeeded overall, merge its final artifacts back into the
+        # project's HEAD before we free the in-memory copy.  Failed
+        # tasks do NOT update HEAD — keeps the project's working
+        # codebase from absorbing bad partial outputs.
+        final_artifacts = self._task_artifacts.pop(task_id, {})  # Sprint 26: free memory
+        artifact_count = len(final_artifacts)
+        if aggregate["success"]:
+            task_row = self.db.get_task(task_id)
+            project_id = (task_row or {}).get("project_id")
+            if project_id and final_artifacts:
+                self.db.upsert_project_artifacts(project_id, final_artifacts)
+                logger.info(
+                    "task %s: merged %d file(s) into project=%s HEAD",
+                    task_id[:8], artifact_count, project_id,
+                )
         self.db.delete_artifacts(task_id)  # Sprint 26.5: free durable copy
         await self._publish_status(
             task_id, "completed",
@@ -2672,10 +2937,25 @@ async def submit_task(
                 "upgrade_action": "open_pricing_table",
             },
         )
+    # Sprint 37: validate project_id (if supplied) before binding the
+    # task to it.  Owner-scoped so a Clerk user can't smuggle their
+    # task into someone else's project.
+    if body.project_id is not None:
+        scope = None if user.source == "admin" else user.id
+        proj = db.get_project(body.project_id, user_id=scope)
+        if proj is None:
+            raise HTTPException(
+                404, f"project `{body.project_id}` not found or not owned by you",
+            )
     # Atomic insert with team_spec attached — no race window for the
     # processor to pick the task up as single-agent before team_spec
     # lands.
-    task_id = db.create_task(body.description, team_spec=team_spec, user_id=user.id)
+    task_id = db.create_task(
+        body.description,
+        team_spec=team_spec,
+        user_id=user.id,
+        project_id=body.project_id,
+    )
     db.increment_task_count(user.id)
     task = db.get_task(task_id)
     return TaskResponse(**task)
@@ -2978,6 +3258,90 @@ async def delete_template(name: str, user: ClerkUser = Depends(require_user)) ->
     if not state["db"].delete_template(name, user_id=scope):
         raise HTTPException(404, f"template `{name}` not found")
     return {"deleted": name}
+
+
+# ── Sprint 37: persistent projects ────────────────────────────────────────────
+
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class ProjectPatch(BaseModel):
+    """Partial update.  Either or both fields may be supplied."""
+    name: str | None = None
+    description: str | None = None
+
+
+@app.post("/projects")
+async def create_project(
+    body: ProjectCreate,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Create a persistent project.  Tasks created with this
+    ``project_id`` will inherit the project's HEAD artifact set on
+    their first agent and merge successful artifacts back on
+    completion."""
+    db: Db = state["db"]
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if len(name) > 64:
+        raise HTTPException(400, "name must be ≤64 chars")
+    project_id = db.create_project(
+        user_id=user.id, name=name, description=(body.description or None),
+    )
+    logger.info("project created: id=%s name=%r owner=%s", project_id, name, user.id)
+    return db.get_project(project_id) or {"id": project_id, "name": name}
+
+
+@app.get("/projects")
+async def list_projects(user: ClerkUser = Depends(require_user)) -> dict:
+    """List the caller's projects.  Admin sees all."""
+    scope = None if user.source == "admin" else user.id
+    return {"projects": state["db"].list_projects(user_id=scope)}
+
+
+@app.get("/projects/{project_id}")
+async def get_project(project_id: str, user: ClerkUser = Depends(require_user)) -> dict:
+    scope = None if user.source == "admin" else user.id
+    proj = state["db"].get_project(project_id, user_id=scope)
+    if proj is None:
+        raise HTTPException(404, f"project `{project_id}` not found")
+    return proj
+
+
+@app.patch("/projects/{project_id}")
+async def update_project(
+    project_id: str,
+    body: ProjectPatch,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    scope = None if user.source == "admin" else user.id
+    # Sanitise name when supplied.
+    name: str | None = None
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "name is empty after strip")
+        if len(name) > 64:
+            raise HTTPException(400, "name must be ≤64 chars")
+    proj = state["db"].update_project(
+        project_id, user_id=scope, name=name, description=body.description,
+    )
+    if proj is None:
+        raise HTTPException(404, f"project `{project_id}` not found")
+    return proj
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str, user: ClerkUser = Depends(require_user)) -> dict:
+    scope = None if user.source == "admin" else user.id
+    if not state["db"].delete_project(project_id, user_id=scope):
+        raise HTTPException(404, f"project `{project_id}` not found")
+    logger.info("project deleted: id=%s owner=%s", project_id, user.id)
+    return {"deleted": project_id}
 
 
 # ── Sprint 34: template edit + share-with-link ────────────────────────────────
