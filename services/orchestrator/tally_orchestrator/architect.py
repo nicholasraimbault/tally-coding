@@ -202,7 +202,41 @@ Optional per-agent fields:
   - `"local_if_available"` — prefer local; fall back to TEE if local isn't online. Good default for Tester (runs against the user's real environment).
   - `"any"` (or absent) — let the orchestrator decide.
 
-Output `worker_affinity` only when you have a real reason; defaults are fine for most tasks.{templates_block}
+Output `worker_affinity` only when you have a real reason; defaults are fine for most tasks.
+
+Sprint 42 — per-agent model selection:
+
+Each agent runs against an LLM that you pick per-agent.  Default is
+the role's `default_model` if you omit `model`.  You CAN override per
+agent based on the task's complexity to save cost on easy work +
+spend more on hard work.  Pick from this catalogue (cost in
+USD per million tokens, prompt / completion):
+
+- `meta-llama/llama-3.3-70b-instruct` (0.59 / 0.79) — fast, cheap,
+  good for straightforward CRUD, short scripts, documentation.
+  Default for most agents — pick another only when the task is
+  clearly harder.
+- `moonshotai/kimi-k2.6-instruct` (0.60 / 2.50) — strong on
+  multi-file refactors, library design, ambiguous specs.  Use for
+  Coder when the task is non-trivial.
+- `deepseek/deepseek-r1-0528` (0.55 / 2.19) — reasoning model.
+  Use for Reviewer / SecReviewer / Planner on tricky problems
+  where you want it to think step-by-step before answering.
+- `deepseek/deepseek-v3.2` (0.27 / 1.10) — cheapest; OK quality on
+  simple code/docs.  Use for DocWriter and other low-stakes agents.
+
+Heuristics:
+- "write hello world", "rename a variable", short single-file edits
+  → all llama-3.3-70b.
+- "build a feature with tests", "refactor across multiple files"
+  → Coder gets kimi-k2.6; Reviewer gets deepseek-r1; DocWriter
+  (if any) stays on llama-3.3-70b.
+- "design a complex algorithm / system", "find subtle bugs"
+  → Coder = kimi-k2.6, Planner/Reviewer/SecReviewer = deepseek-r1.
+
+Return per-agent `model` ONLY when you're deliberately overriding
+the role default for cost or capability reasons.  When in doubt,
+omit `model` and let the role default carry.{templates_block}
 
 Task: {description}
 
@@ -292,6 +326,20 @@ def _validate_team_spec(raw: dict, valid_roles: set[str]) -> dict | None:
         return None
     cleaned_agents: list[dict[str, Any]] = []
     _valid_affinities = {"any", "tee", "local", "local_if_available"}
+    # Sprint 42: defense-in-depth allow-list for architect-picked models.
+    # Even though the prompt tells the architect which models to pick,
+    # we don't trust the LLM to stay inside the catalogue — hallucinated
+    # names would crash at dispatch time.  Validation here drops the
+    # offending value so the role's default_model takes over.
+    _allowed_models = {
+        "meta-llama/llama-3.3-70b-instruct",
+        "moonshotai/kimi-k2-instruct",
+        "moonshotai/kimi-k2.6-instruct",
+        "deepseek/deepseek-r1-0528",
+        "deepseek/deepseek-r1",
+        "deepseek/deepseek-v3.2",
+        "deepseek/deepseek-v3",
+    }
     for a in agents:
         if not isinstance(a, dict):
             return None
@@ -302,6 +350,17 @@ def _validate_team_spec(raw: dict, valid_roles: set[str]) -> dict | None:
         if not isinstance(spec, str):
             return None
         cleaned = {"role": role, "spec": spec[:1000]}
+        # Sprint 42: carry forward per-agent model when the architect
+        # picked one we recognise.  Unknown models drop silently; the
+        # dispatch path then uses the role's default_model.
+        model = a.get("model")
+        if isinstance(model, str) and model in _allowed_models:
+            cleaned["model"] = model
+        elif isinstance(model, str) and model:
+            logger.info(
+                "architect picked unknown model %r for role %s; dropping (will use role default)",
+                model, role,
+            )
         # Sprint 28: worker_affinity is optional; only carry forward when
         # the architect picked a non-default value. Garbage / unknown
         # values silently drop to default ("any"), so the orchestrator
