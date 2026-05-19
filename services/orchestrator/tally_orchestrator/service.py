@@ -53,6 +53,7 @@ from .clerk_auth import (
 )
 from .clerk_backend import ClerkBackendClient
 from .clerk_billing import ClerkBillingClient
+from .cost import compute_cost_micro_usd, format_micro_usd
 from .credentials import CredentialsManager, fernet_key_help, redact_token
 from .github_push import (
     GithubPushAuthError,
@@ -209,6 +210,27 @@ CREATE TABLE IF NOT EXISTS user_credentials (
     updated_at     REAL NOT NULL,
     PRIMARY KEY (user_id, kind)
 );
+
+-- Sprint 39: LLM cost events.  One row per upstream LLM call (the
+-- architect, eventually the worker agents).  Cost is computed at
+-- insert time using the static price table in `cost.py` so reads
+-- don't have to repeat the math.  Stored as micro-USD (int) to
+-- avoid float drift over time: 1 USD = 1_000_000 micro_usd.
+CREATE TABLE IF NOT EXISTS cost_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    task_id         TEXT,                  -- nullable for non-task LLM calls (future)
+    agent_idx       INTEGER,               -- nullable for architect calls
+    kind            TEXT NOT NULL,         -- 'architect' | 'agent' | 'other'
+    model           TEXT NOT NULL,
+    prompt_tokens   INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    cost_micro_usd  INTEGER NOT NULL DEFAULT 0,
+    ts              REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_events_user_ts ON cost_events(user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_cost_events_task ON cost_events(task_id);
 
 -- Sprint 33: per-user quotas. One row per Clerk user (plus
 -- 'admin'/'legacy-admin' for those paths). Plans are name-only;
@@ -1058,6 +1080,104 @@ class Db:
             (project_id,),
         ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ── Sprint 39: LLM cost accounting ─────────────────────────────────────
+
+    def record_cost_event(
+        self,
+        *,
+        user_id: str,
+        kind: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        cost_micro_usd: int,
+        task_id: str | None = None,
+        agent_idx: int | None = None,
+    ) -> None:
+        """Insert one cost event.  Safe to call from background threads;
+        ``self._conn`` is autocommit (sprint-1 default)."""
+        self._conn.execute(
+            "INSERT INTO cost_events "
+            "(user_id, task_id, agent_idx, kind, model, "
+            " prompt_tokens, completion_tokens, total_tokens, cost_micro_usd, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id, task_id, agent_idx, kind, model,
+                prompt_tokens, completion_tokens, total_tokens,
+                cost_micro_usd, time.time(),
+            ),
+        )
+
+    def cost_summary(self, *, user_id: str, since_ts: float) -> dict:
+        """Return aggregated cost for ``user_id`` since ``since_ts``.
+        Shape matches what the BillingScreen consumes:
+
+          {
+            "since_ts": ...,
+            "total_micro_usd": int,
+            "total_tokens": int,
+            "by_kind":  [{kind, total_micro_usd, total_tokens, calls}, ...],
+            "by_model": [{model, total_micro_usd, total_tokens, calls}, ...],
+          }
+        """
+        total_row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_micro_usd), 0), COALESCE(SUM(total_tokens), 0) "
+            "FROM cost_events WHERE user_id=? AND ts >= ?",
+            (user_id, since_ts),
+        ).fetchone()
+        total_micro_usd = int(total_row[0] or 0)
+        total_tokens = int(total_row[1] or 0)
+        by_kind = [
+            {
+                "kind": r[0],
+                "total_micro_usd": int(r[1] or 0),
+                "total_tokens": int(r[2] or 0),
+                "calls": int(r[3] or 0),
+            }
+            for r in self._conn.execute(
+                "SELECT kind, SUM(cost_micro_usd), SUM(total_tokens), COUNT(*) "
+                "FROM cost_events WHERE user_id=? AND ts >= ? GROUP BY kind "
+                "ORDER BY SUM(cost_micro_usd) DESC",
+                (user_id, since_ts),
+            ).fetchall()
+        ]
+        by_model = [
+            {
+                "model": r[0],
+                "total_micro_usd": int(r[1] or 0),
+                "total_tokens": int(r[2] or 0),
+                "calls": int(r[3] or 0),
+            }
+            for r in self._conn.execute(
+                "SELECT model, SUM(cost_micro_usd), SUM(total_tokens), COUNT(*) "
+                "FROM cost_events WHERE user_id=? AND ts >= ? GROUP BY model "
+                "ORDER BY SUM(cost_micro_usd) DESC",
+                (user_id, since_ts),
+            ).fetchall()
+        ]
+        return {
+            "since_ts": since_ts,
+            "total_micro_usd": total_micro_usd,
+            "total_tokens": total_tokens,
+            "by_kind": by_kind,
+            "by_model": by_model,
+        }
+
+    def task_cost(self, task_id: str) -> dict:
+        """Sum cost for one task — used in the per-task billing pill on
+        the task channel."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_micro_usd), 0), COALESCE(SUM(total_tokens), 0), COUNT(*) "
+            "FROM cost_events WHERE task_id=?", (task_id,),
+        ).fetchone()
+        return {
+            "task_id": task_id,
+            "total_micro_usd": int(row[0] or 0),
+            "total_tokens": int(row[1] or 0),
+            "calls": int(row[2] or 0),
+        }
 
     # ── Sprint 38: encrypted per-user credentials ──────────────────────────
 
@@ -2200,6 +2320,41 @@ class Orchestrator:
                     owner = task_row.get("user_id") or "legacy-admin"
                     if elapsed > 0:
                         self.db.add_agent_seconds(owner, elapsed)
+                    # Sprint 39: per-agent LLM cost.  Workers emit
+                    # `usage_tokens` (an OpenAI-shaped {prompt_tokens,
+                    # completion_tokens, total_tokens} dict) and
+                    # `model` in their final result event.  Either may
+                    # be missing — older workers don't ship S39's
+                    # accounting yet, in which case the dashboard shows
+                    # architect-only cost.
+                    usage = result.get("usage_tokens") if isinstance(result, dict) else None
+                    if isinstance(usage, dict) and task_row:
+                        model = (
+                            result.get("model")
+                            or (refreshed_agent.get("model") if refreshed_agent else None)
+                            or "unknown"
+                        )
+                        prompt = int(usage.get("prompt_tokens", 0) or 0)
+                        completion = int(usage.get("completion_tokens", 0) or 0)
+                        total = int(usage.get("total_tokens", prompt + completion) or 0)
+                        if total > 0:
+                            cost = compute_cost_micro_usd(model, prompt, completion)
+                            self.db.record_cost_event(
+                                user_id=owner,
+                                task_id=task_id,
+                                agent_idx=agent_idx,
+                                kind="agent",
+                                model=model,
+                                prompt_tokens=prompt,
+                                completion_tokens=completion,
+                                total_tokens=total,
+                                cost_micro_usd=cost,
+                            )
+                            logger.info(
+                                "agent cost: task=%s agent=%s/%s model=%s tokens=%d cost=%s",
+                                task_id[:8], agent_idx, target_agent["role"],
+                                model, total, format_micro_usd(cost),
+                            )
             except Exception as exc:
                 logger.warning("usage-accounting raised; ignoring: %s", exc)
         # Did this agent fail? Short-circuit the rest of the workflow.
@@ -2993,6 +3148,29 @@ async def submit_task(
             # full template pool, matching pre-Sprint-32 behaviour.
             scope = None if user.source == "admin" else user.id
             templates = db.list_templates(user_id=scope)
+            # Sprint 39: pass a cost recorder so the architect's Red
+            # Pill call surfaces token usage into cost_events.  Per-
+            # agent worker cost is captured separately at result-event
+            # time once workers start reporting `usage_tokens`.
+            def _record_architect_cost(model: str, usage: dict) -> None:
+                prompt = int(usage.get("prompt_tokens", 0) or 0)
+                completion = int(usage.get("completion_tokens", 0) or 0)
+                total = int(usage.get("total_tokens", prompt + completion) or 0)
+                cost = compute_cost_micro_usd(model, prompt, completion)
+                db.record_cost_event(
+                    user_id=user.id,
+                    kind="architect",
+                    model=model,
+                    prompt_tokens=prompt,
+                    completion_tokens=completion,
+                    total_tokens=total,
+                    cost_micro_usd=cost,
+                )
+                logger.info(
+                    "architect call: user=%s model=%s tokens=%d cost=%s",
+                    user.id, model, total, format_micro_usd(cost),
+                )
+
             team_spec = await asyncio.to_thread(
                 architect_team,
                 description=body.description,
@@ -3000,6 +3178,7 @@ async def submit_task(
                 redpill_key=orch.redpill_key,
                 redpill_base=orch.redpill_base,
                 templates=templates,
+                cost_recorder=_record_architect_cost,
             )
             if isinstance(team_spec, dict) and team_spec.get("template_used"):
                 db.touch_template(team_spec["template_used"], user_id=scope)
@@ -3808,6 +3987,34 @@ async def get_shared_template(token: str) -> dict:
 
 
 # ── Sprint 33-rest: Clerk Billing + quotas ────────────────────────────────────
+
+
+@app.get("/billing/cost")
+async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 39: per-period LLM cost for the calling user, broken
+    down by kind (architect / agent / other) and by model.
+
+    The window aligns with the quota period (Sprint 33) so the
+    cost dashboard matches the tasks-this-period counter.  Numbers
+    are estimates — Red Pill bills the orchestrator, not the user
+    directly — but they're computed from real token counts that
+    Red Pill returned in each chat-completions response.
+    """
+    db: Db = state["db"]
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
+    return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
+
+
+@app.get("/tasks/{task_id}/cost")
+async def task_cost(task_id: str, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 39: per-task cost roll-up.  Drives the cost pill on
+    the task channel header."""
+    db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
+    task = db.get_task(task_id, user_id=scope)
+    if task is None:
+        raise HTTPException(404, f"task `{task_id}` not found")
+    return db.task_cost(task_id)
 
 
 @app.get("/billing/usage")

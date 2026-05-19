@@ -23,6 +23,7 @@ class BillingScreen extends StatefulWidget {
 
 class _BillingScreenState extends State<BillingScreen> {
   Future<Map<String, dynamic>>? _usage;
+  Future<Map<String, dynamic>>? _cost;
 
   @override
   void initState() {
@@ -31,7 +32,10 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   void _refresh() {
-    setState(() => _usage = widget.client.billingUsage());
+    setState(() {
+      _usage = widget.client.billingUsage();
+      _cost = widget.client.billingCost();
+    });
   }
 
   /// Derive the Clerk Account Portal URL from the publishable key.
@@ -145,6 +149,8 @@ class _BillingScreenState extends State<BillingScreen> {
                   cap: (data['agent_seconds']?['cap'] as num?)?.toInt() ?? 0,
                   formatter: _formatSeconds,
                 ),
+                const SizedBox(height: 12),
+                _CostCard(future: _cost),
                 const SizedBox(height: 24),
                 Row(
                   children: [
@@ -183,6 +189,180 @@ class _BillingScreenState extends State<BillingScreen> {
     if (s < 60) return '${s}s';
     if (s < 3600) return '${(s / 60).toStringAsFixed(1)}m';
     return '${(s / 3600).toStringAsFixed(1)}h';
+  }
+}
+
+/// Sprint 39: cost breakdown panel — total LLM spend this period
+/// plus per-kind (architect / agent) and per-model splits.  Numbers
+/// are estimates based on the orchestrator's static price table;
+/// real billing is on Red Pill's side and only available there.
+class _CostCard extends StatelessWidget {
+  final Future<Map<String, dynamic>>? future;
+  const _CostCard({required this.future});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2B2D31),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: FutureBuilder<Map<String, dynamic>>(
+        future: future,
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return const SizedBox(
+              height: 80,
+              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+            );
+          }
+          if (snap.hasError) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('LLM cost this period',
+                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                Text(
+                  '${snap.error}',
+                  style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 12),
+                ),
+              ],
+            );
+          }
+          final data = snap.data!;
+          final totalMicro = (data['total_micro_usd'] as num?)?.toInt() ?? 0;
+          final totalTokens = (data['total_tokens'] as num?)?.toInt() ?? 0;
+          final byKind = (data['by_kind'] as List?) ?? const [];
+          final byModel = (data['by_model'] as List?) ?? const [];
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('LLM cost this period',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.baseline,
+                textBaseline: TextBaseline.alphabetic,
+                children: [
+                  Text(
+                    _formatUsd(totalMicro),
+                    style: const TextStyle(
+                      color: Color(0xFF57F287),
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${_thousands(totalTokens)} tokens',
+                    style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 12),
+                  ),
+                ],
+              ),
+              if (byKind.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                const Text('By kind',
+                    style: TextStyle(color: Color(0xFF8E9297), fontSize: 11, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 4),
+                for (final k in byKind.cast<Map<String, dynamic>>())
+                  _CostRow(
+                    label: '${k['kind']}',
+                    micro: (k['total_micro_usd'] as num?)?.toInt() ?? 0,
+                    tokens: (k['total_tokens'] as num?)?.toInt() ?? 0,
+                    calls: (k['calls'] as num?)?.toInt() ?? 0,
+                  ),
+              ],
+              if (byModel.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                const Text('By model',
+                    style: TextStyle(color: Color(0xFF8E9297), fontSize: 11, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 4),
+                for (final m in byModel.cast<Map<String, dynamic>>())
+                  _CostRow(
+                    label: _shortModel('${m['model']}'),
+                    micro: (m['total_micro_usd'] as num?)?.toInt() ?? 0,
+                    tokens: (m['total_tokens'] as num?)?.toInt() ?? 0,
+                    calls: (m['calls'] as num?)?.toInt() ?? 0,
+                  ),
+              ],
+              const SizedBox(height: 10),
+              const Text(
+                'Estimates from orchestrator-side price table. Real billing on Red Pill.',
+                style: TextStyle(color: Color(0xFF6E7378), fontSize: 10),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  static String _formatUsd(int microUsd) {
+    final usd = microUsd / 1_000_000;
+    if (usd >= 0.01) return '\$${usd.toStringAsFixed(2)}';
+    if (usd > 0) return '\$${usd.toStringAsFixed(4)}';
+    return '\$0.00';
+  }
+
+  static String _thousands(int n) {
+    final s = n.toString();
+    final buf = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+      buf.write(s[i]);
+    }
+    return buf.toString();
+  }
+
+  static String _shortModel(String full) {
+    // "meta-llama/llama-3.3-70b-instruct" → "llama-3.3-70b"
+    final slash = full.lastIndexOf('/');
+    var trimmed = slash >= 0 ? full.substring(slash + 1) : full;
+    trimmed = trimmed.replaceAll('-instruct', '');
+    return trimmed;
+  }
+}
+
+class _CostRow extends StatelessWidget {
+  final String label;
+  final int micro;
+  final int tokens;
+  final int calls;
+  const _CostRow({
+    required this.label,
+    required this.micro,
+    required this.tokens,
+    required this.calls,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(color: Color(0xFFC4C9CE), fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _CostCard._formatUsd(micro),
+            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w500),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '$calls call${calls == 1 ? '' : 's'}',
+            style: const TextStyle(color: Color(0xFF8E9297), fontSize: 11),
+          ),
+        ],
+      ),
+    );
   }
 }
 

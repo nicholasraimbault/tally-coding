@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -57,6 +57,7 @@ def architect_team(
     redpill_base: str = "https://api.redpill.ai/v1",
     model: str = ARCHITECT_MODEL,
     templates: list[dict] | None = None,
+    cost_recorder: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """Ask Tally to build a custom team for this task.
 
@@ -78,7 +79,7 @@ def architect_team(
     template_names = {t["name"] for t in (templates or [])}
     prompt = _build_prompt(description, palette, templates or [])
     try:
-        raw = _call_redpill(
+        raw, usage = _call_redpill(
             prompt=prompt,
             redpill_key=redpill_key,
             redpill_base=redpill_base,
@@ -87,6 +88,14 @@ def architect_team(
     except Exception as exc:
         logger.warning("architect Red Pill call failed: %s; using fallback", exc)
         return dict(FALLBACK_TEAM)
+    # Sprint 39: hand the cost back to the caller for accounting.
+    # Recorder is best-effort — accounting failures must not affect
+    # the task pipeline.
+    if cost_recorder is not None and usage:
+        try:
+            cost_recorder(model, usage)
+        except Exception as exc:
+            logger.warning("cost_recorder raised; ignoring: %s", exc)
     parsed = _extract_json(raw)
     if parsed is None:
         logger.warning("architect returned non-JSON output; using fallback. raw[:200]=%r",
@@ -200,10 +209,17 @@ Task: {description}
 Return JSON ONLY."""
 
 
-def _call_redpill(*, prompt: str, redpill_key: str, redpill_base: str, model: str) -> str:
-    """One synchronous chat-completions call. Returns the assistant
-    message content. Stream=False because we want the full response
-    in one shot for JSON parsing."""
+def _call_redpill(
+    *, prompt: str, redpill_key: str, redpill_base: str, model: str
+) -> tuple[str, dict]:
+    """One synchronous chat-completions call. Returns
+    ``(content, usage_dict)`` so the caller can do cost accounting.
+
+    Stream=False because we want the full response in one shot for
+    JSON parsing.  ``usage_dict`` mirrors the OpenAI-compatible shape:
+    ``{prompt_tokens, completion_tokens, total_tokens}``.  Empty dict
+    when the provider omits ``usage`` (older proxies; degraded mode).
+    """
     url = redpill_base.rstrip("/") + "/chat/completions"
     body = {
         "model": model,
@@ -223,7 +239,9 @@ def _call_redpill(*, prompt: str, redpill_key: str, redpill_base: str, model: st
         resp = client.post(url, json=body, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    content = data["choices"][0]["message"]["content"]
+    usage = data.get("usage") or {}
+    return content, usage
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)

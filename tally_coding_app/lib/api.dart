@@ -497,6 +497,20 @@ class TallyOrchClient {
     }
   }
 
+  /// Sprint 39: LLM cost roll-up for the calling user's current period.
+  /// Returns `{since_ts, total_micro_usd, total_tokens, by_kind, by_model}`.
+  Future<Map<String, dynamic>> billingCost() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/billing/cost'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('billing cost failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   /// Sprint 33-rest: usage + plan summary for the calling user.  Drives
   /// the in-app billing screen.  Returns:
   ///   {
