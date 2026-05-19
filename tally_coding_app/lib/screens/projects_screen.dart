@@ -168,6 +168,51 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
       );
       return;
     }
+    // Sprint 38.5 hardening: a project with zero HEAD files is a 400
+    // from the orchestrator.  Catch it client-side with a clear "run
+    // a task first" affordance instead of letting users hit the
+    // generic error.
+    final fileCount = (p['file_count'] as num?)?.toInt() ?? 0;
+    if (fileCount == 0) {
+      final goToGeneral = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF2B2D31),
+          title: const Text('Project is empty',
+              style: TextStyle(color: Colors.white)),
+          content: const Text(
+            "This project has no files in HEAD yet — there's nothing to "
+            "push.  Set it as the active project and submit a task in "
+            "#general so the agents can populate the workspace.  Once "
+            "the task completes, come back here and push.",
+            style: TextStyle(color: Color(0xFFB9BBBE)),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('OK'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF7C5CFC),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Set active + go to #general'),
+            ),
+          ],
+        ),
+      );
+      if (goToGeneral == true) {
+        _setActive(p['id'] as String);
+        if (!mounted) return;
+        // Pop the Projects screen so the user lands back on the
+        // Discord shell with the project already active and the
+        // composer ready.
+        Navigator.of(context).pop();
+      }
+      return;
+    }
     final spec = await showDialog<({String repo, String? branch, String? message})>(
       context: context,
       builder: (ctx) => _PushDialog(projectName: p['name'] as String),
@@ -216,9 +261,26 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
       );
       if (!mounted) return;
       // Auto-select the new project so the user can immediately
-      // submit a task into it.
+      // submit a task into it.  Then surface a snackbar nudging
+      // them to #general — empty projects have nothing to push, so
+      // task-first is the natural next step.
       _setActive(proj['id'] as String);
       _refresh();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            "Project '${proj['name']}' created + set active. Submit a task "
+            "in #general to populate it before pushing.",
+          ),
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(
+            label: 'Go to #general',
+            onPressed: () {
+              if (mounted) Navigator.of(context).pop();
+            },
+          ),
+        ),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));

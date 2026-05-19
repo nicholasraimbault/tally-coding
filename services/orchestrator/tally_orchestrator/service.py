@@ -3630,6 +3630,10 @@ async def push_project_to_github(
             continue
         except GithubPushRepoError as exc:
             # Repo-not-found is terminal — won't fix by switching credential.
+            logger.warning(
+                "push %s via %s: repo error — %s",
+                project_id, source_label, exc,
+            )
             raise HTTPException(404, exc.user_facing)
         except GithubPushError as exc:
             last_other_err = exc
