@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -1592,6 +1592,20 @@ class Db:
             (time.time(), time.time(), user_id),
         )
 
+    def list_quota_rows_due_for_rollover(self, period_seconds: float) -> list[str]:
+        """Sprint 44: return user_ids whose ``period_start`` is older
+        than ``period_seconds`` and that aren't on the practical-
+        infinity ``unlimited`` plan.  Used by the period-rollover
+        sweeper.  Admin / legacy-admin rows are on ``unlimited`` and
+        excluded so the sweeper doesn't churn them every cycle."""
+        cutoff = time.time() - period_seconds
+        rows = self._conn.execute(
+            "SELECT user_id FROM quotas "
+            "WHERE plan != 'unlimited' AND period_start < ?",
+            (cutoff,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
     # ── worker pool state ──────────────────────────────────────────────────
 
     def upsert_active_worker(
@@ -2691,6 +2705,38 @@ class Orchestrator:
         logger.info("task %s team complete: %d agents, %d artifact(s) accumulated",
                     task_id[:8], len(final_agents), artifact_count)
 
+    async def run_period_rollover_sweeper(self) -> None:
+        """Sprint 44: every hour, roll over any quota row whose
+        ``period_start`` is older than 30 days.  Resets
+        ``period_tasks_used`` + ``period_agent_seconds_used`` to 0
+        and bumps ``period_start`` to now.
+
+        Aligns with the comment in ``_period_start_now`` ("30-day
+        rolling window keyed off the user's first task").  Calendar-
+        month or Clerk-subscription-renewal anchored windows would
+        be nicer but require either a cron job or wiring webhooks
+        for renewal events; this is good enough for v1 and runs
+        inside the orchestrator's existing async loop.
+        """
+        period_seconds = float(os.environ.get("TALLY_QUOTA_PERIOD_S", str(30 * 86400)))
+        sweep_interval_s = float(os.environ.get("TALLY_QUOTA_SWEEP_INTERVAL_S", "3600"))
+        while True:
+            try:
+                due = self.db.list_quota_rows_due_for_rollover(period_seconds)
+                if due:
+                    for user_id in due:
+                        self.db.reset_quota_period(user_id)
+                    logger.info(
+                        "period sweeper: rolled over %d quota row(s) (period=%ds)",
+                        len(due), int(period_seconds),
+                    )
+            except Exception as exc:
+                logger.warning("period sweeper raised; ignoring: %s", exc)
+            try:
+                await asyncio.sleep(sweep_interval_s)
+            except asyncio.CancelledError:
+                return
+
     async def run_recovery_sweeper(self) -> None:
         """Sprint 18+19: every 60s, demote any `recovering` row older
         than `TALLY_RECOVERY_TIMEOUT` (default 300s) to `failed`, AND
@@ -3234,52 +3280,89 @@ async def lifespan(app: FastAPI):
         "last_error": None,
     }
 
+    # Sprint 43: retry schedule for the pool bootstrap.  Sequence
+    # repeats indefinitely so the orchestrator self-heals when workers
+    # come back online after an outage.  Last entry is the cap; the
+    # bootstrap stays on the slowest cadence forever rather than
+    # giving up.
+    _retry_delays_s = [60, 300, 900]  # 1 min, 5 min, 15 min
+
     async def _bootstrap_pool_in_background() -> None:
-        try:
-            slots = await _resolve_pool(db, pool, target_pool_size)
-            logger.info(
-                "bootstrapping pool of %d worker(s) in parallel (background)",
-                len(slots),
-            )
-            handles = await asyncio.gather(
-                *[_bootstrap_slot(orchestrator, db, pool, w) for w in slots]
-            )
-            ok = [h for h in handles if h is not None]
-            state["pool_status"]["joined"] = len(ok)
-            if not ok:
-                state["pool_status"]["last_error"] = (
-                    f"no workers bootstrapped (target={target_pool_size})"
+        attempt = 0
+        while not state.get("pool_ready"):
+            attempt += 1
+            try:
+                slots = await _resolve_pool(db, pool, target_pool_size)
+                logger.info(
+                    "bootstrapping pool of %d worker(s) in parallel "
+                    "(background; attempt=%d)",
+                    len(slots), attempt,
                 )
-                logger.error(state["pool_status"]["last_error"]
-                             + "; /tasks will 503 until the next pool attempt")
-                # Don't crash the lifespan — the operator can restart the
-                # worker CVMs without taking the orchestrator down too.
+                handles = await asyncio.gather(
+                    *[_bootstrap_slot(orchestrator, db, pool, w) for w in slots]
+                )
+                ok = [h for h in handles if h is not None]
+                state["pool_status"]["joined"] = len(ok)
+                if not ok:
+                    state["pool_status"]["last_error"] = (
+                        f"no workers bootstrapped (target={target_pool_size}; "
+                        f"attempt={attempt})"
+                    )
+                    logger.error(
+                        "%s; sleeping %ds before retry",
+                        state["pool_status"]["last_error"],
+                        _retry_delays_s[min(attempt - 1, len(_retry_delays_s) - 1)],
+                    )
+                    # Sprint 43: don't crash, don't give up — sleep and
+                    # try again.  Backoff caps at the last entry.
+                    delay = _retry_delays_s[min(attempt - 1, len(_retry_delays_s) - 1)]
+                    await asyncio.sleep(delay)
+                    continue
+                if len(ok) < target_pool_size:
+                    logger.warning(
+                        "only %d/%d workers bootstrapped; running degraded",
+                        len(ok), target_pool_size,
+                    )
+                for h in ok:
+                    orchestrator.start_poller(h)
+                # Processor loop dispatches tasks to workers; only starts
+                # now that handles exist.
+                state["processor_task"] = asyncio.create_task(
+                    orchestrator.run_processor_loop()
+                )
+                state["pool_ready"] = True
+                state["pool_status"]["last_error"] = None  # clear on success
+                logger.info(
+                    "pool ready (attempt=%d): %d worker(s) joined; "
+                    "processor loop running",
+                    attempt, len(orchestrator.handles),
+                )
                 return
-            if len(ok) < target_pool_size:
-                logger.warning(
-                    "only %d/%d workers bootstrapped; running degraded",
-                    len(ok), target_pool_size,
+            except asyncio.CancelledError:
+                # Shutdown — propagate cleanly so the lifespan finalizer
+                # gets the cancellation it expects.
+                raise
+            except Exception as exc:
+                state["pool_status"]["last_error"] = repr(exc)
+                logger.exception(
+                    "pool bootstrap raised (attempt=%d); sleeping before retry: %s",
+                    attempt, exc,
                 )
-            for h in ok:
-                orchestrator.start_poller(h)
-            # Processor loop dispatches tasks to workers; only starts now
-            # that handles exist.
-            state["processor_task"] = asyncio.create_task(
-                orchestrator.run_processor_loop()
-            )
-            state["pool_ready"] = True
-            logger.info(
-                "pool ready: %d worker(s) joined; processor loop running",
-                len(orchestrator.handles),
-            )
-        except Exception as exc:
-            state["pool_status"]["last_error"] = repr(exc)
-            logger.exception("pool bootstrap raised: %s", exc)
+                delay = _retry_delays_s[min(attempt - 1, len(_retry_delays_s) - 1)]
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
 
     # Sweeper + backup don't depend on workers — start them eagerly so
     # the recovery clock keeps ticking even during a pool outage.
     sweeper_task = asyncio.create_task(orchestrator.run_recovery_sweeper())
     state["sweeper_task"] = sweeper_task
+    # Sprint 44: hourly quota-period rollover so paying users don't stay
+    # capped at "this period" forever.
+    state["quota_sweeper_task"] = asyncio.create_task(
+        orchestrator.run_period_rollover_sweeper()
+    )
     backup_task = asyncio.create_task(run_nightly_backup())  # Sprint 24.5
     state["backup_task"] = backup_task
     state["pool_bootstrap_task"] = asyncio.create_task(_bootstrap_pool_in_background())
@@ -3296,7 +3379,7 @@ async def lifespan(app: FastAPI):
         # Sprint 35: processor_task only exists after pool bootstrap; the
         # bootstrap task itself might still be in flight if shutdown
         # arrives during a redeploy window.  Cancel whatever's set.
-        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "backup_task"):
+        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task"):
             t = state.get(key)
             if t is None:
                 continue
@@ -3308,6 +3391,170 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Tally Orchestrator", lifespan=lifespan)
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """Sprint 45: Prometheus-format metrics endpoint.
+
+    Public (no auth) so any scrape pipeline can pull without
+    juggling a bearer token.  Numbers are point-in-time SQL
+    aggregates — cheap on the order of milliseconds even with
+    thousands of rows because we lean on the existing indices.
+
+    Exposed series (alphabetical):
+
+      - tally_cost_micro_usd_total{kind=architect|agent|other}
+      - tally_pool_joined            (gauge)
+      - tally_pool_ready             (gauge 0/1)
+      - tally_pool_target            (gauge)
+      - tally_quota_exceeded_total   (counter, summed across users)
+      - tally_tasks_total{status=pending|running|recovering|completed|failed}
+      - tally_workers_active         (gauge)
+
+    Operators wire these into Grafana / Datadog / vendor-of-choice.
+    No labels carry user_id — privacy + cardinality both win.
+    """
+    db: Db = state["db"]
+    pool_status = state.get("pool_status") or {}
+    lines: list[str] = []
+
+    def _add(name: str, help_text: str, kind: str, samples: list[tuple[dict, float]]) -> None:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        for labels, value in samples:
+            label_str = (
+                "{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}"
+                if labels else ""
+            )
+            lines.append(f"{name}{label_str} {value}")
+
+    _add(
+        "tally_pool_ready", "1 when at least one worker joined and the processor loop is running",
+        "gauge", [({}, 1 if state.get("pool_ready") else 0)],
+    )
+    _add(
+        "tally_pool_target", "Desired pool size from TALLY_POOL_SIZE.",
+        "gauge", [({}, pool_status.get("target_size", 0))],
+    )
+    _add(
+        "tally_pool_joined", "Workers that completed MLS bootstrap this attempt.",
+        "gauge", [({}, pool_status.get("joined", 0))],
+    )
+
+    # Task counts by status — one indexed SELECT.
+    rows = db._conn.execute(
+        "SELECT status, COUNT(*) FROM tasks GROUP BY status"
+    ).fetchall()
+    _add(
+        "tally_tasks_total", "Total tasks broken down by status.",
+        "gauge", [({"status": r[0]}, r[1]) for r in rows] or [({"status": "none"}, 0)],
+    )
+
+    # Cost totals by kind.
+    rows = db._conn.execute(
+        "SELECT kind, COALESCE(SUM(cost_micro_usd), 0) FROM cost_events GROUP BY kind"
+    ).fetchall()
+    _add(
+        "tally_cost_micro_usd_total",
+        "Cumulative LLM cost in micro-USD broken down by call kind.",
+        "counter",
+        [({"kind": r[0]}, r[1]) for r in rows] or [({"kind": "none"}, 0)],
+    )
+
+    # Workers active.
+    workers_active = len(db.list_active_workers())
+    _add(
+        "tally_workers_active", "Workers in `active` state in the worker pool DB.",
+        "gauge", [({}, workers_active)],
+    )
+
+    # Quota-exceeded counter.  Approximation: count rows where used >= cap.
+    # The actual 429 event count would need its own counter table; this
+    # gauge tells operators "N users are at their cap right now."
+    rows = db._conn.execute(
+        "SELECT COUNT(*) FROM quotas WHERE period_tasks_used >= 25 AND plan = 'free'"
+    ).fetchall()
+    _add(
+        "tally_quota_at_cap_users", "Users whose period_tasks_used >= free-tier cap (25).",
+        "gauge", [({}, rows[0][0] if rows else 0)],
+    )
+
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+@app.get("/admin/alerts", dependencies=[Depends(require_token)])
+async def admin_alerts() -> dict:
+    """Sprint 45: hand-rolled summary of operational concerns the
+    operator should look at right now.  Cheaper than wiring full
+    Grafana alerts; lets the operator pipe ``curl /admin/alerts | jq``
+    into a Slack notifier or whatever.  Admin-only since the
+    error-string field could leak internal details.
+
+    Each entry: ``{severity, code, message, value}`` where severity
+    is ``info | warn | crit``.
+    """
+    db: Db = state["db"]
+    pool_status = state.get("pool_status") or {}
+    alerts: list[dict] = []
+
+    if not state.get("pool_ready"):
+        sev = "crit" if pool_status.get("last_error") else "warn"
+        alerts.append({
+            "severity": sev,
+            "code": "pool_not_ready",
+            "message": "Worker pool not ready; /tasks is 503'ing.",
+            "value": pool_status.get("last_error") or "still bootstrapping",
+        })
+
+    cb: ClerkBillingClient | None = state.get("clerk_billing")  # type: ignore
+    if cb is not None and not cb.webhook_enabled:
+        alerts.append({
+            "severity": "info",
+            "code": "clerk_webhook_unset",
+            "message": "CLERK_WEBHOOK_SECRET unset; /webhooks/clerk will 503.",
+            "value": None,
+        })
+
+    cm: CredentialsManager | None = state.get("credentials")  # type: ignore
+    if cm is not None and not cm.configured:
+        alerts.append({
+            "severity": "info",
+            "code": "credentials_key_unset",
+            "message": "CREDENTIALS_KEY unset; /github/* routes will 503.",
+            "value": None,
+        })
+
+    backed = state.get("clerk_backend")
+    if backed is not None and not backed.configured:  # type: ignore[union-attr]
+        alerts.append({
+            "severity": "info",
+            "code": "clerk_secret_key_unset",
+            "message": "CLERK_SECRET_KEY unset; project push falls back to PAT-only.",
+            "value": None,
+        })
+
+    # Tasks stuck in `recovering` for > 1h indicate a worker that
+    # silently stopped sending result events.
+    cutoff = time.time() - 3600
+    stuck = db._conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status='recovering' AND updated_at < ?",
+        (cutoff,),
+    ).fetchone()
+    if stuck and stuck[0] > 0:
+        alerts.append({
+            "severity": "warn",
+            "code": "tasks_stuck_recovering",
+            "message": "Tasks stuck in `recovering` for >1h — workers may be silently dropping result events.",
+            "value": stuck[0],
+        })
+
+    # Pool bootstrap last_error sticky → surface for retry-not-yet-succeeded state.
+    if pool_status.get("last_error") and state.get("pool_ready"):
+        # Cleared after success; this is here for completeness.
+        pass
+
+    return {"alerts": alerts, "count": len(alerts)}
 
 
 @app.get("/health")
