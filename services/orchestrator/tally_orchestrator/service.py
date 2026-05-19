@@ -187,6 +187,26 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
 
+-- Sprint 41: multi-task workflows.  A child task can name a parent
+-- task whose final artifacts seed the child's first-agent workspace
+-- (overrides the project's HEAD seed when both are present).  Tasks
+-- can have one parent and zero-or-more children — together this
+-- forms a DAG users + architects can navigate as a single "thread
+-- of work".  Tasks without a parent_task_id behave exactly as
+-- pre-S41 (free-standing or project-rooted).
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    parent_task_id TEXT NOT NULL,
+    child_task_id  TEXT NOT NULL,
+    created_at     REAL NOT NULL,
+    PRIMARY KEY (parent_task_id, child_task_id),
+    FOREIGN KEY (parent_task_id) REFERENCES tasks(id),
+    FOREIGN KEY (child_task_id)  REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_deps_parent
+    ON task_dependencies(parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_child
+    ON task_dependencies(child_task_id);
+
 -- Sprint 37: persistent project workspaces.  A user can group tasks
 -- under a project; the project's HEAD artifact set seeds the first
 -- agent of every task in the project, and successful task artifacts
@@ -320,6 +340,11 @@ class TaskSubmit(BaseModel):
     # first agent's workspace seeds from the project's HEAD artifact
     # set, and final task artifacts merge back into HEAD on success.
     project_id: str | None = None
+    # Sprint 41: optional parent task — the new child task's first
+    # agent inherits the parent's final artifact set as seed_files
+    # (takes priority over project HEAD).  Lets users branch from a
+    # completed task without needing the project to be the same.
+    parent_task_id: str | None = None
 
 
 class TaskResponse(BaseModel):
@@ -338,6 +363,11 @@ class TaskResponse(BaseModel):
     user_id: str = "legacy-admin"
     # Sprint 37: persistent project the task belongs to (nullable).
     project_id: str | None = None
+    # Sprint 41: parent task (set via the parent_task_id input).  Surfaced
+    # so the Flutter shell can render a "branched from <task>" pill.
+    parent_task_id: str | None = None
+    # Sprint 41: direct children's task ids in created-at order.
+    child_task_ids: list[str] = []
 
 
 class Db:
@@ -1074,6 +1104,36 @@ class Db:
         ).fetchone()
         return self._template_row_to_dict(row) if row else None
 
+    # ── Sprint 41: task DAG (parent → child) helpers ────────────────────────
+
+    def link_tasks(self, *, parent_task_id: str, child_task_id: str) -> None:
+        """Record the parent → child edge.  Idempotent — re-linking is
+        a no-op since the PK absorbs duplicates."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO task_dependencies "
+            "(parent_task_id, child_task_id, created_at) VALUES (?, ?, ?)",
+            (parent_task_id, child_task_id, time.time()),
+        )
+
+    def get_parent_task_id(self, task_id: str) -> str | None:
+        """Return the parent_task_id for a child task (if any).  A
+        task has at most one parent in our model."""
+        row = self._conn.execute(
+            "SELECT parent_task_id FROM task_dependencies "
+            "WHERE child_task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def list_child_task_ids(self, parent_task_id: str) -> list[str]:
+        """Return all direct children of a task in created-at order."""
+        rows = self._conn.execute(
+            "SELECT child_task_id FROM task_dependencies "
+            "WHERE parent_task_id = ? ORDER BY created_at",
+            (parent_task_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
+
     # ── Sprint 37: persistent project workspaces ────────────────────────────
 
     @staticmethod
@@ -1772,34 +1832,56 @@ class Orchestrator:
         self._task_artifacts: dict[str, dict[str, str]] = {}
 
     def _seed_files_for_task(self, task: dict) -> dict[str, str]:
-        """Sprint 37: return the seed_files snapshot to hand to the
+        """Sprint 37/41: return the seed_files snapshot to hand to the
         next agent of ``task``.
 
-        - Sequence-aware: subsequent agents in a sequential workflow
-          see the cumulative ``_task_artifacts[task_id]`` (Sprint 26).
-        - Project-aware: the very first agent on a project-scoped task
-          (no entries yet in ``_task_artifacts``) is seeded with the
-          project's HEAD snapshot, so the team starts from the real
-          working codebase instead of an empty workspace.
-        - Free-tier-safe: if the project is missing or has no
-          artifacts yet, we fall through to the empty dict.
+        Hydration priority (highest wins):
+          1. In-memory ``_task_artifacts[task_id]`` if any predecessor
+             agent already ran in this task (Sprint 26 contract).
+          2. Sprint 41: parent task's final artifacts when the task
+             has a ``task_dependencies`` row pointing at a successful
+             parent.  Lets the architect chain tasks — child builds
+             on parent's output, not a generic project HEAD.
+          3. Sprint 37: project HEAD when the task belongs to a project
+             AND has no parent.  Lets users iterate on a codebase
+             across multiple Tally runs.
+          4. Empty dict otherwise.
         """
         existing = self._task_artifacts.get(task["id"])
         if existing:
             return existing
+        task_id = task["id"]
+
+        # Path 2: parent-task inheritance (Sprint 41).
+        parent_id = self.db.get_parent_task_id(task_id)
+        if parent_id:
+            parent_task = self.db.get_task(parent_id)
+            if parent_task and parent_task.get("status") == "completed":
+                # Read parent's final artifacts from the durable
+                # ``task_artifacts`` table.  These were captured by
+                # ``upsert_artifacts`` at parent run time and persist
+                # for the lifetime of the parent task.
+                seed = self.db.load_artifacts(parent_id)
+                if seed:
+                    self._task_artifacts[task_id] = dict(seed)
+                    logger.info(
+                        "task %s: hydrated %d file(s) from parent task=%s",
+                        task_id[:8], len(seed), parent_id[:8],
+                    )
+                    return seed
+
+        # Path 3: project HEAD (Sprint 37).
         project_id = task.get("project_id")
-        if not project_id:
-            return {}
-        seed = self.db.load_project_artifacts(project_id)
-        if seed:
-            # Cache the in-memory copy so subsequent agents pick it up
-            # via the same dict (and the per-agent merge layers cleanly).
-            self._task_artifacts[task["id"]] = dict(seed)
-            logger.info(
-                "task %s: hydrated %d file(s) from project=%s HEAD",
-                task["id"][:8], len(seed), project_id,
-            )
-            return seed
+        if project_id:
+            seed = self.db.load_project_artifacts(project_id)
+            if seed:
+                self._task_artifacts[task_id] = dict(seed)
+                logger.info(
+                    "task %s: hydrated %d file(s) from project=%s HEAD",
+                    task_id[:8], len(seed), project_id,
+                )
+                return seed
+
         return {}
 
     # ── handle lifecycle ──────────────────────────────────────────────────
@@ -2594,7 +2676,14 @@ class Orchestrator:
                     "task %s: merged %d file(s) into project=%s HEAD",
                     task_id[:8], artifact_count, project_id,
                 )
-        self.db.delete_artifacts(task_id)  # Sprint 26.5: free durable copy
+            # Sprint 41: keep the durable task_artifacts row around
+            # for SUCCESSFUL tasks — they're the snapshot that child
+            # tasks hydrate from in `_seed_files_for_task`.  Storage
+            # cost is bounded by the artifact-size caps from Sprint 26.
+            # Failed tasks still get cleaned up below since their
+            # artifacts shouldn't seed anything.
+        else:
+            self.db.delete_artifacts(task_id)  # free durable copy on failure
         await self._publish_status(
             task_id, "completed",
             {"success": aggregate["success"], "agents_run": len(final_agents)},
@@ -3379,6 +3468,23 @@ async def submit_task(
             raise HTTPException(
                 404, f"project `{body.project_id}` not found or not owned by you",
             )
+    # Sprint 41: validate parent_task_id.  Parent must exist + be
+    # owned by the caller (or the caller must be admin) + be in a
+    # state that's safe to inherit from (completed; in-flight parents
+    # would race the child's seed hydration).
+    if body.parent_task_id is not None:
+        parent_scope = None if user.source == "admin" else user.id
+        parent = db.get_task(body.parent_task_id, user_id=parent_scope)
+        if parent is None:
+            raise HTTPException(
+                404, f"parent task `{body.parent_task_id}` not found or not owned by you",
+            )
+        if parent.get("status") != "completed":
+            raise HTTPException(
+                400,
+                f"parent task `{body.parent_task_id}` has status "
+                f"`{parent.get('status')}`; only completed tasks can seed a child.",
+            )
     # Atomic insert with team_spec attached — no race window for the
     # processor to pick the task up as single-agent before team_spec
     # lands.
@@ -3388,8 +3494,19 @@ async def submit_task(
         user_id=user.id,
         project_id=body.project_id,
     )
+    if body.parent_task_id is not None:
+        db.link_tasks(parent_task_id=body.parent_task_id, child_task_id=task_id)
+        logger.info(
+            "task %s linked as child of parent=%s",
+            task_id[:8], body.parent_task_id[:8],
+        )
     db.increment_task_count(user.id)
     task = db.get_task(task_id)
+    # Enrich the response with the parent/children edges so the
+    # Flutter shell can render the relationship without an extra round
+    # trip.
+    task["parent_task_id"] = db.get_parent_task_id(task_id)
+    task["child_task_ids"] = db.list_child_task_ids(task_id)
     return TaskResponse(**task)
 
 
@@ -3399,9 +3516,13 @@ async def get_task(
     user: ClerkUser = Depends(require_user),
 ) -> TaskResponse:
     scope = None if user.source == "admin" else user.id
-    task = state["db"].get_task(task_id, user_id=scope)
+    db: Db = state["db"]
+    task = db.get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
+    # Sprint 41: enrich with parent + children edges.
+    task["parent_task_id"] = db.get_parent_task_id(task_id)
+    task["child_task_ids"] = db.list_child_task_ids(task_id)
     return TaskResponse(**task)
 
 

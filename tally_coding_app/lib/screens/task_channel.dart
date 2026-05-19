@@ -168,12 +168,46 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
             trailing: t == null ? null : _HeaderTrailing(
               task: t,
               onSaveTemplate: () => _promptSaveTemplate(t),
+              onBranch: () => _promptBranch(t),
             ),
           ),
           Expanded(child: _body(t)),
         ],
       ),
     );
+  }
+
+  /// Sprint 41: branch off a completed task — submit a new task whose
+  /// first agent inherits the parent's artifacts as seed_files.
+  Future<void> _promptBranch(Task parent) async {
+    final desc = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _BranchTaskDialog(parent: parent),
+    );
+    if (desc == null || desc.trim().isEmpty || !mounted) return;
+    try {
+      final child = await widget.client.submitTask(
+        desc.trim(),
+        parentTaskId: parent.id,
+        projectId: parent.projectId,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Branched: new task #${child.id.substring(0, 8)} inherits '
+            '${parent.id.substring(0, 8)}\'s workspace.',
+          ),
+          backgroundColor: const Color(0xFF57F287),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$e')),
+      );
+    }
   }
 
   Future<void> _promptSaveTemplate(Task t) async {
@@ -789,19 +823,32 @@ class _BlinkingCursorState extends State<_BlinkingCursor> with SingleTickerProvi
       );
 }
 
-/// Sprint 29: header trailing controls — status badge + "save this team"
-/// bookmark for completed multi-agent tasks.
+/// Sprint 29/41: header trailing controls — branch-this-task button
+/// (S41) + "save this team" bookmark (S29) + status badge.  Both
+/// action buttons are visible only on completed tasks.
 class _HeaderTrailing extends StatelessWidget {
   final Task task;
   final VoidCallback onSaveTemplate;
-  const _HeaderTrailing({required this.task, required this.onSaveTemplate});
+  final VoidCallback onBranch;
+  const _HeaderTrailing({
+    required this.task,
+    required this.onSaveTemplate,
+    required this.onBranch,
+  });
 
   @override
   Widget build(BuildContext context) {
     final canSave = task.isTerminal && task.teamSpec != null;
+    final canBranch = task.status == 'completed';
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (canBranch)
+          IconButton(
+            tooltip: 'Branch a new task from this one (inherits the workspace)',
+            icon: const Icon(Icons.fork_right, size: 18, color: Color(0xFF8E9297)),
+            onPressed: onBranch,
+          ),
         if (canSave)
           IconButton(
             tooltip: 'Save this team as a template',
@@ -810,6 +857,73 @@ class _HeaderTrailing extends StatelessWidget {
             onPressed: onSaveTemplate,
           ),
         _StatusBadge(status: task.status),
+      ],
+    );
+  }
+}
+
+class _BranchTaskDialog extends StatefulWidget {
+  final Task parent;
+  const _BranchTaskDialog({required this.parent});
+
+  @override
+  State<_BranchTaskDialog> createState() => _BranchTaskDialogState();
+}
+
+class _BranchTaskDialogState extends State<_BranchTaskDialog> {
+  final _ctrl = TextEditingController();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF2B2D31),
+      title: const Text('Branch a new task', style: TextStyle(color: Colors.white)),
+      content: SizedBox(
+        width: 480,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'The new task\'s first agent will start with the same '
+              'workspace this task ended with.  Describe what should happen next.',
+              style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Parent: ${widget.parent.description}',
+              style: const TextStyle(color: Color(0xFF8E9297), fontSize: 11),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _ctrl,
+              autofocus: true,
+              maxLines: 5,
+              minLines: 3,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: 'New task description',
+                labelStyle: TextStyle(color: Color(0xFFB9BBBE)),
+                alignLabelWithHint: true,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+        ElevatedButton(
+          onPressed: () => Navigator.of(context).pop(_ctrl.text),
+          child: const Text('Branch'),
+        ),
       ],
     );
   }

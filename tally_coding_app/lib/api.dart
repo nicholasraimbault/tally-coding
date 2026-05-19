@@ -22,6 +22,11 @@ class Task {
   final Map<String, dynamic>? teamSpec;
   /// Sprint 37: persistent-project id (null on one-off tasks).
   final String? projectId;
+  /// Sprint 41: parent task id (null when this task isn't branched
+  /// off a previous one).  Surfaced as a "branched from <task>" pill.
+  final String? parentTaskId;
+  /// Sprint 41: ids of direct children (tasks branched off this one).
+  final List<String> childTaskIds;
 
   Task({
     required this.id,
@@ -33,6 +38,8 @@ class Task {
     required this.updatedAt,
     this.teamSpec,
     this.projectId,
+    this.parentTaskId,
+    this.childTaskIds = const [],
   });
 
   factory Task.fromJson(Map<String, dynamic> j) => Task(
@@ -45,6 +52,8 @@ class Task {
         updatedAt: (j['updated_at'] as num).toDouble(),
         teamSpec: j['team_spec'] as Map<String, dynamic>?,
         projectId: j['project_id'] as String?,
+        parentTaskId: j['parent_task_id'] as String?,
+        childTaskIds: ((j['child_task_ids'] as List?) ?? const []).cast<String>(),
       );
 
   bool get isTerminal => status == 'completed' || status == 'failed';
@@ -120,6 +129,7 @@ class TallyOrchClient {
     String description, {
     Map<String, dynamic>? teamSpec,
     String? projectId,
+    String? parentTaskId,
   }) async {
     final resp = await _http.post(
       baseUrl.resolve('/tasks'),
@@ -128,6 +138,7 @@ class TallyOrchClient {
         'description': description,
         if (teamSpec != null) 'team_spec': teamSpec,
         if (projectId != null) 'project_id': projectId,
+        if (parentTaskId != null) 'parent_task_id': parentTaskId,
       }),
     );
     _checkAuth(resp);
