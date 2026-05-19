@@ -31,16 +31,16 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
   bool _submitting = false;
   String? _error;
 
-  Future<void> _submit() async {
-    final desc = _ctrl.text.trim();
+  Future<void> _submit({String? overrideDescription, Map<String, dynamic>? teamSpec}) async {
+    final desc = (overrideDescription ?? _ctrl.text).trim();
     if (desc.isEmpty || _submitting) return;
     setState(() {
       _submitting = true;
       _error = null;
     });
     try {
-      final t = await widget.client.submitTask(desc);
-      _ctrl.clear();
+      final t = await widget.client.submitTask(desc, teamSpec: teamSpec);
+      if (overrideDescription == null) _ctrl.clear();
       if (!mounted) return;
       setState(() => _submitting = false);
       widget.onTaskSubmitted(t);
@@ -65,7 +65,14 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
             description: 'Describe what to build. Tally picks the team.',
           ),
           Expanded(
-            child: _GeneralFeed(recentTasks: widget.recentTasks),
+            child: _GeneralFeed(
+              recentTasks: widget.recentTasks,
+              submitting: _submitting,
+              onTryExample: (e) => _submit(
+                overrideDescription: e.description,
+                teamSpec: e.teamSpec,
+              ),
+            ),
           ),
           _Composer(
             controller: _ctrl,
@@ -79,11 +86,102 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
   }
 }
 
+/// Sprint 36: example task a new user can try with one tap.  Each
+/// example carries a hand-picked team_spec so the user gets to see a
+/// successful end-to-end run without having to write a prompt
+/// themselves.  Cards only show when the user has zero prior tasks.
+class _Example {
+  final String emoji;
+  final String title;
+  final String subtitle;
+  final String description;
+  final Map<String, dynamic> teamSpec;
+  const _Example({
+    required this.emoji,
+    required this.title,
+    required this.subtitle,
+    required this.description,
+    required this.teamSpec,
+  });
+}
+
+const _examples = <_Example>[
+  _Example(
+    emoji: '👋',
+    title: 'Hello world (Python)',
+    subtitle: '1 agent · ~30 s · the gentlest possible smoke test',
+    description:
+        'Write hello.py that prints "hello, world" and verify it runs.',
+    teamSpec: {
+      'agents': [
+        {'role': 'Coder', 'model': 'meta-llama/llama-3.3-70b-instruct'},
+      ],
+      'workflow': 'Coder',
+      'reasoning':
+          'Tiny self-contained task — one Coder is plenty. Picked as a free-tier '
+              'onboarding example so you can see the agent timeline end-to-end '
+              'without burning quota.',
+    },
+  ),
+  _Example(
+    emoji: '✅',
+    title: 'React TODO list',
+    subtitle: '2 agents · ~3 min · code + review',
+    description:
+        'Build a single-file React TODO list component with add, mark-complete, '
+        'and delete. Use functional components + useState. Include a quick '
+        'render-test to confirm it builds.',
+    teamSpec: {
+      'agents': [
+        {'role': 'Coder', 'model': 'meta-llama/llama-3.3-70b-instruct'},
+        {'role': 'Reviewer', 'model': 'meta-llama/llama-3.3-70b-instruct'},
+      ],
+      'workflow': 'Coder -> Reviewer',
+      'reasoning':
+          'Coder writes the component; Reviewer catches missing keys, accessibility '
+              'issues, and obvious React anti-patterns before the artifact lands.',
+    },
+  ),
+  _Example(
+    emoji: '📋',
+    title: 'Document a small codebase',
+    subtitle: '2 agents · ~4 min · planner + docs',
+    description:
+        'Write a small Python utility that reads a directory of markdown files '
+        'and prints a flat index, then produce README.md describing how the '
+        'tool works and how to extend it.',
+    teamSpec: {
+      'agents': [
+        {'role': 'Planner', 'model': 'meta-llama/llama-3.3-70b-instruct'},
+        {'role': 'DocWriter', 'model': 'meta-llama/llama-3.3-70b-instruct'},
+      ],
+      'workflow': 'Planner -> DocWriter',
+      'reasoning':
+          'Planner outlines the tool + the README structure; DocWriter writes both. '
+              "Mirrors the workflow you'd reach for on a real internal-doc task.",
+    },
+  ),
+];
+
 /// Renders recent tasks as Tally's responses. Oldest first (chat scroll),
-/// keeps the welcome message at the top.
+/// keeps the welcome message at the top. Sprint 36: when the user has
+/// zero tasks, shows three "Try this" example cards beneath the welcome.
 class _GeneralFeed extends StatelessWidget {
   final List<Task> recentTasks;
-  const _GeneralFeed({required this.recentTasks});
+  final bool submitting;
+  final void Function(_Example) onTryExample;
+  const _GeneralFeed({
+    required this.recentTasks,
+    required this.submitting,
+    required this.onTryExample,
+  });
+
+  /// Dev affordance: `--dart-define=TALLY_FORCE_ONBOARDING=true` shows the
+  /// example cards even when the user has prior tasks.  Useful for taking
+  /// screenshots, verifying layout, and demoing the onboarding flow to a
+  /// non-fresh account.  No effect on production builds (defaults false).
+  static const bool _forceOnboarding =
+      bool.fromEnvironment('TALLY_FORCE_ONBOARDING', defaultValue: false);
 
   @override
   Widget build(BuildContext context) {
@@ -91,10 +189,19 @@ class _GeneralFeed extends StatelessWidget {
     // message is at the bottom (Discord-style).
     final chronological = [...recentTasks]
       ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final isFirstTime = _forceOnboarding || recentTasks.isEmpty;
     return ListView(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
       children: [
         const _WelcomeMessage(),
+        if (isFirstTime) ...[
+          const SizedBox(height: 16),
+          _OnboardingExamples(
+            examples: _examples,
+            submitting: submitting,
+            onTry: onTryExample,
+          ),
+        ],
         const SizedBox(height: 24),
         for (final t in chronological) ...[
           _UserSubmission(task: t),
@@ -105,6 +212,113 @@ class _GeneralFeed extends StatelessWidget {
           const SizedBox(height: 16),
         ],
       ],
+    );
+  }
+}
+
+class _OnboardingExamples extends StatelessWidget {
+  final List<_Example> examples;
+  final bool submitting;
+  final void Function(_Example) onTry;
+  const _OnboardingExamples({
+    required this.examples,
+    required this.submitting,
+    required this.onTry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.only(left: 4, bottom: 8),
+          child: Text(
+            'Try one of these to see a real multi-agent run:',
+            style: TextStyle(
+              color: Color(0xFFB9BBBE),
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        for (final e in examples) ...[
+          _ExampleCard(example: e, submitting: submitting, onTap: () => onTry(e)),
+          const SizedBox(height: 8),
+        ],
+      ],
+    );
+  }
+}
+
+class _ExampleCard extends StatelessWidget {
+  final _Example example;
+  final bool submitting;
+  final VoidCallback onTap;
+  const _ExampleCard({
+    required this.example,
+    required this.submitting,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: submitting ? null : onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF2B2D31),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFF1E1F22)),
+        ),
+        child: Row(
+          children: [
+            Text(example.emoji, style: const TextStyle(fontSize: 28)),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    example.title,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    example.subtitle,
+                    style: const TextStyle(color: Color(0xFF99AAB5), fontSize: 11),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    example.description,
+                    style: const TextStyle(
+                      color: Color(0xFFC4C9CE),
+                      fontSize: 12,
+                      height: 1.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton(
+              onPressed: submitting ? null : onTap,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF7C5CFC),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              ),
+              child: const Text('Try this'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
