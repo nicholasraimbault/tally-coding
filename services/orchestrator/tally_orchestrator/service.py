@@ -51,6 +51,7 @@ from .clerk_auth import (
     User as ClerkUser,
     looks_like_jwt as clerk_looks_like_jwt,
 )
+from .stripe_billing import BillingClient
 import jwt
 from .worker_pool import WorkerPool
 
@@ -154,7 +155,52 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
+
+-- Sprint 33: per-user quotas. One row per Clerk user (plus
+-- 'admin'/'legacy-admin' for those paths). Plans are name-only;
+-- the caps come from the QUOTA_PLANS dict in service.py — keeps the
+-- table simple and lets us tune caps without a migration.
+CREATE TABLE IF NOT EXISTS quotas (
+    user_id                       TEXT PRIMARY KEY,
+    plan                          TEXT NOT NULL DEFAULT 'free',
+    stripe_customer_id            TEXT,           -- nullable until first checkout
+    stripe_subscription_id        TEXT,           -- nullable for free tier
+    period_start                  REAL NOT NULL,  -- unix ts of current billing period
+    period_tasks_used             INTEGER NOT NULL DEFAULT 0,
+    period_agent_seconds_used     INTEGER NOT NULL DEFAULT 0,
+    updated_at                    REAL NOT NULL
+);
 """
+
+# Sprint 33: plan caps. Keep them in code, not the DB, so tuning is a
+# one-liner deploy. `tasks` is the *count of tasks the user has
+# submitted this billing period*; `agent_seconds` is the cumulative
+# wall-time worker-side compute, tracked from result events. Either
+# cap hit → POST /tasks returns 429.
+QUOTA_PLANS = {
+    "free": {
+        "tasks": 25,
+        "agent_seconds": 1800,   # 30 min/mo
+        "label": "Free",
+    },
+    "pro": {
+        "tasks": 500,
+        "agent_seconds": 36_000,  # 10 h/mo
+        "label": "Pro",
+    },
+    "team": {
+        "tasks": 5000,
+        "agent_seconds": 360_000,  # 100 h/mo
+        "label": "Team",
+    },
+    # Admin path bypasses caps; we still surface a row with practical
+    # infinity so /billing/usage doesn't 500 on the admin user.
+    "unlimited": {
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+        "label": "Unlimited (admin)",
+    },
+}
 
 
 def b64url_no_pad(data: bytes) -> str:
@@ -700,6 +746,99 @@ class Db:
             "SELECT DISTINCT task_id FROM task_artifacts"
         ).fetchall()
         return [r[0] for r in rows]
+
+    # ── Sprint 33: quotas ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _period_start_now() -> float:
+        """A 30-day rolling window keyed off the user's first task.
+        Trivial to swap for calendar-month or Stripe billing-period
+        windows later; today we want simple-and-correct enforcement."""
+        return time.time()
+
+    def get_or_create_quota(self, user_id: str) -> dict:
+        """Idempotent. Default plan: 'unlimited' for admin/legacy-admin
+        (so they never trip caps), 'free' for everyone else."""
+        row = self._conn.execute(
+            "SELECT plan, stripe_customer_id, stripe_subscription_id, "
+            "period_start, period_tasks_used, period_agent_seconds_used, updated_at "
+            "FROM quotas WHERE user_id=?", (user_id,),
+        ).fetchone()
+        if row is None:
+            plan = "unlimited" if user_id in ("admin", "legacy-admin") else "free"
+            now = self._period_start_now()
+            self._conn.execute(
+                "INSERT INTO quotas (user_id, plan, period_start, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, plan, now, now),
+            )
+            return {
+                "user_id": user_id, "plan": plan,
+                "stripe_customer_id": None, "stripe_subscription_id": None,
+                "period_start": now, "period_tasks_used": 0,
+                "period_agent_seconds_used": 0, "updated_at": now,
+            }
+        return {
+            "user_id": user_id, "plan": row[0],
+            "stripe_customer_id": row[1], "stripe_subscription_id": row[2],
+            "period_start": row[3], "period_tasks_used": row[4],
+            "period_agent_seconds_used": row[5], "updated_at": row[6],
+        }
+
+    def increment_task_count(self, user_id: str, delta: int = 1) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET period_tasks_used = period_tasks_used + ?, "
+            "updated_at=? WHERE user_id=?",
+            (delta, time.time(), user_id),
+        )
+
+    def add_agent_seconds(self, user_id: str, seconds: int) -> None:
+        if seconds <= 0:
+            return
+        self._conn.execute(
+            "UPDATE quotas SET period_agent_seconds_used = period_agent_seconds_used + ?, "
+            "updated_at=? WHERE user_id=?",
+            (seconds, time.time(), user_id),
+        )
+
+    def set_user_plan(
+        self,
+        user_id: str,
+        *,
+        plan: str,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+    ) -> None:
+        """Sprint 33: called by the Stripe webhook handler when a
+        subscription transitions. Upserts the row in case the user
+        upgrades before they've submitted any tasks."""
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT 1 FROM quotas WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if existing is None:
+            self._conn.execute(
+                "INSERT INTO quotas (user_id, plan, stripe_customer_id, "
+                "stripe_subscription_id, period_start, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, plan, stripe_customer_id, stripe_subscription_id, now, now),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE quotas SET plan=?, stripe_customer_id=COALESCE(?, stripe_customer_id), "
+                "stripe_subscription_id=?, updated_at=? WHERE user_id=?",
+                (plan, stripe_customer_id, stripe_subscription_id, now, user_id),
+            )
+
+    def reset_quota_period(self, user_id: str) -> None:
+        """Start a new billing period; called by the period-rollover
+        sweeper when 30 days elapse, OR by the webhook handler on
+        invoice.payment_succeeded for the next period."""
+        self._conn.execute(
+            "UPDATE quotas SET period_start=?, period_tasks_used=0, "
+            "period_agent_seconds_used=0, updated_at=? WHERE user_id=?",
+            (time.time(), time.time(), user_id),
+        )
 
     # ── worker pool state ──────────────────────────────────────────────────
 
@@ -1582,6 +1721,24 @@ class Orchestrator:
             logger.info("task %s agent %s (%s) completed: files=%s",
                         task_id[:8], agent_idx, target_agent["role"],
                         len(result.get("files_created", []) or []))
+            # Sprint 33: bill agent wall-time to the task's owner.
+            # started_at was set in mark_agent_running; pull the fresh
+            # row to get both timestamps + the owner's user_id.
+            try:
+                refreshed_agent = next(
+                    (a for a in self.db.list_agents(task_id)
+                     if a["agent_idx"] == agent_idx), None,
+                )
+                task_row = self.db.get_task(task_id)
+                if refreshed_agent and task_row:
+                    start = refreshed_agent.get("started_at") or 0
+                    end = refreshed_agent.get("finished_at") or time.time()
+                    elapsed = max(0, int(end - start))
+                    owner = task_row.get("user_id") or "legacy-admin"
+                    if elapsed > 0:
+                        self.db.add_agent_seconds(owner, elapsed)
+            except Exception as exc:
+                logger.warning("usage-accounting raised; ignoring: %s", exc)
         # Did this agent fail? Short-circuit the rest of the workflow.
         if result.get("success") is False:
             self.db.mark_failed(task_id, f"agent {target_agent['role']} failed: {result.get('error', '?')}")
@@ -2146,6 +2303,17 @@ async def lifespan(app: FastAPI):
         state["clerk_validator"] = None
         logger.info("Clerk not configured (CLERK_PUBLISHABLE_KEY unset); admin-token-only auth")
 
+    # Sprint 33: Stripe billing client. Disabled (graceful 503 on
+    # /billing/checkout + /billing/webhook) when STRIPE_SECRET_KEY is
+    # missing — quotas + the free-tier 429s still work without Stripe.
+    billing = BillingClient()
+    state["billing"] = billing
+    if billing.enabled:
+        logger.info("Stripe billing enabled (prices: pro=%s team=%s)",
+                    billing.price_pro or "—", billing.price_team or "—")
+    else:
+        logger.info("Stripe not configured; /billing/checkout + /billing/webhook will 503")
+
     slots = await _resolve_pool(db, pool, target_pool_size)
     logger.info("bootstrapping pool of %d worker(s) in parallel", len(slots))
     handles = await asyncio.gather(
@@ -2194,6 +2362,19 @@ async def health() -> dict:
     return {"status": "ok", "tasks_in_flight": state["db"].next_pending() is not None}
 
 
+@app.get("/whoami")
+async def whoami(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 32.5: return the caller's resolved identity. Useful for
+    Flutter debug + confirming the bearer is what you expect. Cheap;
+    no DB hit beyond the Clerk JWKS cache."""
+    return {
+        "id": user.id,
+        "source": user.source,
+        "email": user.email,
+        "github": user.github,
+    }
+
+
 @app.post("/tasks", response_model=TaskResponse)
 async def submit_task(
     body: TaskSubmit,
@@ -2237,10 +2418,29 @@ async def submit_task(
         except Exception as exc:
             logger.exception("architect call raised; falling back to single-agent: %s", exc)
             team_spec = None
+    # Sprint 33: per-user quota enforcement. Admin path bypasses by
+    # virtue of get_or_create_quota assigning 'unlimited'. Everyone
+    # else: check `period_tasks_used` against the plan's cap before
+    # we burn the architect's LLM call cost on a 429.
+    quota = db.get_or_create_quota(user.id)
+    plan_caps = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
+    if quota["period_tasks_used"] >= plan_caps["tasks"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "quota_exceeded",
+                "plan": quota["plan"],
+                "cap": plan_caps["tasks"],
+                "used": quota["period_tasks_used"],
+                "metric": "tasks_per_period",
+                "upgrade_url": "/billing/checkout",
+            },
+        )
     # Atomic insert with team_spec attached — no race window for the
     # processor to pick the task up as single-agent before team_spec
     # lands.
     task_id = db.create_task(body.description, team_spec=team_spec, user_id=user.id)
+    db.increment_task_count(user.id)
     task = db.get_task(task_id)
     return TaskResponse(**task)
 
@@ -2423,14 +2623,21 @@ async def admin_status(task_limit: int = 10) -> dict:
     }
 
 
-@app.get("/tasks/{task_id}/team", dependencies=[Depends(require_token)])
-async def get_task_team(task_id: str) -> dict:
+@app.get("/tasks/{task_id}/team")
+async def get_task_team(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
     """Sprint 22: return the team_spec + per-agent runtime state for a
     multi-agent task. Powers the Discord-shaped task view's members
     sidebar (Sprint 25). Returns {team_spec: null, agents: []} for
-    single-agent tasks."""
+    single-agent tasks.
+
+    Sprint 32.5: per-user scoping — Clerk users only see their own
+    tasks; admin sees all."""
     db: Db = state["db"]
-    task = db.get_task(task_id)
+    scope = None if user.source == "admin" else user.id
+    task = db.get_task(task_id, user_id=scope)
     if not task:
         raise HTTPException(404, f"task {task_id} not found")
     return {
@@ -2535,6 +2742,126 @@ async def delete_template(name: str, user: ClerkUser = Depends(require_user)) ->
     if not state["db"].delete_template(name, user_id=scope):
         raise HTTPException(404, f"template `{name}` not found")
     return {"deleted": name}
+
+
+# ── Sprint 33: billing + quotas ──────────────────────────────────────────────
+
+
+class CheckoutBody(BaseModel):
+    plan: str  # "pro" | "team"
+
+
+@app.get("/billing/usage")
+async def billing_usage(user: ClerkUser = Depends(require_user)) -> dict:
+    """Return current period usage + plan caps for the calling user.
+    Drives the Flutter UI's "Usage" surface."""
+    db: Db = state["db"]
+    q = db.get_or_create_quota(user.id)
+    caps = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
+    return {
+        "user_id": user.id,
+        "plan": q["plan"],
+        "plan_label": caps["label"],
+        "period_start": q["period_start"],
+        "tasks": {"used": q["period_tasks_used"], "cap": caps["tasks"]},
+        "agent_seconds": {
+            "used": q["period_agent_seconds_used"],
+            "cap": caps["agent_seconds"],
+        },
+        "stripe_customer_id": q["stripe_customer_id"],
+        "stripe_subscription_id": q["stripe_subscription_id"],
+    }
+
+
+@app.post("/billing/checkout")
+async def billing_checkout(
+    body: CheckoutBody,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Mint a Stripe Checkout session URL for the requested plan.
+    Returns 503 if Stripe isn't configured on this orchestrator
+    (development tier). Returns 400 for unknown plans or admin-source
+    callers (admins don't subscribe; they bypass quotas)."""
+    billing: BillingClient = state["billing"]
+    if not billing.enabled:
+        raise HTTPException(
+            503,
+            "Stripe not configured on this orchestrator. "
+            "Set STRIPE_SECRET_KEY + STRIPE_PRICE_PRO + STRIPE_PRICE_TEAM.",
+        )
+    if user.source == "admin":
+        raise HTTPException(400, "admin users bypass quotas; no subscription needed")
+    if body.plan not in {"pro", "team"}:
+        raise HTTPException(400, f"unknown plan: {body.plan!r}; expected 'pro' or 'team'")
+    if not billing.price_for_plan(body.plan):
+        raise HTTPException(
+            503, f"plan={body.plan} has no STRIPE_PRICE_* env var configured",
+        )
+    try:
+        session = await asyncio.to_thread(
+            billing.create_checkout_session,
+            user_id=user.id, email=user.email, plan=body.plan,
+        )
+    except Exception as exc:
+        logger.exception("Stripe checkout creation failed: %s", exc)
+        raise HTTPException(502, f"Stripe error: {exc}")
+    return {"checkout_url": session.url, "session_id": session.session_id}
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request) -> dict:
+    """Stripe webhook: customer.subscription.{created,updated,deleted}
+    + invoice.payment_succeeded. No bearer required (Stripe doesn't
+    send one); HMAC signature in `Stripe-Signature` is the auth."""
+    billing: BillingClient = state["billing"]
+    if not billing.enabled:
+        raise HTTPException(503, "Stripe not configured on this orchestrator")
+    if not billing.webhook_secret:
+        raise HTTPException(503, "STRIPE_WEBHOOK_SECRET not configured")
+    payload = await request.body()
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        event = billing.validate_webhook(payload=payload, signature=sig)
+    except Exception as exc:
+        logger.warning("Stripe webhook validation failed: %s", exc)
+        raise HTTPException(400, f"invalid signature: {exc}")
+    event_type = event.get("type", "")
+    obj = (event.get("data") or {}).get("object", {})
+    db: Db = state["db"]
+    if event_type in ("customer.subscription.created", "customer.subscription.updated"):
+        user_id = (obj.get("metadata") or {}).get("tally_user_id")
+        plan = (obj.get("metadata") or {}).get("plan", "pro")
+        if user_id:
+            status = obj.get("status", "")
+            new_plan = plan if status in ("active", "trialing") else "free"
+            db.set_user_plan(
+                user_id,
+                plan=new_plan,
+                stripe_customer_id=obj.get("customer"),
+                stripe_subscription_id=obj.get("id"),
+            )
+            logger.info("subscription %s → user=%s plan=%s (sub=%s)",
+                        event_type, user_id, new_plan, obj.get("id"))
+    elif event_type == "customer.subscription.deleted":
+        user_id = (obj.get("metadata") or {}).get("tally_user_id")
+        if user_id:
+            db.set_user_plan(
+                user_id, plan="free",
+                stripe_customer_id=obj.get("customer"),
+                stripe_subscription_id=None,
+            )
+            logger.info("subscription canceled → user=%s back to free", user_id)
+    elif event_type == "invoice.payment_succeeded":
+        # New billing period: reset the user's usage counters.
+        sub_id = obj.get("subscription")
+        if sub_id:
+            row = db._conn.execute(
+                "SELECT user_id FROM quotas WHERE stripe_subscription_id=?", (sub_id,),
+            ).fetchone()
+            if row:
+                db.reset_quota_period(row[0])
+                logger.info("new period for user=%s (sub=%s)", row[0], sub_id)
+    return {"received": True, "event": event_type}
 
 
 @app.get("/admin/agent_roles", dependencies=[Depends(require_token)])
