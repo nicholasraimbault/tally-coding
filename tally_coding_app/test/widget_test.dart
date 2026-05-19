@@ -6,7 +6,10 @@ import 'package:tally_coding_app/screens/discord_shell.dart';
 
 void main() {
   testWidgets('DiscordShellScreen renders the four-column layout', (WidgetTester tester) async {
-    final client = TallyOrchClient(baseUrl: Uri.parse('http://127.0.0.1:65535'), token: 'fake');
+    final client = TallyOrchClient.fromToken(
+      baseUrl: Uri.parse('http://127.0.0.1:65535'),
+      token: 'fake',
+    );
     await tester.pumpWidget(MaterialApp(home: DiscordShellScreen(client: client)));
     // Server rail label
     expect(find.text('T'), findsOneWidget);

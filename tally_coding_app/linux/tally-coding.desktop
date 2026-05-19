@@ -1,0 +1,16 @@
+[Desktop Entry]
+# Sprint 32.5: registers the `tallycoding://` URL scheme so Clerk's OAuth
+# flow can redirect the user's system browser back into the app after
+# GitHub sign-in completes. Pairs with linux/install-scheme.sh which
+# installs this file to ~/.local/share/applications/ and runs the xdg
+# registration commands.
+Name=Tally Coding
+GenericName=Multi-agent coding workspace
+Comment=Privacy-first multi-agent coding on Phala TEE workers
+Exec=/usr/local/bin/tally-coding-app %u
+Icon=tally-coding
+Terminal=false
+Type=Application
+Categories=Development;
+MimeType=x-scheme-handler/tallycoding;
+StartupWMClass=com.tallycoding.flutter_app

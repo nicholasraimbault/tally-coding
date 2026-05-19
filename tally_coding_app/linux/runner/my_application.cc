@@ -63,22 +63,38 @@ static void my_application_activate(GApplication* application) {
 }
 
 // Implements GApplication::local_command_line.
+//
+// Sprint 32.5: with G_APPLICATION_HANDLES_COMMAND_LINE the GApplication
+// framework manages single-instance routing — second + later launches
+// forward their argv to the primary instance over DBus, the primary
+// fires its "command-line" signal (handled by GtkApplicationNotifier
+// for app_links_linux), and the remote instance exits.  We don't
+// override that flow; we just stash the launch-time argv for the
+// Dart entrypoint when WE are the primary.
 static gboolean my_application_local_command_line(GApplication* application, gchar*** arguments, int* exit_status) {
   MyApplication* self = MY_APPLICATION(application);
   // Strip out the first argument as it is the binary name.
   self->dart_entrypoint_arguments = g_strdupv(*arguments + 1);
-
-  g_autoptr(GError) error = nullptr;
-  if (!g_application_register(application, nullptr, &error)) {
-     g_warning("Failed to register: %s", error->message);
-     *exit_status = 1;
-     return TRUE;
-  }
-
-  g_application_activate(application);
+  // Return FALSE → let GApplication run its default command-line
+  // handling, which respects HANDLES_COMMAND_LINE (DBus-forward to
+  // primary or fire local "command-line" signal).
   *exit_status = 0;
+  return FALSE;
+}
 
-  return TRUE;
+// Implements GApplication::command_line.  Fires inside the primary
+// instance for both the initial launch AND any subsequent remote
+// launches that forwarded their argv via DBus.  Activate the window
+// so the user sees it (helpful when a hidden background instance
+// receives a deep-link), then return 0 to indicate success.
+//
+// GtkApplicationNotifier (used by app_links_linux) attaches its own
+// "command-line" listener on this GApplication, so we don't need to
+// extract the URL ourselves — the package does it.
+static int my_application_command_line(GApplication* application,
+                                       GApplicationCommandLine* cmdline) {
+  g_application_activate(application);
+  return 0;
 }
 
 // Implements GApplication::startup.
@@ -109,6 +125,7 @@ static void my_application_dispose(GObject* object) {
 static void my_application_class_init(MyApplicationClass* klass) {
   G_APPLICATION_CLASS(klass)->activate = my_application_activate;
   G_APPLICATION_CLASS(klass)->local_command_line = my_application_local_command_line;
+  G_APPLICATION_CLASS(klass)->command_line = my_application_command_line;
   G_APPLICATION_CLASS(klass)->startup = my_application_startup;
   G_APPLICATION_CLASS(klass)->shutdown = my_application_shutdown;
   G_OBJECT_CLASS(klass)->dispose = my_application_dispose;
@@ -123,8 +140,13 @@ MyApplication* my_application_new() {
   // the application to be recognized beyond its binary name.
   g_set_prgname(APPLICATION_ID);
 
+  // Sprint 32.5: G_APPLICATION_HANDLES_COMMAND_LINE makes this app
+  // single-instance per APPLICATION_ID — subsequent `tallycoding://`
+  // launches forward their argv to the primary instance via DBus
+  // (instead of spawning a fresh signed-out clone).  Pairs with the
+  // local_command_line + command_line handlers above.
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID,
-                                     "flags", G_APPLICATION_NON_UNIQUE,
+                                     "flags", G_APPLICATION_HANDLES_COMMAND_LINE,
                                      nullptr));
 }

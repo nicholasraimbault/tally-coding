@@ -13,6 +13,18 @@ dependencies:
   cupertino_icons: ^1.0.8
   http: ^1.2.0
   path_provider: ^2.1.4
+  url_launcher: ^6.3.0
+  # Sprint 32.5: deep-link callback for Clerk OAuth flow. Used by the
+  # `tallycoding://auth/oauth` redirect that closes the browser-based
+  # sign-in loop on every platform (Android, iOS, Linux, macOS, Windows).
+  app_links: ^6.4.1
+
+  # Sprint 32.5: Clerk SDK for in-app sign-in. With redirectionGenerator +
+  # deepLinkStream wired (see main.dart), Clerk routes OAuth through the
+  # system browser via url_launcher and catches the redirect back via
+  # app_links — no platform-specific webview required.
+  clerk_flutter: ^0.0.15-beta
+  clerk_auth: ^0.0.15-beta
 
   # Skytale Dart SDK — E2E encryption + agent identity. Currently a skeleton
   # awaiting PR #469 merge; pinned to the branch until then.

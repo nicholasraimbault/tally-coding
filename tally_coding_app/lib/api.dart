@@ -55,19 +55,46 @@ class Task {
   }
 }
 
+/// Bearer-token provider — either a static admin token (`() async => "TL_…"`)
+/// or a Clerk session that mints fresh JWTs on demand.  api.dart fetches
+/// the token immediately before each HTTP call so short-lived Clerk
+/// session JWTs (60s lifetime) never expire mid-request.
+typedef BearerProvider = Future<String?> Function();
+
 class TallyOrchClient {
   final Uri baseUrl;
-  final String token;
+  final BearerProvider _provider;
   final http.Client _http;
 
-  TallyOrchClient({required this.baseUrl, this.token = '', http.Client? client})
-      : _http = client ?? http.Client();
+  TallyOrchClient({
+    required this.baseUrl,
+    required BearerProvider provider,
+    http.Client? client,
+  })  : _provider = provider,
+        _http = client ?? http.Client();
 
-  Map<String, String> get _authHeaders =>
-      token.isEmpty ? const {} : {'authorization': 'Bearer $token'};
+  /// Backwards-compat factory for the legacy static-token path
+  /// (admin token from the .env / pre-Sprint-32.5 paste flow).
+  factory TallyOrchClient.fromToken({
+    required Uri baseUrl,
+    required String token,
+    http.Client? client,
+  }) {
+    return TallyOrchClient(
+      baseUrl: baseUrl,
+      provider: () async => token,
+      client: client,
+    );
+  }
+
+  Future<Map<String, String>> get _authHeaders async {
+    final token = await _provider();
+    if (token == null || token.isEmpty) return const {};
+    return {'authorization': 'Bearer $token'};
+  }
 
   Future<List<Task>> listTasks({int limit = 100}) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks?limit=$limit'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/tasks?limit=$limit'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list tasks failed: ${resp.statusCode} ${resp.body}');
@@ -77,7 +104,7 @@ class TallyOrchClient {
   }
 
   Future<Task> getTask(String id) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$id'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/tasks/$id'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('get task failed: ${resp.statusCode} ${resp.body}');
@@ -88,7 +115,7 @@ class TallyOrchClient {
   Future<Task> submitTask(String description, {Map<String, dynamic>? teamSpec}) async {
     final resp = await _http.post(
       baseUrl.resolve('/tasks'),
-      headers: {'content-type': 'application/json', ..._authHeaders},
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
       body: jsonEncode({
         'description': description,
         if (teamSpec != null) 'team_spec': teamSpec,
@@ -115,7 +142,7 @@ class TallyOrchClient {
         'pass exactly one of sourceTaskId or teamSpec');
     final resp = await _http.post(
       baseUrl.resolve('/templates'),
-      headers: {'content-type': 'application/json', ..._authHeaders},
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
       body: jsonEncode({
         'name': name,
         if (sourceTaskId != null) 'source_task_id': sourceTaskId,
@@ -141,7 +168,7 @@ class TallyOrchClient {
   Future<List<Map<String, dynamic>>> listAgentRoles() async {
     final resp = await _http.get(
       baseUrl.resolve('/admin/agent_roles'),
-      headers: _authHeaders,
+      headers: await _authHeaders,
     );
     _checkAuth(resp);
     if (resp.statusCode != 200) {
@@ -152,7 +179,7 @@ class TallyOrchClient {
   }
 
   Future<List<Map<String, dynamic>>> listTemplates() async {
-    final resp = await _http.get(baseUrl.resolve('/templates'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/templates'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list templates failed: ${resp.statusCode} ${resp.body}');
@@ -164,7 +191,7 @@ class TallyOrchClient {
   Future<void> deleteTemplate(String name) async {
     final resp = await _http.delete(
       baseUrl.resolve('/templates/$name'),
-      headers: _authHeaders,
+      headers: await _authHeaders,
     );
     _checkAuth(resp);
     if (resp.statusCode != 200) {
@@ -181,7 +208,7 @@ class TallyOrchClient {
   /// One-shot fetch of events with seq > sinceSeq. Used as a fallback when SSE
   /// is unavailable; live clients should prefer [streamFrames].
   Future<List<Map<String, dynamic>>> listEvents(String taskId, {int sinceSeq = -1}) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/events?since_seq=$sinceSeq'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list events failed: ${resp.statusCode} ${resp.body}');
@@ -196,7 +223,7 @@ class TallyOrchClient {
     final req = http.Request('GET', baseUrl.resolve('/tasks/$taskId/stream?since_seq=$sinceSeq'))
       ..headers['accept'] = 'text/event-stream'
       ..headers['cache-control'] = 'no-cache'
-      ..headers.addAll(_authHeaders);
+      ..headers.addAll((await _authHeaders));
     final resp = await _http.send(req);
     if (resp.statusCode == 401) {
       throw const UnauthorizedException();
@@ -242,7 +269,7 @@ class TallyOrchClient {
   /// Workspace file listing for a completed (or running) task. Returns
   /// {"entries": [{"path", "size", "is_dir"}, ...]}.
   Future<List<Map<String, dynamic>>> listFiles(String taskId) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('list files failed: ${resp.statusCode} ${resp.body}');
@@ -254,7 +281,7 @@ class TallyOrchClient {
   /// Read a single file from a task's workspace. Returns the decoded body
   /// (server delivers base64; we decode to UTF-8 string here for the viewer).
   Future<({String content, int size, bool truncated})> readFile(String taskId, String path) async {
-    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files/$path'), headers: _authHeaders);
+    final resp = await _http.get(baseUrl.resolve('/tasks/$taskId/files/$path'), headers: await _authHeaders);
     _checkAuth(resp);
     if (resp.statusCode != 200) {
       throw Exception('read file failed: ${resp.statusCode} ${resp.body}');
