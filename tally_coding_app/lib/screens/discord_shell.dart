@@ -23,6 +23,7 @@ import '../agent_roles.dart';
 import '../api.dart';
 import '../main.dart';
 import 'billing_screen.dart';
+import 'custom_roles_screen.dart';
 import 'general_channel.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
@@ -207,6 +208,15 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     );
   }
 
+  /// Sprint 40: server rail 🧑‍💻 → custom agent roles catalogue.
+  Future<void> _openCustomRoles(BuildContext context) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => CustomRolesScreen(client: widget.client),
+      ),
+    );
+  }
+
   /// Sprint 31: width threshold below which the shell collapses from
   /// four panes to one. Wide → keep desktop layout; narrow → AppBar +
   /// drawer (channels) + bottom sheet (members). 1100px lands on a
@@ -248,6 +258,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     onOpenBilling: () => _openBilling(context),
                     onOpenTemplates: () => _openTemplates(context),
                     onOpenProjects: () => _openProjects(context),
+                    onOpenCustomRoles: () => _openCustomRoles(context),
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   _ChannelList(
@@ -461,12 +472,14 @@ class _ServerRail extends StatelessWidget {
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
   final VoidCallback onOpenProjects;
+  final VoidCallback onOpenCustomRoles;
   const _ServerRail({
     required this.onSignOut,
     required this.onOpenBuilder,
     required this.onOpenBilling,
     required this.onOpenTemplates,
     required this.onOpenProjects,
+    required this.onOpenCustomRoles,
   });
 
   @override
@@ -499,6 +512,11 @@ class _ServerRail extends StatelessWidget {
             tooltip: 'Saved templates',
             icon: const Icon(Icons.bookmark_border, color: Color(0xFF99AAB5)),
             onPressed: onOpenTemplates,
+          ),
+          IconButton(
+            tooltip: 'Agent roles',
+            icon: const Icon(Icons.psychology_outlined, color: Color(0xFF99AAB5)),
+            onPressed: onOpenCustomRoles,
           ),
           IconButton(
             tooltip: 'Billing & usage',

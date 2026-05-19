@@ -115,6 +115,27 @@ CREATE TABLE IF NOT EXISTS agent_roles (
     system_prompt  TEXT NOT NULL
 );
 
+-- Sprint 40: per-user custom agent roles.  Same shape as agent_roles
+-- but namespaced by user_id, so two users can both have a role
+-- named "DataAnalyst" without colliding.  Lookups go user-roles-
+-- first, then fall back to the seeded global agent_roles, so
+-- custom roles never accidentally shadow seeded ones unless the
+-- user explicitly creates one with a seeded role's name (which
+-- the validator rejects).
+CREATE TABLE IF NOT EXISTS user_agent_roles (
+    user_id        TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    description    TEXT NOT NULL,
+    default_model  TEXT NOT NULL,
+    tools_json     TEXT NOT NULL,
+    system_prompt  TEXT NOT NULL,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (user_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_user_roles_user
+    ON user_agent_roles(user_id, updated_at DESC);
+
 -- Sprint 22: per-task agent instances. team_spec on tasks holds the architect
 -- output as JSON, this table holds the resolved instances for inspection +
 -- per-agent worker/result tracking.
@@ -630,20 +651,60 @@ class Db:
 
     # ── Sprint 22: agent palette + per-task agent instances ──────────────
 
-    def list_agent_roles(self) -> list[dict]:
+    def list_agent_roles(self, *, user_id: str | None = None) -> list[dict]:
+        """Sprint 40: returns seeded global roles + caller's custom
+        roles when ``user_id`` is supplied.  Custom roles are tagged
+        with ``source='custom'`` + ``owner=user_id``; seeded roles
+        get ``source='seeded'``.  Used by the architect (which sees
+        each user's palette including their custom roles) and by
+        the team builder UI."""
         rows = self._conn.execute(
             "SELECT name, description, default_model, tools_json, system_prompt "
             "FROM agent_roles ORDER BY name"
         ).fetchall()
-        return [
+        roles = [
             {
                 "name": r[0], "description": r[1], "default_model": r[2],
                 "tools": json.loads(r[3]), "system_prompt": r[4],
+                "source": "seeded", "owner": None,
             }
             for r in rows
         ]
+        if user_id is not None:
+            custom_rows = self._conn.execute(
+                "SELECT name, description, default_model, tools_json, system_prompt "
+                "FROM user_agent_roles WHERE user_id = ? ORDER BY name",
+                (user_id,),
+            ).fetchall()
+            roles.extend([
+                {
+                    "name": r[0], "description": r[1], "default_model": r[2],
+                    "tools": json.loads(r[3]), "system_prompt": r[4],
+                    "source": "custom", "owner": user_id,
+                }
+                for r in custom_rows
+            ])
+        return roles
 
-    def get_agent_role(self, name: str) -> dict | None:
+    def get_agent_role(self, name: str, *, user_id: str | None = None) -> dict | None:
+        """Sprint 40: lookup checks the caller's custom roles first,
+        then falls back to seeded.  Letting custom override seeded for
+        the same name was considered but rejected — the create
+        endpoint validates that custom names don't collide with
+        seeded ones, so the fallback path is the only one that hits
+        ``agent_roles``."""
+        if user_id is not None:
+            row = self._conn.execute(
+                "SELECT name, description, default_model, tools_json, system_prompt "
+                "FROM user_agent_roles WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            ).fetchone()
+            if row:
+                return {
+                    "name": row[0], "description": row[1], "default_model": row[2],
+                    "tools": json.loads(row[3]), "system_prompt": row[4],
+                    "source": "custom", "owner": user_id,
+                }
         row = self._conn.execute(
             "SELECT name, description, default_model, tools_json, system_prompt "
             "FROM agent_roles WHERE name = ?", (name,),
@@ -653,6 +714,94 @@ class Db:
         return {
             "name": row[0], "description": row[1], "default_model": row[2],
             "tools": json.loads(row[3]), "system_prompt": row[4],
+            "source": "seeded", "owner": None,
+        }
+
+    # ── Sprint 40: user-defined custom roles ───────────────────────────────
+
+    def create_custom_role(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        description: str,
+        default_model: str,
+        tools: list[str],
+        system_prompt: str,
+    ) -> None:
+        """Insert a user-scoped role.  Caller validates the name
+        doesn't collide with a seeded role (via ``get_agent_role`` or
+        the seeded-name set) — this method just trusts the input."""
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO user_agent_roles "
+            "(user_id, name, description, default_model, tools_json, "
+            " system_prompt, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, description, default_model,
+             json.dumps(tools), system_prompt, now, now),
+        )
+
+    def update_custom_role(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        description: str | None = None,
+        default_model: str | None = None,
+        tools: list[str] | None = None,
+        system_prompt: str | None = None,
+    ) -> dict | None:
+        """Partial PATCH.  Returns the updated row or ``None`` when
+        the role doesn't exist for this user."""
+        updates: list[str] = []
+        params: list = []
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+        if default_model is not None:
+            updates.append("default_model = ?")
+            params.append(default_model)
+        if tools is not None:
+            updates.append("tools_json = ?")
+            params.append(json.dumps(tools))
+        if system_prompt is not None:
+            updates.append("system_prompt = ?")
+            params.append(system_prompt)
+        if not updates:
+            return self.get_agent_role(name, user_id=user_id)
+        updates.append("updated_at = ?")
+        params.append(time.time())
+        params.extend([user_id, name])
+        cur = self._conn.execute(
+            f"UPDATE user_agent_roles SET {', '.join(updates)} "
+            f"WHERE user_id = ? AND name = ?",
+            params,
+        )
+        if (cur.rowcount or 0) == 0:
+            return None
+        return self.get_agent_role(name, user_id=user_id)
+
+    def delete_custom_role(self, *, user_id: str, name: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM user_agent_roles WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        )
+        return (cur.rowcount or 0) > 0
+
+    def list_custom_role_names(self, user_id: str) -> set[str]:
+        """Fast set lookup for the name-collision check."""
+        return {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT name FROM user_agent_roles WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        }
+
+    def seeded_role_names(self) -> set[str]:
+        return {
+            r[0] for r in self._conn.execute("SELECT name FROM agent_roles").fetchall()
         }
 
     def set_task_team_spec(self, task_id: str, team_spec: dict) -> None:
@@ -1842,9 +1991,14 @@ class Orchestrator:
             return
         # Resolve + insert per-agent rows up front so the team's shape is
         # visible in /admin/status before any worker dispatch starts.
+        # Sprint 40: scope role lookups to the task's owner so custom
+        # roles defined by THAT user resolve.  Admin / legacy-admin
+        # tasks fall through to seeded-only lookups.
+        owner_id = task.get("user_id")
+        role_scope = owner_id if owner_id and owner_id not in ("admin", "legacy-admin") else None
         for idx, a in enumerate(agents_spec):
             role_name = a.get("role")
-            role = self.db.get_agent_role(role_name)
+            role = self.db.get_agent_role(role_name, user_id=role_scope)
             if not role:
                 self.db.mark_failed(task["id"], f"unknown role: {role_name}")
                 await self._publish_status(task["id"], "failed", {"error": f"unknown role: {role_name}"})
@@ -1931,7 +2085,11 @@ class Orchestrator:
             handle.in_flight_task = task["id"]
             self.db.set_task_worker(task["id"], handle.identity)
             self.db.mark_agent_running(agent["id"], handle.identity)
-            role = self.db.get_agent_role(agent["role"]) or {}
+            # Sprint 40: scope role lookup to the task owner so the
+            # worker dispatch picks up custom roles' system_prompt + tools.
+            owner_id = task.get("user_id")
+            role_scope = owner_id if owner_id and owner_id not in ("admin", "legacy-admin") else None
+            role = self.db.get_agent_role(agent["role"], user_id=role_scope) or {}
             await self._publish_status(task["id"], "running", {
                 "agent_role": agent["role"], "agent_idx": agent["agent_idx"],
             })
@@ -3137,7 +3295,11 @@ async def submit_task(
     team_spec = body.team_spec
     if team_spec is None and orch.redpill_key:
         try:
-            palette = db.list_agent_roles()
+            # Sprint 40: hand the architect THIS user's palette
+            # (seeded roles + their custom roles).  Admin uses the
+            # seeded-only palette.
+            palette_scope = None if user.source == "admin" else user.id
+            palette = db.list_agent_roles(user_id=palette_scope)
             # Sprint 29: surface saved templates to the architect. The
             # model can pick one verbatim (template_used field) or build
             # fresh — we touch the template's use_count + last_used_at
@@ -4118,19 +4280,183 @@ async def clerk_webhook(request: Request) -> dict:
 
 @app.get("/admin/agent_roles")
 async def list_agent_roles(user: ClerkUser = Depends(require_user)) -> dict:
-    """The agent palette. Static today (seeded once at orchestrator boot);
-    the Discord-shaped Flutter UI uses this to show role glyphs / names
-    in the members sidebar without hardcoding the list.
+    """The agent palette.  Returns seeded roles plus the caller's
+    custom roles (Sprint 40).  Each row has ``source`` ∈
+    ``{seeded, custom}`` so the UI can render them differently.
 
-    Auth: any authenticated user (admin OR Clerk JWT).  The palette
-    is the same for everyone — no per-tenant data — and the team
-    builder is one of the first surfaces a signed-in user touches,
-    so gating it on the admin token would break the core UX.
-    The ``/admin/`` URL prefix is historical; the endpoint is not
-    admin-only.
+    Auth: any authenticated user (admin OR Clerk JWT).  Admin sees
+    only seeded roles (admin has no per-user custom-role rows).
     """
-    del user  # auth-gated only; no per-user filtering.
-    return {"roles": state["db"].list_agent_roles()}
+    scope = None if user.source == "admin" else user.id
+    return {"roles": state["db"].list_agent_roles(user_id=scope)}
+
+
+# ── Sprint 40: user-defined custom roles ─────────────────────────────────────
+
+
+class CustomRoleCreate(BaseModel):
+    name: str
+    description: str
+    default_model: str
+    tools: list[str] = []
+    system_prompt: str
+
+
+class CustomRolePatch(BaseModel):
+    """Partial update; any subset of fields may be supplied."""
+    description: str | None = None
+    default_model: str | None = None
+    tools: list[str] | None = None
+    system_prompt: str | None = None
+
+
+# Allow-list of model ids we'll accept on the create/patch path.  Keeps
+# operators from accidentally typing a model that isn't on Red Pill.
+# Extend by editing this set as Red Pill's catalogue grows.
+_ALLOWED_MODELS = {
+    "meta-llama/llama-3.3-70b-instruct",
+    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2.6-instruct",
+    "deepseek/deepseek-r1-0528",
+    "deepseek/deepseek-r1",
+    "deepseek/deepseek-v3.2",
+    "deepseek/deepseek-v3",
+}
+
+# Tool palette mirrors the seeded roles' tools_json values.  Any
+# subset accepted; unknown tool names rejected so users can't smuggle
+# in something the worker doesn't honour.
+_ALLOWED_TOOLS = {
+    "file_editor",
+    "file_editor_read",
+    "bash",
+    "bash_read",
+    "browser",
+}
+
+
+def _validate_custom_role_inputs(
+    *,
+    name: str,
+    default_model: str,
+    tools: list[str],
+    system_prompt: str,
+) -> None:
+    """Raises HTTPException 400 on any input violation."""
+    if not name or not name.strip():
+        raise HTTPException(400, "name is required")
+    clean = name.strip()
+    if len(clean) > 64:
+        raise HTTPException(400, "name must be ≤64 chars")
+    if "/" in clean or any(ord(c) < 32 for c in clean):
+        raise HTTPException(
+            400, "name must contain no `/` or control chars",
+        )
+    if default_model not in _ALLOWED_MODELS:
+        raise HTTPException(
+            400,
+            f"default_model `{default_model}` not in allow-list. "
+            f"Pick one of: {sorted(_ALLOWED_MODELS)}",
+        )
+    for tool in tools:
+        if tool not in _ALLOWED_TOOLS:
+            raise HTTPException(
+                400,
+                f"unknown tool `{tool}`. Pick from: {sorted(_ALLOWED_TOOLS)}",
+            )
+    if not system_prompt or not system_prompt.strip():
+        raise HTTPException(400, "system_prompt is required")
+    if len(system_prompt) > 8192:
+        raise HTTPException(400, "system_prompt is too long (>8 KiB)")
+
+
+@app.post("/agent_roles")
+async def create_custom_role(
+    body: CustomRoleCreate,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Mint a user-scoped custom role.  Cannot collide with seeded
+    role names (returns 409) or with the user's own existing custom
+    roles (also 409)."""
+    if user.source == "admin":
+        raise HTTPException(
+            400, "admin doesn't own custom roles; sign in as a Clerk user",
+        )
+    db: Db = state["db"]
+    _validate_custom_role_inputs(
+        name=body.name,
+        default_model=body.default_model,
+        tools=body.tools,
+        system_prompt=body.system_prompt,
+    )
+    clean_name = body.name.strip()
+    seeded = db.seeded_role_names()
+    if clean_name in seeded:
+        raise HTTPException(
+            409,
+            f"`{clean_name}` collides with a seeded role. Pick a different name.",
+        )
+    existing_custom = db.list_custom_role_names(user.id)
+    if clean_name in existing_custom:
+        raise HTTPException(409, f"you already have a custom role named `{clean_name}`")
+    description = (body.description or "").strip() or f"Custom role: {clean_name}"
+    db.create_custom_role(
+        user_id=user.id,
+        name=clean_name,
+        description=description,
+        default_model=body.default_model,
+        tools=body.tools,
+        system_prompt=body.system_prompt,
+    )
+    logger.info("custom_role created: user=%s name=%r model=%s",
+                user.id, clean_name, body.default_model)
+    return db.get_agent_role(clean_name, user_id=user.id) or {"name": clean_name}
+
+
+@app.patch("/agent_roles/{name}")
+async def update_custom_role(
+    name: str,
+    body: CustomRolePatch,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Patch a custom role.  Cannot rename — drop + recreate for that.
+    Seeded roles are immutable from this endpoint."""
+    if user.source == "admin":
+        raise HTTPException(400, "admin can't patch custom roles via this endpoint")
+    db: Db = state["db"]
+    if body.default_model is not None and body.default_model not in _ALLOWED_MODELS:
+        raise HTTPException(400, f"default_model `{body.default_model}` not in allow-list")
+    if body.tools is not None:
+        for tool in body.tools:
+            if tool not in _ALLOWED_TOOLS:
+                raise HTTPException(400, f"unknown tool `{tool}`")
+    if body.system_prompt is not None and len(body.system_prompt) > 8192:
+        raise HTTPException(400, "system_prompt is too long (>8 KiB)")
+    updated = db.update_custom_role(
+        user_id=user.id,
+        name=name,
+        description=body.description,
+        default_model=body.default_model,
+        tools=body.tools,
+        system_prompt=body.system_prompt,
+    )
+    if updated is None:
+        raise HTTPException(404, f"custom role `{name}` not found")
+    return updated
+
+
+@app.delete("/agent_roles/{name}")
+async def delete_custom_role(
+    name: str, user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Delete a custom role.  Tasks already running with this role
+    are unaffected (the role spec lives in their team_spec column)."""
+    if user.source == "admin":
+        raise HTTPException(400, "admin can't delete custom roles via this endpoint")
+    db: Db = state["db"]
+    if not db.delete_custom_role(user_id=user.id, name=name):
+        raise HTTPException(404, f"custom role `{name}` not found")
+    return {"deleted": name}
 
 
 @app.get("/admin/pool/status", dependencies=[Depends(require_token)])

@@ -214,6 +214,71 @@ class TallyOrchClient {
     }
   }
 
+  // ── Sprint 40: custom user-defined agent roles ───────────────────────────
+
+  Future<Map<String, dynamic>> createCustomRole({
+    required String name,
+    required String description,
+    required String defaultModel,
+    required List<String> tools,
+    required String systemPrompt,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/agent_roles'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({
+        'name': name,
+        'description': description,
+        'default_model': defaultModel,
+        'tools': tools,
+        'system_prompt': systemPrompt,
+      }),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode == 409) {
+      throw Exception('role name conflicts with a seeded role or your existing custom role');
+    }
+    if (resp.statusCode != 200) {
+      throw Exception('create custom role failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> patchCustomRole(
+    String name, {
+    String? description,
+    String? defaultModel,
+    List<String>? tools,
+    String? systemPrompt,
+  }) async {
+    final body = <String, dynamic>{};
+    if (description != null) body['description'] = description;
+    if (defaultModel != null) body['default_model'] = defaultModel;
+    if (tools != null) body['tools'] = tools;
+    if (systemPrompt != null) body['system_prompt'] = systemPrompt;
+    final resp = await _http.patch(
+      baseUrl.resolve('/agent_roles/$name'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('patch role failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<void> deleteCustomRole(String name) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/agent_roles/$name'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200 && resp.statusCode != 404) {
+      throw Exception('delete role failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
   // ── Sprint 38: GitHub PAT + push ─────────────────────────────────────────
 
   /// Returns `{has_token: bool}`.  Never returns the token itself.
