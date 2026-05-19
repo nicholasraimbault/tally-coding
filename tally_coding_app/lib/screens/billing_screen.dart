@@ -34,11 +34,16 @@ class _BillingScreenState extends State<BillingScreen> {
     setState(() => _usage = widget.client.billingUsage());
   }
 
-  /// Derive the Clerk Account Portal URL from the publishable key,
-  /// then append `/billing` so users land on the plan-management
-  /// surface.  Publishable keys look like
-  /// `pk_test_<base64-of-frontend-api$>`; we strip the `$` and
-  /// build `https://<frontend>/billing`.
+  /// Derive the Clerk Account Portal URL from the publishable key.
+  ///
+  /// **Important:** the *frontend API host* (where the SDK fetches
+  /// `/v1/environment` etc.) is `<slug>.clerk.accounts.dev`, but the
+  /// *hosted Account Portal* (the user-facing profile + billing
+  /// pages) is `<slug>.accounts.dev` — no `clerk.` prefix.  We have
+  /// to strip the `clerk.` segment when building the portal URL or
+  /// users get a 404.  Billing lives inside the UserProfile widget
+  /// as a tab; the public route is `/user` and Clerk auto-selects
+  /// the Billing tab when you append `#/billing` to the hash route.
   Uri? _billingPortalUri() {
     final pk = widget.publishableKey;
     for (final prefix in ['pk_test_', 'pk_live_']) {
@@ -47,8 +52,14 @@ class _BillingScreenState extends State<BillingScreen> {
       try {
         final padded = tail.padRight(((tail.length + 3) ~/ 4) * 4, '=');
         final decoded = utf8.decode(base64.decode(padded));
-        final frontend = decoded.endsWith(r'$') ? decoded.substring(0, decoded.length - 1) : decoded;
-        return Uri.parse('https://$frontend/billing');
+        final frontend = decoded.endsWith(r'$')
+            ? decoded.substring(0, decoded.length - 1)
+            : decoded;
+        // Strip the leading `clerk.` segment to get the portal host.
+        final portalHost = frontend.startsWith('clerk.')
+            ? frontend.substring('clerk.'.length)
+            : frontend.replaceFirst('.clerk.', '.');
+        return Uri.parse('https://$portalHost/user#/billing');
       } catch (_) {
         return null;
       }

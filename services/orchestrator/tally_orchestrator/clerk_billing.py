@@ -191,7 +191,13 @@ class ClerkBillingClient:
             if isinstance(raw, str):
                 plan_slug = parse_plan_claim(raw)
 
-        # On `subscriptionItem.canceled` the user reverts to free.
+        # On `subscriptionItem.canceled` the user explicitly cancels
+        # and reverts to free.  ``.ended`` is a *different* event that
+        # fires when an existing plan ends due to a plan change (free
+        # → pro, pro → team, etc.); in that case the new ``.active``
+        # event for the replacement plan arrives a few ms later and
+        # carries the right slug, so we don't override here.  Clerk
+        # delivers both within a single webhook batch, in source-order.
         if event_type.endswith(".canceled"):
             plan_slug = "free"
 
