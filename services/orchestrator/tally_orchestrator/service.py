@@ -52,6 +52,14 @@ from .clerk_auth import (
     looks_like_jwt as clerk_looks_like_jwt,
 )
 from .clerk_billing import ClerkBillingClient
+from .credentials import CredentialsManager, fernet_key_help, redact_token
+from .github_push import (
+    GithubPushAuthError,
+    GithubPushError,
+    GithubPushRepoError,
+    push_project,
+    validate_repo,
+)
 import jwt
 from .worker_pool import WorkerPool
 
@@ -185,6 +193,21 @@ CREATE TABLE IF NOT EXISTS project_artifacts (
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 CREATE INDEX IF NOT EXISTS idx_project_artifacts ON project_artifacts(project_id);
+
+-- Sprint 38: encrypted per-user credentials store.  One row per
+-- (user_id, kind) pair; the ciphertext is a Fernet token (binary,
+-- stored as BLOB).  The orchestrator's CREDENTIALS_KEY decrypts.
+-- Today only kind='github_pat' is used (Sprint 38); future kinds
+-- (e.g. 'aws_role_arn', 'openai_api_key' for BYOK) drop in without
+-- a schema change.
+CREATE TABLE IF NOT EXISTS user_credentials (
+    user_id        TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    ciphertext     BLOB NOT NULL,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (user_id, kind)
+);
 
 -- Sprint 33: per-user quotas. One row per Clerk user (plus
 -- 'admin'/'legacy-admin' for those paths). Plans are name-only;
@@ -1034,6 +1057,52 @@ class Db:
             (project_id,),
         ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ── Sprint 38: encrypted per-user credentials ──────────────────────────
+
+    def put_credential(self, *, user_id: str, kind: str, ciphertext: bytes) -> None:
+        """Upsert ``(user_id, kind) → ciphertext``.  Caller is
+        responsible for the encryption (see ``credentials.py``)."""
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM user_credentials WHERE user_id=? AND kind=?",
+            (user_id, kind),
+        ).fetchone()
+        if existing:
+            self._conn.execute(
+                "UPDATE user_credentials SET ciphertext=?, updated_at=? "
+                "WHERE user_id=? AND kind=?",
+                (ciphertext, now, user_id, kind),
+            )
+        else:
+            self._conn.execute(
+                "INSERT INTO user_credentials "
+                "(user_id, kind, ciphertext, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, kind, ciphertext, now, now),
+            )
+
+    def get_credential(self, *, user_id: str, kind: str) -> bytes | None:
+        """Return the raw ciphertext (or None if not stored).  Caller
+        decrypts."""
+        row = self._conn.execute(
+            "SELECT ciphertext FROM user_credentials WHERE user_id=? AND kind=?",
+            (user_id, kind),
+        ).fetchone()
+        return row[0] if row else None
+
+    def has_credential(self, *, user_id: str, kind: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM user_credentials WHERE user_id=? AND kind=?",
+            (user_id, kind),
+        ).fetchone() is not None
+
+    def delete_credential(self, *, user_id: str, kind: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM user_credentials WHERE user_id=? AND kind=?",
+            (user_id, kind),
+        )
+        return (cur.rowcount or 0) > 0
 
     # ── Sprint 26.5: durable artifact map for cross-restart replay ──────────
 
@@ -2719,6 +2788,15 @@ async def lifespan(app: FastAPI):
     # because the plan flows from the user's JWT `pla` claim.
     clerk_billing = ClerkBillingClient()
     state["clerk_billing"] = clerk_billing
+    # Sprint 38: encrypted credentials manager (PATs, future BYOK).
+    # When CREDENTIALS_KEY is unset, /github/* routes 503 with a
+    # generation-instructions detail so operators know how to fix it.
+    credentials = CredentialsManager()
+    state["credentials"] = credentials
+    if credentials.configured:
+        logger.info("Credentials manager ready (Fernet master key loaded)")
+    else:
+        logger.info("CREDENTIALS_KEY not configured; /github/* routes will 503")
     if clerk_billing.webhook_enabled:
         logger.info("Clerk Billing webhook enabled (whsec_...%s)",
                     clerk_billing.webhook_secret[-4:])
@@ -3342,6 +3420,167 @@ async def delete_project(project_id: str, user: ClerkUser = Depends(require_user
         raise HTTPException(404, f"project `{project_id}` not found")
     logger.info("project deleted: id=%s owner=%s", project_id, user.id)
     return {"deleted": project_id}
+
+
+# ── Sprint 38: GitHub PAT + project push ──────────────────────────────────────
+
+
+class GithubTokenSet(BaseModel):
+    pat: str
+
+
+class GithubPush(BaseModel):
+    """Body for ``POST /projects/{id}/push``."""
+    repo: str  # "owner/repo"
+    branch: str | None = None  # default: tally/push-<unix-ts>
+    commit_message: str | None = None  # default: "Push from Tally project ..."
+
+
+def _require_credentials_configured() -> CredentialsManager:
+    cm: CredentialsManager = state.get("credentials")  # type: ignore
+    if cm is None or not cm.configured:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Credentials store not configured on this orchestrator. "
+                + fernet_key_help()
+            ),
+        )
+    return cm
+
+
+@app.post("/github/token")
+async def set_github_token(
+    body: GithubTokenSet,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Store an encrypted GitHub PAT for the caller.  The PAT is
+    Fernet-encrypted before persisting; we never log any byte of
+    it (see ``credentials.redact_token``).
+
+    Validation is shallow — we don't call GitHub's API to verify
+    the token here (would block the request on network).  The next
+    ``POST /projects/{id}/push`` will surface a clean auth error if
+    the PAT is bad.
+    """
+    cm = _require_credentials_configured()
+    pat = (body.pat or "").strip()
+    if not pat:
+        raise HTTPException(400, "pat is empty")
+    if len(pat) > 256:
+        raise HTTPException(400, "pat is implausibly long; check that you pasted only the token")
+    # Light shape check: github tokens start with one of these prefixes.
+    if not (pat.startswith("ghp_") or pat.startswith("github_pat_") or pat.startswith("gho_")):
+        logger.info(
+            "github_pat for user=%s has unrecognised prefix; storing anyway %s",
+            user.id, redact_token(pat),
+        )
+    db: Db = state["db"]
+    db.put_credential(user_id=user.id, kind="github_pat", ciphertext=cm.encrypt(pat))
+    logger.info("stored github_pat for user=%s (%s)", user.id, redact_token(pat))
+    return {"stored": True}
+
+
+@app.get("/github/token")
+async def get_github_token_status(user: ClerkUser = Depends(require_user)) -> dict:
+    """Boolean check: does the caller have a stored PAT?  We never
+    return the token itself.  Drives the "Connected to GitHub"
+    indicator in the Flutter settings UI."""
+    db: Db = state["db"]
+    return {"has_token": db.has_credential(user_id=user.id, kind="github_pat")}
+
+
+@app.delete("/github/token")
+async def delete_github_token(user: ClerkUser = Depends(require_user)) -> dict:
+    db: Db = state["db"]
+    if not db.delete_credential(user_id=user.id, kind="github_pat"):
+        raise HTTPException(404, "no GitHub token stored for this user")
+    return {"deleted": True}
+
+
+@app.post("/projects/{project_id}/push")
+async def push_project_to_github(
+    project_id: str,
+    body: GithubPush,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Push the project's HEAD artifact set to ``owner/repo`` as a
+    new branch.  The PAT is decrypted, used in-memory only, and
+    never logged.
+
+    Errors map to:
+      - 400: malformed inputs (bad repo, empty branch, etc.)
+      - 401: GitHub rejected the PAT.
+      - 404: project not found / not owned, OR no PAT stored.
+      - 502: any other git push failure.
+    """
+    cm = _require_credentials_configured()
+    db: Db = state["db"]
+    scope = None if user.source == "admin" else user.id
+    project = db.get_project(project_id, user_id=scope)
+    if project is None:
+        raise HTTPException(404, f"project `{project_id}` not found")
+
+    ciphertext = db.get_credential(user_id=user.id, kind="github_pat")
+    if ciphertext is None:
+        raise HTTPException(
+            404,
+            "no GitHub token stored for this user. "
+            "POST /github/token with your PAT first.",
+        )
+
+    # Validate the repo shape early so we don't even decrypt the PAT
+    # if the input is garbage.
+    try:
+        repo = validate_repo(body.repo)
+    except GithubPushError as exc:
+        raise HTTPException(400, exc.user_facing)
+
+    try:
+        pat = cm.decrypt(ciphertext)
+    except Exception as exc:
+        logger.exception("decrypt failed for user=%s: %s", user.id, exc)
+        raise HTTPException(
+            502,
+            "failed to decrypt stored PAT — has CREDENTIALS_KEY rotated?",
+        )
+
+    artifacts = db.load_project_artifacts(project_id)
+    if not artifacts:
+        raise HTTPException(400, "project has no files in HEAD to push")
+
+    try:
+        result = await asyncio.to_thread(
+            push_project,
+            project_name=project["name"],
+            artifacts=artifacts,
+            repo=repo,
+            branch=body.branch,
+            commit_message=body.commit_message,
+            pat=pat,
+        )
+    except GithubPushAuthError as exc:
+        raise HTTPException(401, exc.user_facing)
+    except GithubPushRepoError as exc:
+        raise HTTPException(404, exc.user_facing)
+    except GithubPushError as exc:
+        logger.warning("push failed for user=%s project=%s: %s", user.id, project_id, exc)
+        raise HTTPException(502, exc.user_facing)
+    finally:
+        # Best-effort scrub — Python ints/strs are immutable so we
+        # can't zeroize, but we drop the reference so the GC can.
+        del pat
+
+    logger.info(
+        "pushed project=%s for user=%s → %s @ %s (sha=%s)",
+        project_id, user.id, result.repo, result.branch, result.commit_sha[:8],
+    )
+    return {
+        "repo": result.repo,
+        "branch": result.branch,
+        "commit_sha": result.commit_sha,
+        "branch_url": result.branch_url,
+    }
 
 
 # ── Sprint 34: template edit + share-with-link ────────────────────────────────

@@ -214,6 +214,71 @@ class TallyOrchClient {
     }
   }
 
+  // ── Sprint 38: GitHub PAT + push ─────────────────────────────────────────
+
+  /// Returns `{has_token: bool}`.  Never returns the token itself.
+  Future<bool> hasGithubToken() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/github/token'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('github token status failed: ${resp.statusCode} ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return body['has_token'] as bool? ?? false;
+  }
+
+  Future<void> setGithubToken(String pat) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/github/token'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'pat': pat}),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('store github token failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
+  Future<void> deleteGithubToken() async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/github/token'),
+      headers: await _authHeaders,
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200 && resp.statusCode != 404) {
+      throw Exception('delete github token failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
+  /// Push a project's HEAD to a GitHub repo as a new branch.  The
+  /// stored PAT is used server-side; this method never sees it.
+  /// Returns the push result with branch_url.
+  Future<Map<String, dynamic>> pushProjectToGithub(
+    String projectId, {
+    required String repo,
+    String? branch,
+    String? commitMessage,
+  }) async {
+    final body = <String, dynamic>{'repo': repo};
+    if (branch != null && branch.isNotEmpty) body['branch'] = branch;
+    if (commitMessage != null && commitMessage.isNotEmpty) {
+      body['commit_message'] = commitMessage;
+    }
+    final resp = await _http.post(
+      baseUrl.resolve('/projects/$projectId/push'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    _checkAuth(resp);
+    if (resp.statusCode != 200) {
+      throw Exception('push project failed: ${resp.statusCode} ${resp.body}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   /// Sprint 29: promote a completed task's team_spec to a named template.
   /// Sprint 30: alternatively pass a hand-built team_spec straight from
   /// the visual builder. Exactly one of [sourceTaskId] or [teamSpec]

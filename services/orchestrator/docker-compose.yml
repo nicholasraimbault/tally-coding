@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v18
+    image: ghcr.io/nicholasraimbault/tally-orch:v19
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -39,6 +39,11 @@ services:
       # the dashboard's Webhooks page). Optional: empty = /webhooks/clerk
       # 503s but JWT-claim plan sync still works on every request.
       - CLERK_WEBHOOK_SECRET=${CLERK_WEBHOOK_SECRET:-}
+      # Sprint 38: master key for the encrypted credentials store
+      # (per-user GitHub PATs today; future BYOK).  Generate with
+      # `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
+      # Optional: empty = /github/* routes 503; everything else works.
+      - CREDENTIALS_KEY=${CREDENTIALS_KEY:-}
     volumes:
       - data:/data
 
