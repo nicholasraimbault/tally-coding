@@ -643,3 +643,252 @@ class TallyOrchClient {
 
   void close() => _http.close();
 }
+
+/// Sprint 46: TallyApi extends TallyOrchClient with credits, caps, checkout,
+/// auto-recharge, notifications, and push device endpoints.
+///
+/// Uses `bearerProvider` as the constructor parameter name (matching the
+/// Sprint 46 API client contract) while delegating to [TallyOrchClient]'s
+/// internals (`_http`, `baseUrl`, `_authHeaders`) via inheritance.
+class TallyApi extends TallyOrchClient {
+  TallyApi({
+    required super.baseUrl,
+    required BearerProvider bearerProvider,
+    super.client,
+  }) : super(provider: bearerProvider);
+
+  // ── Sprint 46: credit-based billing ─────────────────────────────────────
+
+  Future<Map<String, dynamic>> getCreditsBalance() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/billing/credits'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /billing/credits ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> getCaps() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/billing/caps'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /billing/caps ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> patchCaps({
+    int? perTaskCapCredits,
+    int? dailySpendCapCredits,
+    int? weeklySpendCapCredits,
+  }) async {
+    final body = <String, dynamic>{};
+    if (perTaskCapCredits != null) body['per_task_cap_credits'] = perTaskCapCredits;
+    if (dailySpendCapCredits != null) body['daily_spend_cap_credits'] = dailySpendCapCredits;
+    if (weeklySpendCapCredits != null) body['weekly_spend_cap_credits'] = weeklySpendCapCredits;
+    final resp = await _http.patch(
+      baseUrl.resolve('/billing/caps'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /billing/caps ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> postCreditsCheckout({
+    required int credits,
+    String successUrl = 'tallycoding://billing/success',
+    String cancelUrl = 'tallycoding://billing/cancel',
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/billing/credits/checkout'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({
+        'credits': credits,
+        'success_url': successUrl,
+        'cancel_url': cancelUrl,
+      }),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /billing/credits/checkout ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> postAutoRechargeSetup({
+    String successUrl = 'tallycoding://billing/auto-recharge/success',
+    String cancelUrl = 'tallycoding://billing/auto-recharge/cancel',
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/billing/auto-recharge/setup'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'success_url': successUrl, 'cancel_url': cancelUrl}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /billing/auto-recharge/setup ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> patchAutoRecharge({
+    int? mode,
+    int? blockCredits,
+    int? monthlyCapMicroUsd,
+  }) async {
+    final body = <String, dynamic>{};
+    if (mode != null) body['mode'] = mode;
+    if (blockCredits != null) body['block_credits'] = blockCredits;
+    if (monthlyCapMicroUsd != null) body['monthly_cap_micro_usd'] = monthlyCapMicroUsd;
+    final resp = await _http.patch(
+      baseUrl.resolve('/billing/auto-recharge'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /billing/auto-recharge ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<List<Map<String, dynamic>>> listNotifications({int limit = 50, int? sinceId}) async {
+    final qs = <String, String>{'limit': '$limit'};
+    if (sinceId != null) qs['since_id'] = '$sinceId';
+    final resp = await _http.get(
+      baseUrl.resolve('/notifications').replace(queryParameters: qs),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /notifications ${resp.statusCode}: ${resp.body}');
+    }
+    final body = Map<String, dynamic>.from(jsonDecode(resp.body));
+    return List<Map<String, dynamic>>.from(body['notifications'] as List);
+  }
+
+  Future<void> dismissNotification(int notificationId) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/notifications/$notificationId/dismiss'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /notifications/$notificationId/dismiss ${resp.statusCode}');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> listNotificationRules() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/notification_rules'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /notification_rules ${resp.statusCode}: ${resp.body}');
+    }
+    final body = Map<String, dynamic>.from(jsonDecode(resp.body));
+    return List<Map<String, dynamic>>.from(body['rules'] as List);
+  }
+
+  Future<Map<String, dynamic>> createNotificationRule({
+    required String kind,
+    required int threshold,
+    bool enabled = true,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/notification_rules'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'kind': kind, 'threshold': threshold, 'enabled': enabled}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /notification_rules ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> patchNotificationRule(
+    int ruleId, {
+    int? threshold,
+    bool? enabled,
+  }) async {
+    final body = <String, dynamic>{};
+    if (threshold != null) body['threshold'] = threshold;
+    if (enabled != null) body['enabled'] = enabled;
+    final resp = await _http.patch(
+      baseUrl.resolve('/notification_rules/$ruleId'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /notification_rules ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> deleteNotificationRule(int ruleId) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/notification_rules/$ruleId'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('DELETE /notification_rules/$ruleId ${resp.statusCode}');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> listPushDevices() async {
+    final resp = await _http.get(
+      baseUrl.resolve('/push/devices'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /push/devices ${resp.statusCode}: ${resp.body}');
+    }
+    final body = Map<String, dynamic>.from(jsonDecode(resp.body));
+    return List<Map<String, dynamic>>.from(body['devices'] as List);
+  }
+
+  Future<Map<String, dynamic>> registerPushDevice({
+    required String provider,
+    String? endpointUrl,
+    String? label,
+    String? platform,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/push/devices'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({
+        'provider': provider,
+        if (endpointUrl != null) 'endpoint_url': endpointUrl,
+        if (label != null) 'label': label,
+        if (platform != null) 'platform': platform,
+      }),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /push/devices ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> deletePushDevice(int deviceId) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/push/devices/$deviceId'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('DELETE /push/devices/$deviceId ${resp.statusCode}');
+    }
+  }
+
+  Future<Map<String, dynamic>> getTaskCost(String taskId) async {
+    final resp = await _http.get(
+      baseUrl.resolve('/tasks/$taskId/cost'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /tasks/$taskId/cost ${resp.statusCode}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+}
