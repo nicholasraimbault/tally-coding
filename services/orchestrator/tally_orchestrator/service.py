@@ -342,33 +342,78 @@ CREATE TABLE IF NOT EXISTS push_devices (
 CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, enabled);
 """
 
-# Sprint 33: plan caps. Keep them in code, not the DB, so tuning is a
-# one-liner deploy. `tasks` is the *count of tasks the user has
-# submitted this billing period*; `agent_seconds` is the cumulative
-# wall-time worker-side compute, tracked from result events. Either
-# cap hit → POST /tasks returns 429.
-QUOTA_PLANS = {
+# Sprint 46: credit-based plan config.  Replaces Sprint 33's
+# tasks-per-period model — credits are units of $0.01 of Red Pill
+# COGS.  Beta tiers are sold at 1.5× COGS markup (25% discount vs
+# stable's 2× markup) and stay locked for the life of a subscription.
+# `model_allowlist=None` means "any Red Pill model"; the Free tier
+# restricts to llama-3.3 only because its credits are too few to
+# safely allow premium reasoning models.
+QUOTA_PLANS: dict[str, dict] = {
     "free": {
-        "tasks": 25,
-        "agent_seconds": 1800,   # 30 min/mo
         "label": "Free",
-    },
-    "pro": {
-        "tasks": 500,
-        "agent_seconds": 36_000,  # 10 h/mo
-        "label": "Pro",
-    },
-    "team": {
-        "tasks": 5000,
-        "agent_seconds": 360_000,  # 100 h/mo
-        "label": "Team",
-    },
-    # Admin path bypasses caps; we still surface a row with practical
-    # infinity so /billing/usage doesn't 500 on the admin user.
-    "unlimited": {
+        "price_micro_usd_monthly": 0,
+        "included_credits": 50,
+        "default_per_task_cap_credits": 25,
+        "max_per_task_cap_credits": 50,
+        "model_allowlist": {"meta-llama/llama-3.3-70b-instruct"},
+        "overage_eligible": False,
+        "is_beta": False,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
         "tasks": 10**9,
         "agent_seconds": 10**9,
+    },
+    "pro_beta": {
+        "label": "Pro (Beta)",
+        "price_micro_usd_monthly": 15_000_000,
+        "included_credits": 1000,
+        "default_per_task_cap_credits": 100,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "max_beta": {
+        "label": "Max (Beta)",
+        "price_micro_usd_monthly": 75_000_000,
+        "included_credits": 5000,
+        "default_per_task_cap_credits": 500,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "ultra_beta": {
+        "label": "Ultra (Beta)",
+        "price_micro_usd_monthly": 150_000_000,
+        "included_credits": 10_000,
+        "default_per_task_cap_credits": 1000,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "unlimited": {
         "label": "Unlimited (admin)",
+        "price_micro_usd_monthly": 0,
+        "included_credits": 10**8,
+        "default_per_task_cap_credits": 10**8,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": False,
+        "is_beta": False,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
     },
 }
 
