@@ -43,7 +43,10 @@ logger = logging.getLogger("tally.clerk_billing")
 # Clerk's `pla` claim is "scope:slug" where scope is `u` (user) or `o`
 # (organization). Strip the scope; we only care about the slug, and
 # all our plans are user-level for now.
-_KNOWN_PLAN_SLUGS = {"free", "free_user", "pro", "team"}
+_KNOWN_PLAN_SLUGS = {
+    "free", "free_user", "pro", "team",  # legacy slugs (kept until Clerk dashboard is migrated)
+    "pro_beta", "max_beta", "ultra_beta",  # Sprint 46 beta tiers
+}
 
 
 def parse_plan_claim(pla: object) -> str | None:

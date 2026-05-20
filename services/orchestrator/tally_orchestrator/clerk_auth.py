@@ -142,3 +142,30 @@ def looks_like_jwt(token: str) -> bool:
     """Cheap heuristic: real JWTs start with `eyJ` (base64 of `{"`).
     Static admin tokens are URL-safe random bytes, never that prefix."""
     return token.startswith("eyJ")
+
+
+# Sprint 46: public alias for the internal JWT decoder, used by the
+# WebSocket auth helper (_ws_authenticate in service.py).  Callers must
+# supply a live ClerkValidator instance; the function just delegates to
+# its validate() method and returns the raw claims dict.
+def _verify_session_token(token: str, *, validator: "ClerkValidator") -> dict:
+    """Decode and verify a Clerk session JWT using *validator*.
+
+    Raises on any failure (signature invalid, token expired, etc.).
+    Returns the raw claims dict so callers can extract ``sub`` etc.
+
+    Example::
+
+        claims = _verify_session_token(token, validator=state["clerk_validator"])
+        user_id = claims.get("sub") or "anon"
+    """
+    import jwt as _jwt
+    signing_key = validator._jwks().get_signing_key_from_jwt(token).key
+    claims = _jwt.decode(
+        token,
+        signing_key,
+        algorithms=["RS256"],
+        issuer=validator.issuer,
+        options={"verify_aud": False},
+    )
+    return claims

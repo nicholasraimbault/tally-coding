@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 
 import 'api.dart';
 import 'screens/discord_shell.dart';
+import 'services/notifications_ws.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
@@ -135,25 +136,33 @@ class _AuthGate extends StatelessWidget {
     return ClerkErrorListener(
       child: ClerkAuthBuilder(
         signedInBuilder: (context, authState) {
+          // Extract as a named variable so both TallyOrchClient and
+          // NotificationsWsClient share the same token-minting closure.
+          Future<String?> bearerProvider() async {
+            // Mint a fresh JWT from the active Clerk session each
+            // call.  60-second-lifetime tokens never expire mid-
+            // request because we call this immediately before the
+            // HTTP request fires.
+            try {
+              final st = await authState.sessionToken();
+              return st.jwt;
+            } catch (e) {
+              if (kDebugMode) {
+                debugPrint('Clerk sessionToken() failed: $e');
+              }
+              return null;
+            }
+          }
+
           final client = TallyOrchClient(
             baseUrl: Uri.parse(_kOrchestratorUrl),
-            provider: () async {
-              // Mint a fresh JWT from the active Clerk session each
-              // call.  60-second-lifetime tokens never expire mid-
-              // request because we call this immediately before the
-              // HTTP request fires.
-              try {
-                final st = await authState.sessionToken();
-                return st.jwt;
-              } catch (e) {
-                if (kDebugMode) {
-                  debugPrint('Clerk sessionToken() failed: $e');
-                }
-                return null;
-              }
-            },
+            provider: bearerProvider,
           );
-          return _SignedInShell(client: client, authState: authState);
+          return _SignedInShell(
+            client: client,
+            authState: authState,
+            bearerProvider: bearerProvider,
+          );
         },
         signedOutBuilder: (context, _) => const _SignedOutScreen(),
       ),
@@ -202,16 +211,51 @@ class _SignedOutScreen extends StatelessWidget {
   }
 }
 
-class _SignedInShell extends StatelessWidget {
+class _SignedInShell extends StatefulWidget {
   final TallyOrchClient client;
   final ClerkAuthState authState;
-  const _SignedInShell({required this.client, required this.authState});
+  final Future<String?> Function() bearerProvider;
+
+  const _SignedInShell({
+    required this.client,
+    required this.authState,
+    required this.bearerProvider,
+  });
+
+  @override
+  State<_SignedInShell> createState() => _SignedInShellState();
+}
+
+class _SignedInShellState extends State<_SignedInShell> {
+  NotificationsWsClient? _wsClient;
+
+  @override
+  void initState() {
+    super.initState();
+    final baseUrl = widget.client.baseUrl;
+    final wsUri = baseUrl.replace(
+      scheme: baseUrl.scheme == 'https' ? 'wss' : 'ws',
+      path: '/ws/notifications',
+    );
+    _wsClient = NotificationsWsClient(
+      api: widget.client,
+      wsUrl: wsUri,
+      bearerProvider: widget.bearerProvider,
+    );
+    unawaited(_wsClient!.connect());
+  }
+
+  @override
+  void dispose() {
+    _wsClient?.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return _SignedInInherited(
-      authState: authState,
-      child: DiscordShellScreen(client: client),
+      authState: widget.authState,
+      child: DiscordShellScreen(client: widget.client),
     );
   }
 }

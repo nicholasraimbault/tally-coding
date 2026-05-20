@@ -49,6 +49,21 @@ FALLBACK_TEAM = {
 }
 
 
+def _fallback_team(model_allowlist: set[str] | None = None) -> dict:
+    """Sprint 46: build a Solo-Coder fallback that honors the user's
+    model allowlist.  Without this, a free-tier user whose architect
+    call failed would land on the Coder role's palette default
+    (typically `kimi-k2.6-instruct`) at dispatch time, bypassing the
+    llama-only restriction.  When allowlist is unconstrained (paid
+    tiers), no model is set and palette defaults apply normally."""
+    team = {**FALLBACK_TEAM, "agents": [dict(a) for a in FALLBACK_TEAM["agents"]]}
+    if model_allowlist:
+        forced = next(iter(model_allowlist))
+        for agent in team["agents"]:
+            agent["model"] = forced
+    return team
+
+
 def architect_team(
     *,
     description: str,
@@ -58,6 +73,7 @@ def architect_team(
     model: str = ARCHITECT_MODEL,
     templates: list[dict] | None = None,
     cost_recorder: Callable[[str, dict], None] | None = None,
+    model_allowlist: set[str] | None = None,
 ) -> dict:
     """Ask Tally to build a custom team for this task.
 
@@ -71,10 +87,10 @@ def architect_team(
     """
     if not palette:
         logger.warning("architect called with empty palette; using fallback")
-        return dict(FALLBACK_TEAM)
+        return _fallback_team(model_allowlist)
     if not description or not description.strip():
         logger.warning("architect called with empty description; using fallback")
-        return dict(FALLBACK_TEAM)
+        return _fallback_team(model_allowlist)
     palette_names = {r["name"] for r in palette}
     template_names = {t["name"] for t in (templates or [])}
     prompt = _build_prompt(description, palette, templates or [])
@@ -87,7 +103,7 @@ def architect_team(
         )
     except Exception as exc:
         logger.warning("architect Red Pill call failed: %s; using fallback", exc)
-        return dict(FALLBACK_TEAM)
+        return _fallback_team(model_allowlist)
     # Sprint 39: hand the cost back to the caller for accounting.
     # Recorder is best-effort — accounting failures must not affect
     # the task pipeline.
@@ -100,12 +116,27 @@ def architect_team(
     if parsed is None:
         logger.warning("architect returned non-JSON output; using fallback. raw[:200]=%r",
                        raw[:200] if raw else "")
-        return dict(FALLBACK_TEAM)
+        return _fallback_team(model_allowlist)
     cleaned = _validate_team_spec(parsed, palette_names)
     if cleaned is None:
         logger.warning("architect returned invalid team_spec; using fallback. raw[:200]=%r",
                        raw[:200] if raw else "")
-        return dict(FALLBACK_TEAM)
+        return _fallback_team(model_allowlist)
+    # Sprint 46: free tier restricts to llama-only.  If the architect
+    # picked anything else, silently override each agent's model.
+    # `next(iter(set))` is the fallback target — order is implementation-
+    # defined for sets with >1 member; today only the free tier sets an
+    # allowlist (single element) so the choice is deterministic.
+    if model_allowlist:
+        fallback_model = next(iter(model_allowlist))
+        for agent in cleaned.get("agents", []):
+            picked = agent.get("model")
+            if picked is not None and picked not in model_allowlist:
+                logger.info(
+                    "allowlist: replacing architect's pick %r with %r for role=%s",
+                    picked, fallback_model, agent.get("role"),
+                )
+                agent["model"] = fallback_model
     # Sprint 29: carry forward template_used IFF the model named a real
     # template AND the team matches that template's shape (cheap sanity
     # check; the orchestrator validates fully before bumping use_count).

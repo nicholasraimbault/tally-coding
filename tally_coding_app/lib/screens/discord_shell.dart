@@ -25,6 +25,7 @@ import '../main.dart';
 import 'billing_screen.dart';
 import 'custom_roles_screen.dart';
 import 'general_channel.dart';
+import 'notifications_screen.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'team_builder.dart';
@@ -178,7 +179,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       MaterialPageRoute(
         builder: (_) => BillingScreen(
           client: widget.client,
-          publishableKey: clerkPublishableKey,
         ),
       ),
     );
@@ -213,6 +213,16 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (_) => CustomRolesScreen(client: widget.client),
+      ),
+    );
+  }
+
+  /// Sprint 46 B7: server rail 🔔 → notifications screen (inbox + rules +
+  /// devices).
+  Future<void> _openNotifications(BuildContext context) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => NotificationsScreen(client: widget.client),
       ),
     );
   }
@@ -259,6 +269,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     onOpenTemplates: () => _openTemplates(context),
                     onOpenProjects: () => _openProjects(context),
                     onOpenCustomRoles: () => _openCustomRoles(context),
+                    onOpenNotifications: () => _openNotifications(context),
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   _ChannelList(
@@ -327,6 +338,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         onOpenProjects: () {
           Navigator.of(context).pop();
           _openProjects(context);
+        },
+        onOpenNotifications: () {
+          Navigator.of(context).pop();
+          _openNotifications(context);
         },
         onSignOut: () => resetTallyConfig(context),
       ),
@@ -473,6 +488,7 @@ class _ServerRail extends StatelessWidget {
   final VoidCallback onOpenTemplates;
   final VoidCallback onOpenProjects;
   final VoidCallback onOpenCustomRoles;
+  final VoidCallback onOpenNotifications;
   const _ServerRail({
     required this.onSignOut,
     required this.onOpenBuilder,
@@ -480,6 +496,7 @@ class _ServerRail extends StatelessWidget {
     required this.onOpenTemplates,
     required this.onOpenProjects,
     required this.onOpenCustomRoles,
+    required this.onOpenNotifications,
   });
 
   @override
@@ -522,6 +539,12 @@ class _ServerRail extends StatelessWidget {
             tooltip: 'Billing & usage',
             icon: const Icon(Icons.credit_card, color: Color(0xFF99AAB5)),
             onPressed: onOpenBilling,
+          ),
+          IconButton(
+            tooltip: 'Notifications',
+            icon: const Icon(Icons.notifications_outlined,
+                color: Color(0xFF99AAB5)),
+            onPressed: onOpenNotifications,
           ),
           const Spacer(),
           IconButton(
@@ -1011,6 +1034,7 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
   final VoidCallback onOpenProjects;
+  final VoidCallback onOpenNotifications;
   final VoidCallback onSignOut;
   const _NarrowDrawer({
     required this.tasks,
@@ -1023,6 +1047,7 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onOpenBilling,
     required this.onOpenTemplates,
     required this.onOpenProjects,
+    required this.onOpenNotifications,
     required this.onSignOut,
   });
 
@@ -1075,6 +1100,12 @@ class _NarrowDrawer extends StatelessWidget {
                     icon: const Icon(Icons.credit_card, size: 18,
                         color: Color(0xFF99AAB5)),
                     onPressed: onOpenBilling,
+                  ),
+                  IconButton(
+                    tooltip: 'Notifications',
+                    icon: const Icon(Icons.notifications_outlined, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onOpenNotifications,
                   ),
                   IconButton(
                     tooltip: 'Sign out / reconnect',

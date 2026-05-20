@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -287,35 +287,133 @@ CREATE TABLE IF NOT EXISTS quotas (
     period_agent_seconds_used     INTEGER NOT NULL DEFAULT 0,
     updated_at                    REAL NOT NULL
 );
+
+-- Sprint 46: overage purchases — one row per successful credit top-up.
+CREATE TABLE IF NOT EXISTS overage_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    credits_purchased INTEGER NOT NULL,
+    cost_charged_micro_usd INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    stripe_payment_intent_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_overage_user_ts ON overage_purchases(user_id, ts DESC);
+
+-- Sprint 46: per-user notification rules (spend alerts, etc.).
+CREATE TABLE IF NOT EXISTS notification_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    threshold INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_fired_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_rules_user ON notification_rules(user_id, enabled);
+
+-- Sprint 46: notification log.
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    rule_id INTEGER,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info',
+    payload_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    dismissed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, dismissed_at, created_at DESC);
+
+-- Sprint 46: registered push devices for server-sent alerts.
+CREATE TABLE IF NOT EXISTS push_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_url TEXT,
+    label TEXT,
+    platform TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_seen_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, enabled);
 """
 
-# Sprint 33: plan caps. Keep them in code, not the DB, so tuning is a
-# one-liner deploy. `tasks` is the *count of tasks the user has
-# submitted this billing period*; `agent_seconds` is the cumulative
-# wall-time worker-side compute, tracked from result events. Either
-# cap hit → POST /tasks returns 429.
-QUOTA_PLANS = {
+# Sprint 46: credit-based plan config.  Replaces Sprint 33's
+# tasks-per-period model — credits are units of $0.01 of Red Pill
+# COGS.  Beta tiers are sold at 1.5× COGS markup (25% discount vs
+# stable's 2× markup) and stay locked for the life of a subscription.
+# `model_allowlist=None` means "any Red Pill model"; the Free tier
+# restricts to llama-3.3 only because its credits are too few to
+# safely allow premium reasoning models.
+QUOTA_PLANS: dict[str, dict] = {
     "free": {
-        "tasks": 25,
-        "agent_seconds": 1800,   # 30 min/mo
         "label": "Free",
-    },
-    "pro": {
-        "tasks": 500,
-        "agent_seconds": 36_000,  # 10 h/mo
-        "label": "Pro",
-    },
-    "team": {
-        "tasks": 5000,
-        "agent_seconds": 360_000,  # 100 h/mo
-        "label": "Team",
-    },
-    # Admin path bypasses caps; we still surface a row with practical
-    # infinity so /billing/usage doesn't 500 on the admin user.
-    "unlimited": {
+        "price_micro_usd_monthly": 0,
+        "included_credits": 50,
+        "default_per_task_cap_credits": 25,
+        "max_per_task_cap_credits": 50,
+        "model_allowlist": {"meta-llama/llama-3.3-70b-instruct"},
+        "overage_eligible": False,
+        "is_beta": False,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
         "tasks": 10**9,
         "agent_seconds": 10**9,
+    },
+    "pro_beta": {
+        "label": "Pro (Beta)",
+        "price_micro_usd_monthly": 15_000_000,
+        "included_credits": 1000,
+        "default_per_task_cap_credits": 100,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "max_beta": {
+        "label": "Max (Beta)",
+        "price_micro_usd_monthly": 75_000_000,
+        "included_credits": 5000,
+        "default_per_task_cap_credits": 500,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "ultra_beta": {
+        "label": "Ultra (Beta)",
+        "price_micro_usd_monthly": 150_000_000,
+        "included_credits": 10_000,
+        "default_per_task_cap_credits": 1000,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": True,
+        "is_beta": True,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
+    },
+    "unlimited": {
         "label": "Unlimited (admin)",
+        "price_micro_usd_monthly": 0,
+        "included_credits": 10**8,
+        "default_per_task_cap_credits": 10**8,
+        "max_per_task_cap_credits": None,
+        "model_allowlist": None,
+        "overage_eligible": False,
+        "is_beta": False,
+        # TODO(s46-a7): remove after credit gate replaces task-count gate
+        "tasks": 10**9,
+        "agent_seconds": 10**9,
     },
 }
 
@@ -326,6 +424,24 @@ def b64url_no_pad(data: bytes) -> str:
 
 def b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _verify_stripe_signature(payload: bytes, sig_header: str) -> dict:
+    """Verify a Stripe webhook signature; return the parsed event.
+
+    Raises HTTPException(503) when STRIPE_WEBHOOK_SECRET is not set.
+    Raises HTTPException(400) on any signature failure.
+    Must be a module-level function so tests can monkeypatch it via
+    ``tally_orchestrator.service._verify_stripe_signature``.
+    """
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(503, "STRIPE_WEBHOOK_SECRET not configured")
+    try:
+        import stripe
+        return stripe.Webhook.construct_event(payload, sig_header, secret)
+    except Exception as exc:
+        raise HTTPException(400, f"invalid stripe signature: {exc}")
 
 
 class TaskSubmit(BaseModel):
@@ -368,6 +484,52 @@ class TaskResponse(BaseModel):
     parent_task_id: str | None = None
     # Sprint 41: direct children's task ids in created-at order.
     child_task_ids: list[str] = []
+
+
+# ── Sprint 46 A12: billing request models ─────────────────────────────────────
+
+
+class CreditsCheckoutRequest(BaseModel):
+    credits: int
+    success_url: str = "tallycoding://billing/success"
+    cancel_url: str = "tallycoding://billing/cancel"
+
+
+class AutoRechargeSetupRequest(BaseModel):
+    success_url: str = "tallycoding://billing/auto-recharge/success"
+    cancel_url: str = "tallycoding://billing/auto-recharge/cancel"
+
+
+class AutoRechargePatchRequest(BaseModel):
+    mode: int | None = None  # 0, 1, 2, 3
+    block_credits: int | None = None
+    monthly_cap_micro_usd: int | None = None
+
+
+class CapsPatchRequest(BaseModel):
+    per_task_cap_credits: int | None = None
+    daily_spend_cap_credits: int | None = None
+    weekly_spend_cap_credits: int | None = None
+
+
+# ── Sprint 46 A15: notification + push device request models ──────────────────
+
+class NotificationRuleRequest(BaseModel):
+    kind: str  # 'period_pct' | 'daily_amount' | 'weekly_amount' | 'per_task_amount' | 'auto_recharge_monthly_pct'
+    threshold: int
+    enabled: bool = True
+
+
+class NotificationRulePatchRequest(BaseModel):
+    threshold: int | None = None
+    enabled: bool | None = None
+
+
+class PushDeviceRequest(BaseModel):
+    provider: str  # 'unifiedpush' | 'desktop_local'
+    endpoint_url: str | None = None
+    label: str | None = None
+    platform: str | None = None
 
 
 class Db:
@@ -437,6 +599,29 @@ class Db:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_share_token "
             "ON team_templates(share_token) WHERE share_token IS NOT NULL"
         )
+        # Sprint 46: credit-based pricing extends `quotas` with cap +
+        # overage + alert columns.  All additive; existing rows get
+        # NULL/default and behave as "no cap, overage off".
+        _s46_quota_cols = [
+            ("per_task_cap_credits", "INTEGER"),
+            ("daily_spend_cap_credits", "INTEGER"),
+            ("weekly_spend_cap_credits", "INTEGER"),
+            ("overage_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("auto_recharge_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("auto_recharge_block_credits", "INTEGER NOT NULL DEFAULT 500"),
+            ("auto_recharge_monthly_cap_micro_usd", "INTEGER"),
+            ("auto_recharge_spent_this_month_micro_usd", "INTEGER NOT NULL DEFAULT 0"),
+            ("stripe_payment_method_id", "TEXT"),
+            ("prepaid_credit_balance", "INTEGER NOT NULL DEFAULT 0"),
+            ("spend_alert_threshold_pct", "INTEGER NOT NULL DEFAULT 80"),
+            ("alert_80_sent_at", "REAL"),
+            ("alert_100_sent_at", "REAL"),
+        ]
+        for col, ddl in _s46_quota_cols:
+            try:
+                self._conn.execute(f"ALTER TABLE quotas ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
         self._seed_agent_roles()
 
     def _seed_agent_roles(self) -> None:
@@ -1388,6 +1573,96 @@ class Db:
             "calls": int(row[2] or 0),
         }
 
+    # ── Sprint 46: credit balance + period usage + overage state ───────────
+
+    def credits_used_this_period(self, user_id: str, period_start: float) -> int:
+        """Credits consumed since `period_start`.  Derived from
+        `cost_events.cost_micro_usd` (single source of truth — no
+        denormalized counter on `quotas`)."""
+        from .credits import micro_usd_to_credits
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM cost_events "
+            "WHERE user_id=? AND ts >= ?",
+            (user_id, period_start),
+        ).fetchone()
+        return micro_usd_to_credits(int(row[0] or 0))
+
+    def credits_used_in_window(self, user_id: str, since_ts: float) -> int:
+        """Credits in a rolling window (used for daily / weekly cap checks).
+
+        Identical query shape to `credits_used_this_period`; delegates
+        to keep the SQL in one place."""
+        return self.credits_used_this_period(user_id, since_ts)
+
+    def credits_available(self, user_id: str) -> int:
+        """Subscription pool remaining + prepaid balance.
+
+        Negative values clamp to 0 — we don't allow negative
+        available-credit anywhere callers might branch on `> 0`.
+        """
+        q = self.get_or_create_quota(user_id)
+        plan = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
+        used = self.credits_used_this_period(user_id, q["period_start"])
+        subscription_left = max(0, plan["included_credits"] - used)
+        return subscription_left + int(q.get("prepaid_credit_balance") or 0)
+
+    def get_prepaid_balance(self, user_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT prepaid_credit_balance FROM quotas WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_prepaid_balance(self, user_id: str, credits: int) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def increment_prepaid_balance(self, user_id: str, delta: int) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance = prepaid_credit_balance + ?, "
+            "updated_at=? WHERE user_id=?",
+            (delta, time.time(), user_id),
+        )
+
+    def consume_prepaid_balance(self, user_id: str, credits: int) -> None:
+        """Decrement (clamped at 0).  Called from the cost-event insert
+        path when a task's cost lands and subscription credits are
+        already exhausted."""
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance = MAX(0, prepaid_credit_balance - ?), "
+            "updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def effective_per_task_cap_credits(self, user_id: str) -> int:
+        """Quota override wins; plan default otherwise."""
+        q = self.get_or_create_quota(user_id)
+        override = q.get("per_task_cap_credits")
+        if override is not None:
+            return int(override)
+        plan = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
+        return int(plan["default_per_task_cap_credits"])
+
+    def set_per_task_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET per_task_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def set_daily_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET daily_spend_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def set_weekly_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET weekly_spend_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
     # ── Sprint 38: encrypted per-user credentials ──────────────────────────
 
     def put_credential(self, *, user_id: str, kind: str, ciphertext: bytes) -> None:
@@ -1504,7 +1779,12 @@ class Db:
         """
         row = self._conn.execute(
             "SELECT plan, stripe_customer_id, stripe_subscription_id, "
-            "period_start, period_tasks_used, period_agent_seconds_used, updated_at "
+            "period_start, period_tasks_used, period_agent_seconds_used, updated_at, "
+            "per_task_cap_credits, daily_spend_cap_credits, weekly_spend_cap_credits, "
+            "overage_enabled, auto_recharge_mode, auto_recharge_block_credits, "
+            "auto_recharge_monthly_cap_micro_usd, auto_recharge_spent_this_month_micro_usd, "
+            "stripe_payment_method_id, prepaid_credit_balance, spend_alert_threshold_pct, "
+            "alert_80_sent_at, alert_100_sent_at "
             "FROM quotas WHERE user_id=?", (user_id,),
         ).fetchone()
         is_admin = user_id in ("admin", "legacy-admin")
@@ -1521,6 +1801,19 @@ class Db:
                 "stripe_customer_id": None, "stripe_subscription_id": None,
                 "period_start": now, "period_tasks_used": 0,
                 "period_agent_seconds_used": 0, "updated_at": now,
+                "per_task_cap_credits": None,
+                "daily_spend_cap_credits": None,
+                "weekly_spend_cap_credits": None,
+                "overage_enabled": 0,
+                "auto_recharge_mode": 0,
+                "auto_recharge_block_credits": 500,
+                "auto_recharge_monthly_cap_micro_usd": None,
+                "auto_recharge_spent_this_month_micro_usd": 0,
+                "stripe_payment_method_id": None,
+                "prepaid_credit_balance": 0,
+                "spend_alert_threshold_pct": 80,
+                "alert_80_sent_at": None,
+                "alert_100_sent_at": None,
             }
         stored_plan = row[0]
         if plan_hint and not is_admin and plan_hint != stored_plan:
@@ -1530,11 +1823,32 @@ class Db:
                 (plan_hint, now, user_id),
             )
             stored_plan = plan_hint
+            # Sprint 46: seed default rules on plan upgrade.  Best-effort —
+            # never let alert seeding fail an opportunistic plan sync.
+            if plan_hint != "free":
+                try:
+                    from .notifications import seed_default_rules
+                    seed_default_rules(self, user_id, plan=plan_hint)
+                except Exception:
+                    pass
         return {
             "user_id": user_id, "plan": stored_plan,
             "stripe_customer_id": row[1], "stripe_subscription_id": row[2],
             "period_start": row[3], "period_tasks_used": row[4],
             "period_agent_seconds_used": row[5], "updated_at": row[6],
+            "per_task_cap_credits": row[7],
+            "daily_spend_cap_credits": row[8],
+            "weekly_spend_cap_credits": row[9],
+            "overage_enabled": row[10],
+            "auto_recharge_mode": row[11],
+            "auto_recharge_block_credits": row[12],
+            "auto_recharge_monthly_cap_micro_usd": row[13],
+            "auto_recharge_spent_this_month_micro_usd": row[14],
+            "stripe_payment_method_id": row[15],
+            "prepaid_credit_balance": row[16],
+            "spend_alert_threshold_pct": row[17],
+            "alert_80_sent_at": row[18],
+            "alert_100_sent_at": row[19],
         }
 
     def increment_task_count(self, user_id: str, delta: int = 1) -> None:
@@ -2609,6 +2923,73 @@ class Orchestrator:
                                 task_id[:8], agent_idx, target_agent["role"],
                                 model, total, format_micro_usd(cost),
                             )
+                            # Sprint 46 Checkpoint 6 — mid-run period cap +
+                            # auto-recharge.  After this cost event, if the
+                            # user's period pool just went negative AND they
+                            # have Mode 2/3 auto-recharge with overage
+                            # enabled, try a top-up.  If they don't (or
+                            # top-up fails), abort the task with
+                            # period_cap_reached.
+                            try:
+                                avail = self.db.credits_available(owner)
+                                if avail <= 0:
+                                    quota = self.db.get_or_create_quota(owner)
+                                    mode = int(quota.get("auto_recharge_mode") or 0)
+                                    handled = False
+                                    if mode == 3:
+                                        try:
+                                            from .stripe_direct import trigger_auto_recharge_unlimited
+                                            await trigger_auto_recharge_unlimited(self.db, owner)
+                                            handled = True
+                                        except Exception as rex:
+                                            logger.warning(
+                                                "mid-run auto-recharge (mode 3) failed for %s: %s",
+                                                owner, rex,
+                                            )
+                                    elif mode == 2:
+                                        try:
+                                            from .stripe_direct import trigger_auto_recharge_capped
+                                            if await trigger_auto_recharge_capped(self.db, owner):
+                                                handled = True
+                                        except Exception as rex:
+                                            logger.warning(
+                                                "mid-run auto-recharge (mode 2) failed for %s: %s",
+                                                owner, rex,
+                                            )
+                                    if not handled:
+                                        self.db.mark_failed(
+                                            task_id,
+                                            "period cap reached: no credits available",
+                                        )
+                                        self._task_artifacts.pop(task_id, None)
+                                        self.db.delete_artifacts(task_id)
+                                        await self._publish_status(task_id, "aborted_cost_cap", {
+                                            "reason": "period_cap_reached",
+                                            "available_credits": 0,
+                                        })
+                                        logger.info(
+                                            "task %s aborted: period cap reached for user=%s",
+                                            task_id[:8], owner,
+                                        )
+                                        return
+                            except Exception as exc:
+                                logger.warning(
+                                    "period cap check failed for task %s: %s",
+                                    task_id[:8], exc,
+                                )
+                            # Sprint 46 Checkpoint 7 — alert eval on every
+                            # agent cost event.  Fires notification rules
+                            # whose threshold was just crossed.
+                            try:
+                                from .notifications import (
+                                    evaluate_rules_for_cost_event,
+                                    fan_out_push,
+                                )
+                                fired = evaluate_rules_for_cost_event(self.db, owner)
+                                for f in fired:
+                                    asyncio.create_task(fan_out_push(self.db, owner, f["id"]))
+                            except Exception as exc:
+                                logger.warning("alert eval (agent) raised: %s", exc)
             except Exception as exc:
                 logger.warning("usage-accounting raised; ignoring: %s", exc)
         # Did this agent fail? Short-circuit the rest of the workflow.
@@ -2621,6 +3002,40 @@ class Orchestrator:
                 {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
             )
             return
+        # Sprint 46: Checkpoint 5 — mid-run per-task cap.  If the
+        # cumulative cost for this task has crossed the user's per-task
+        # cap, abort the remaining stages.  S41's task_artifacts
+        # retention rule applies — partials stay.
+        try:
+            from .credits import micro_usd_to_credits
+            task_cost_micro = self.db.task_cost(task_id)["total_micro_usd"]
+            task_cost_credits = micro_usd_to_credits(task_cost_micro)
+            _task_for_cap = self.db.get_task(task_id)
+            user_id = (_task_for_cap.get("user_id") if _task_for_cap else None) or "legacy-admin"
+            effective_cap = self.db.effective_per_task_cap_credits(user_id)
+            if task_cost_credits > effective_cap:
+                self.db.mark_failed(
+                    task_id,
+                    f"cost cap reached: {task_cost_credits} > {effective_cap}",
+                )
+                self._task_artifacts.pop(task_id, None)
+                # Match other abort paths (failed agent, end-of-task failure):
+                # durable artifact rows are only retained for SUCCESSFUL tasks
+                # so child tasks can hydrate from them.
+                self.db.delete_artifacts(task_id)
+                await self._publish_status(task_id, "aborted_cost_cap", {
+                    "cost_credits": task_cost_credits,
+                    "cap_credits": effective_cap,
+                })
+                logger.info(
+                    "task %s aborted: cost cap %d > %d",
+                    task_id[:8], task_cost_credits, effective_cap,
+                )
+                return
+        except Exception as exc:
+            # Cost cap is safety, not feature — never crash the
+            # orchestrator if accounting fails.
+            logger.warning("cost cap check failed for task %s: %s", task_id[:8], exc)
         # Sprint 27: stage-aware advancement. The agent we just finished
         # is in some stage; only advance to the *next* stage when EVERY
         # agent in this stage has reached a terminal status. Sequential
@@ -3650,6 +4065,10 @@ async def submit_task(
             # Pill call surfaces token usage into cost_events.  Per-
             # agent worker cost is captured separately at result-event
             # time once workers start reporting `usage_tokens`.
+            # Sprint 46: capture the event loop NOW (we're in async
+            # context); the closure runs inside asyncio.to_thread where
+            # asyncio.get_event_loop() raises on Python 3.10+.
+            _loop_for_recorder = asyncio.get_running_loop()
             def _record_architect_cost(model: str, usage: dict) -> None:
                 prompt = int(usage.get("prompt_tokens", 0) or 0)
                 completion = int(usage.get("completion_tokens", 0) or 0)
@@ -3668,7 +4087,23 @@ async def submit_task(
                     "architect call: user=%s model=%s tokens=%d cost=%s",
                     user.id, model, total, format_micro_usd(cost),
                 )
+                # Sprint 46: Checkpoint 7 — evaluate alert rules after each
+                # architect cost event.  _record_architect_cost runs inside
+                # asyncio.to_thread so we must use call_soon_threadsafe to
+                # schedule coroutines back on the event loop.
+                # Worker-side wiring deferred to A18.
+                try:
+                    from .notifications import evaluate_rules_for_cost_event, fan_out_push
+                    fired = evaluate_rules_for_cost_event(db, user.id)
+                    for f in fired:
+                        _loop_for_recorder.call_soon_threadsafe(
+                            asyncio.create_task,
+                            fan_out_push(db, user.id, f["id"]),
+                        )
+                except Exception as exc:
+                    logger.warning("alert evaluation raised: %s", exc)
 
+            plan_caps_for_arch = QUOTA_PLANS.get(user.plan or "free", QUOTA_PLANS["free"])
             team_spec = await asyncio.to_thread(
                 architect_team,
                 description=body.description,
@@ -3677,34 +4112,104 @@ async def submit_task(
                 redpill_base=orch.redpill_base,
                 templates=templates,
                 cost_recorder=_record_architect_cost,
+                model_allowlist=plan_caps_for_arch.get("model_allowlist"),
             )
             if isinstance(team_spec, dict) and team_spec.get("template_used"):
                 db.touch_template(team_spec["template_used"], user_id=scope)
         except Exception as exc:
             logger.exception("architect call raised; falling back to single-agent: %s", exc)
             team_spec = None
-    # Sprint 33: per-user quota enforcement. Admin path bypasses by
-    # virtue of get_or_create_quota assigning 'unlimited'. Everyone
-    # else: check `period_tasks_used` against the plan's cap before
-    # we burn the architect's LLM call cost on a 429.
+    # Sprint 46: credit-based pre-submit gates.  Replace the old
+    # task-count cap with credit-of-COGS accounting + daily/weekly
+    # spend caps.  Admin's `unlimited` plan has 10**8 included
+    # credits so this check is a no-op for them.
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
-    plan_caps = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
-    if quota["period_tasks_used"] >= plan_caps["tasks"]:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "quota_exceeded",
-                "plan": quota["plan"],
-                "cap": plan_caps["tasks"],
-                "used": quota["period_tasks_used"],
-                "metric": "tasks_per_period",
-                # Sprint 33-rest: clients should open the Clerk-hosted
-                # PricingTable widget (in-app via clerk_flutter) to
-                # upgrade; no orchestrator-side checkout endpoint
-                # exists anymore.
-                "upgrade_action": "open_pricing_table",
-            },
-        )
+    available = db.credits_available(user.id)
+    if available <= 0:
+        # Mode 3 (full auto unlimited) auto-tops-up before failing
+        mode = int(quota.get("auto_recharge_mode") or 0)
+        recharged = False
+        if mode == 3:
+            try:
+                from .stripe_direct import trigger_auto_recharge_unlimited
+                await trigger_auto_recharge_unlimited(db, user.id)
+                recharged = True
+            except Exception as exc:
+                logger.warning("auto_recharge_unlimited failed for %s: %s", user.id, exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "auto_recharge_payment_failed",
+                            "message": "Stripe unreachable, retry shortly"},
+                )
+        elif mode == 2:
+            try:
+                from .stripe_direct import trigger_auto_recharge_capped
+                if await trigger_auto_recharge_capped(db, user.id):
+                    recharged = True
+            except Exception as exc:
+                logger.warning("auto_recharge_capped failed for %s: %s", user.id, exc)
+        if not recharged:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "no_credits_remaining",
+                    "plan": quota["plan"],
+                    "available_credits": 0,
+                    "overage_enabled": bool(quota.get("overage_enabled") or 0),
+                    "upgrade_action": "open_pricing_table",
+                },
+            )
+    # Daily cap (rolling 24h)
+    daily_cap = quota.get("daily_spend_cap_credits")
+    if daily_cap is not None and int(daily_cap) > 0:
+        day_since = time.time() - 86400
+        daily_used = db.credits_used_in_window(user.id, day_since)
+        if daily_used >= int(daily_cap):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "daily_cap_reached",
+                    "cap_credits": int(daily_cap),
+                    "used_credits": daily_used,
+                },
+            )
+    # Weekly cap (rolling 7d)
+    weekly_cap = quota.get("weekly_spend_cap_credits")
+    if weekly_cap is not None and int(weekly_cap) > 0:
+        week_since = time.time() - 7 * 86400
+        weekly_used = db.credits_used_in_window(user.id, week_since)
+        if weekly_used >= int(weekly_cap):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "weekly_cap_reached",
+                    "cap_credits": int(weekly_cap),
+                    "used_credits": weekly_used,
+                },
+            )
+    # Sprint 46: Checkpoint 4 — estimated-cost pre-check.  If the team
+    # team_spec's estimated cost exceeds the user's per-task cap, try
+    # rerouting to cheap models; if still over, abort with a 402
+    # before we burn agent compute.
+    from .cost_estimate import estimate_team_cost_credits, reroute_to_cheap_models
+    if team_spec and team_spec.get("agents"):
+        cap = db.effective_per_task_cap_credits(user.id)
+        estimate = estimate_team_cost_credits(team_spec, len(body.description))
+        if estimate["total_credits"] > cap:
+            # Try one re-route pass to llama-only
+            cheap_allowlist = {"meta-llama/llama-3.3-70b-instruct"}
+            team_spec = reroute_to_cheap_models(team_spec, cheap_allowlist)
+            estimate = estimate_team_cost_credits(team_spec, len(body.description))
+        if estimate["total_credits"] > cap:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "task_cap_estimated_exceeds",
+                    "estimated_credits": estimate["total_credits"],
+                    "cap_credits": cap,
+                    "per_agent": estimate["per_agent"],
+                },
+            )
     # Sprint 37: validate project_id (if supplied) before binding the
     # task to it.  Owner-scoped so a Clerk user can't smuggle their
     # task into someone else's project.
@@ -4535,6 +5040,395 @@ async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
     return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
 
 
+# ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
+
+
+@app.get("/billing/credits")
+async def get_credits_balance(
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: credit balance + plan summary for the billing screen."""
+    db: Db = state["db"]
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
+    plan = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
+    used = db.credits_used_this_period(user.id, quota["period_start"])
+    available = db.credits_available(user.id)
+    return {
+        "plan": quota["plan"],
+        "plan_label": plan["label"],
+        "is_beta": plan.get("is_beta", False),
+        "period_start": quota["period_start"],
+        "included_credits": plan["included_credits"],
+        "used_credits": used,
+        "available_credits": available,
+        "prepaid_credit_balance": int(quota.get("prepaid_credit_balance") or 0),
+        "overage_enabled": bool(quota.get("overage_enabled") or 0),
+        "auto_recharge_mode": int(quota.get("auto_recharge_mode") or 0),
+        "auto_recharge_block_credits": int(quota.get("auto_recharge_block_credits") or 500),
+        "auto_recharge_monthly_cap_micro_usd": quota.get("auto_recharge_monthly_cap_micro_usd"),
+        "auto_recharge_spent_this_month_micro_usd": int(
+            quota.get("auto_recharge_spent_this_month_micro_usd") or 0
+        ),
+        "stripe_payment_method_id": quota.get("stripe_payment_method_id"),
+        "spend_alert_threshold_pct": int(quota.get("spend_alert_threshold_pct") or 80),
+    }
+
+
+@app.get("/billing/caps")
+async def get_caps(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: spending caps for the calling user."""
+    db: Db = state["db"]
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
+    return {
+        "per_task_cap_credits": db.effective_per_task_cap_credits(user.id),
+        "daily_spend_cap_credits": quota.get("daily_spend_cap_credits"),
+        "weekly_spend_cap_credits": quota.get("weekly_spend_cap_credits"),
+    }
+
+
+@app.patch("/billing/caps")
+async def patch_caps(
+    body: CapsPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: update spending caps.  Returns the updated caps dict."""
+    db: Db = state["db"]
+    db.get_or_create_quota(user.id, plan_hint=user.plan)
+    if body.per_task_cap_credits is not None:
+        plan = QUOTA_PLANS.get(user.plan or "free", QUOTA_PLANS["free"])
+        max_cap = plan.get("max_per_task_cap_credits")
+        if max_cap is not None and body.per_task_cap_credits > max_cap:
+            raise HTTPException(400, f"per_task_cap exceeds plan max ({max_cap})")
+        db.set_per_task_cap(user.id, body.per_task_cap_credits)
+    if body.daily_spend_cap_credits is not None:
+        db.set_daily_cap(user.id, body.daily_spend_cap_credits)
+    if body.weekly_spend_cap_credits is not None:
+        db.set_weekly_cap(user.id, body.weekly_spend_cap_credits)
+    return await get_caps(user=user)
+
+
+@app.post("/billing/credits/checkout")
+async def post_credits_checkout(
+    body: CreditsCheckoutRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a Stripe Checkout Session for a one-time credit purchase."""
+    db: Db = state["db"]
+    from .stripe_direct import create_credits_checkout_session, StripeNotConfiguredError
+    try:
+        out = create_credits_checkout_session(
+            db, user_id=user.id, credits=body.credits,
+            success_url=body.success_url, cancel_url=body.cancel_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except StripeNotConfiguredError:
+        raise HTTPException(503, "Stripe billing not configured")
+    except Exception as exc:
+        # Network blip / Stripe API error → 503 so client can retry.
+        logger.warning("checkout session creation failed: %s", exc)
+        raise HTTPException(503, "Stripe API error; retry shortly")
+    return out
+
+
+@app.post("/billing/auto-recharge/setup")
+async def post_auto_recharge_setup(
+    body: AutoRechargeSetupRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a Stripe Setup Session to save a payment method."""
+    db: Db = state["db"]
+    from .stripe_direct import create_setup_session, StripeNotConfiguredError
+    try:
+        return create_setup_session(
+            db, user_id=user.id, success_url=body.success_url, cancel_url=body.cancel_url,
+        )
+    except StripeNotConfiguredError:
+        raise HTTPException(503, "Stripe billing not configured")
+    except Exception as exc:
+        logger.warning("setup session creation failed: %s", exc)
+        raise HTTPException(503, "Stripe API error; retry shortly")
+
+
+@app.patch("/billing/auto-recharge")
+async def patch_auto_recharge(
+    body: AutoRechargePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: configure auto-recharge mode, block size, and monthly cap."""
+    db: Db = state["db"]
+    db.get_or_create_quota(user.id, plan_hint=user.plan)
+    fields: list[str] = []
+    values: list = []
+    if body.mode is not None:
+        if body.mode not in (0, 1, 2, 3):
+            raise HTTPException(400, "mode must be 0, 1, 2, or 3")
+        fields.append("auto_recharge_mode=?")
+        values.append(body.mode)
+        fields.append("overage_enabled=?")
+        values.append(0 if body.mode == 0 else 1)
+    if body.block_credits is not None:
+        if body.block_credits < 250:
+            raise HTTPException(400, "block_credits minimum is 250 ($5)")
+        fields.append("auto_recharge_block_credits=?")
+        values.append(body.block_credits)
+    if body.monthly_cap_micro_usd is not None:
+        if body.monthly_cap_micro_usd <= 0:
+            raise HTTPException(400, "monthly_cap_micro_usd must be > 0")
+        fields.append("auto_recharge_monthly_cap_micro_usd=?")
+        values.append(body.monthly_cap_micro_usd)
+    if not fields:
+        raise HTTPException(400, "no fields to update")
+    fields.append("updated_at=?")
+    values.append(time.time())
+    values.append(user.id)
+    db._conn.execute(
+        f"UPDATE quotas SET {', '.join(fields)} WHERE user_id=?", values,
+    )
+    return await get_credits_balance(user=user)
+
+
+# ── Sprint 46 A15: notifications + notification_rules + push devices ──────────
+
+_NOTIFICATION_RULE_KINDS = {
+    "period_pct", "daily_amount", "weekly_amount",
+    "per_task_amount", "auto_recharge_monthly_pct",
+}
+_PUSH_PROVIDERS = {"unifiedpush", "desktop_local"}
+
+
+@app.get("/notifications")
+async def get_notifications(
+    limit: int = 50,
+    since_id: int | None = None,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: list undismissed notifications for the calling user."""
+    from .notifications import list_notifications
+    db: Db = state["db"]
+    items = list_notifications(db, user.id, limit=limit, since_id=since_id)
+    next_since = max((n["id"] for n in items), default=since_id or 0)
+    return {"notifications": items, "next_since_id": next_since}
+
+
+@app.post("/notifications/{notification_id}/dismiss")
+async def post_dismiss_notification(
+    notification_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: mark one notification dismissed; 404 if not found."""
+    from .notifications import dismiss_notification
+    db: Db = state["db"]
+    if not dismiss_notification(db, user.id, notification_id):
+        raise HTTPException(404, "notification not found")
+    return {"ok": True}
+
+
+@app.get("/notification_rules")
+async def get_notification_rules(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: list all notification rules for the calling user."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, kind, threshold, enabled, last_fired_at, created_at "
+        "FROM notification_rules WHERE user_id=? ORDER BY created_at",
+        (user.id,),
+    ).fetchall()
+    rules = [
+        {"id": r[0], "kind": r[1], "threshold": r[2],
+         "enabled": bool(r[3]), "last_fired_at": r[4], "created_at": r[5]}
+        for r in rows
+    ]
+    return {"rules": rules}
+
+
+@app.post("/notification_rules")
+async def post_notification_rule(
+    body: NotificationRuleRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a notification rule; validates kind + threshold."""
+    if body.kind not in _NOTIFICATION_RULE_KINDS:
+        raise HTTPException(400, f"unknown kind: {body.kind}")
+    if body.threshold <= 0:
+        raise HTTPException(400, "threshold must be > 0")
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "INSERT INTO notification_rules "
+        "(user_id, kind, threshold, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user.id, body.kind, body.threshold, int(body.enabled), time.time()),
+    )
+    return {
+        "id": cur.lastrowid, "kind": body.kind, "threshold": body.threshold,
+        "enabled": body.enabled,
+    }
+
+
+@app.patch("/notification_rules/{rule_id}")
+async def patch_notification_rule(
+    rule_id: int,
+    body: NotificationRulePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: partial update of a notification rule.  Scoped to the calling user."""
+    db: Db = state["db"]
+    fields: list[str] = []
+    values: list = []
+    if body.threshold is not None:
+        if body.threshold <= 0:
+            raise HTTPException(400, "threshold must be > 0")
+        fields.append("threshold=?")
+        values.append(body.threshold)
+    if body.enabled is not None:
+        fields.append("enabled=?")
+        values.append(int(body.enabled))
+    if not fields:
+        raise HTTPException(400, "no fields to update")
+    values += [rule_id, user.id]
+    cur = db._conn.execute(
+        f"UPDATE notification_rules SET {', '.join(fields)} WHERE id=? AND user_id=?",
+        values,
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "rule not found")
+    row = db._conn.execute(
+        "SELECT id, kind, threshold, enabled, last_fired_at, created_at "
+        "FROM notification_rules WHERE id=? AND user_id=?",
+        (rule_id, user.id),
+    ).fetchone()
+    return {
+        "id": row[0], "kind": row[1], "threshold": row[2],
+        "enabled": bool(row[3]), "last_fired_at": row[4], "created_at": row[5],
+    }
+
+
+@app.delete("/notification_rules/{rule_id}")
+async def delete_notification_rule(
+    rule_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: delete a notification rule; 404 if not owned by calling user."""
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "DELETE FROM notification_rules WHERE id=? AND user_id=?",
+        (rule_id, user.id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "rule not found")
+    return {"ok": True}
+
+
+@app.get("/push/devices")
+async def get_push_devices(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: list registered push devices for the calling user."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, provider, endpoint_url, label, platform, enabled, last_seen_at, created_at "
+        "FROM push_devices WHERE user_id=? ORDER BY created_at DESC",
+        (user.id,),
+    ).fetchall()
+    devices = [
+        {"id": r[0], "provider": r[1], "endpoint_url": r[2], "label": r[3],
+         "platform": r[4], "enabled": bool(r[5]), "last_seen_at": r[6],
+         "created_at": r[7]}
+        for r in rows
+    ]
+    return {"devices": devices}
+
+
+@app.post("/push/devices")
+async def post_push_device(
+    body: PushDeviceRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: register a push device.  unifiedpush requires endpoint_url."""
+    if body.provider not in _PUSH_PROVIDERS:
+        raise HTTPException(400, f"unknown provider: {body.provider}")
+    if body.provider == "unifiedpush" and not body.endpoint_url:
+        raise HTTPException(400, "unifiedpush requires endpoint_url")
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "INSERT INTO push_devices "
+        "(user_id, provider, endpoint_url, label, platform, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?)",
+        (user.id, body.provider, body.endpoint_url, body.label, body.platform, time.time()),
+    )
+    return {
+        "id": cur.lastrowid, "provider": body.provider,
+        "endpoint_url": body.endpoint_url, "label": body.label,
+        "platform": body.platform, "enabled": True,
+    }
+
+
+@app.delete("/push/devices/{device_id}")
+async def delete_push_device(
+    device_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: deregister a push device; 404 if not owned by calling user."""
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "DELETE FROM push_devices WHERE id=? AND user_id=?",
+        (device_id, user.id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "device not found")
+    return {"ok": True}
+
+
+# ── Sprint 46 A17: WebSocket notification feed ────────────────────────────────
+
+
+async def _ws_authenticate(websocket: WebSocket) -> str:
+    """Bearer-token (admin) or Clerk JWT auth via ?token query param.
+
+    Returns the resolved user_id string; closes the WebSocket and raises
+    WebSocketDisconnect(4401) on any authentication failure.
+    """
+    token = websocket.query_params.get("token", "")
+    if not token:
+        await websocket.close(code=4401, reason="missing token")
+        raise WebSocketDisconnect(code=4401)
+    bearer = os.environ.get("TALLY_API_TOKEN", "").strip()
+    if bearer and token == bearer:
+        return "admin"
+    try:
+        from .clerk_auth import _verify_session_token
+        validator: ClerkValidator | None = state.get("clerk_validator")
+        if validator is None:
+            raise ValueError("Clerk validator not configured")
+        claims = _verify_session_token(token, validator=validator)
+        return claims.get("sub") or "anon"
+    except Exception:
+        await websocket.close(code=4401, reason="invalid token")
+        raise WebSocketDisconnect(code=4401)
+
+
+@app.websocket("/ws/notifications")
+async def ws_notifications(websocket: WebSocket) -> None:
+    """Sprint 46: live notification feed.
+
+    Client connects with ?token=<bearer-or-jwt>; receives hello then signals.
+    Ping/pong keepalive: client sends ``{"type": "ping"}``, server replies
+    ``{"type": "pong"}``.  ``fan_out_push`` delivers
+    ``{"type": "new_notification", "id": N}`` to all registered sockets.
+    """
+    await websocket.accept()
+    user_id = await _ws_authenticate(websocket)
+    from .notifications import register_websocket, unregister_websocket
+    register_websocket(user_id, websocket)
+    await websocket.send_json({"type": "hello", "user_id": user_id})
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            if msg.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        unregister_websocket(user_id, websocket)
+
+
 @app.get("/tasks/{task_id}/cost")
 async def task_cost(task_id: str, user: ClerkUser = Depends(require_user)) -> dict:
     """Sprint 39: per-task cost roll-up.  Drives the cost pill on
@@ -4637,6 +5531,12 @@ async def clerk_webhook(request: Request) -> dict:
             stripe_customer_id=None,  # Clerk owns payer state; no separate id
             stripe_subscription_id=evt.subscription_id,
         )
+        # Sprint 46: seed default alert rules for newly paid users
+        try:
+            from .notifications import seed_default_rules
+            seed_default_rules(db, evt.user_id, plan=new_plan)
+        except Exception as exc:
+            logger.warning("seed_default_rules raised: %s", exc)
         logger.info("clerk webhook %s → user=%s plan=%s sub=%s",
                     evt.type, evt.user_id, new_plan, evt.subscription_id)
         return {"received": True, "event": evt.type, "applied": True}
@@ -4644,6 +5544,154 @@ async def clerk_webhook(request: Request) -> dict:
     # Other event families (paymentAttempt.*, etc.): accepted, not acted on.
     logger.debug("clerk webhook: ignored event_type=%s", evt.type)
     return {"received": True, "event": evt.type, "applied": False}
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request) -> dict:
+    """Sprint 46: Stripe → Tally webhook receiver.
+
+    Events we act on:
+      - checkout.session.completed: one-time credit purchase completed
+      - setup_intent.succeeded: save card for auto-recharge
+      - payment_intent.succeeded: auto-recharge fired successfully
+      - payment_intent.payment_failed: disable auto-recharge + notify
+
+    Other events: 200 OK, no-op (Stripe retries on non-2xx indefinitely).
+    Idempotency is enforced via the ``overage_purchases.status='pending'``
+    guard — duplicate deliveries see status='succeeded' and are silently
+    dropped.
+    """
+    db: Db = state["db"]
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature") or ""
+    event = _verify_stripe_signature(payload, sig)
+    evt_type = event.get("type", "")
+    data = (event.get("data") or {}).get("object") or {}
+    metadata = data.get("metadata") or {}
+    user_id = metadata.get("user_id")
+
+    if evt_type == "checkout.session.completed":
+        if not user_id:
+            logger.warning("stripe webhook: checkout.session.completed missing user_id")
+            return {"ok": True}
+        pi_id = data.get("payment_intent")
+        credits = int(metadata.get("credits", "0") or 0)
+        # Idempotent: only credit if the matching overage_purchases row is
+        # still 'pending'.  Re-deliveries find status='succeeded' and no-op.
+        cur = db._conn.execute(
+            "SELECT id, credits_purchased, status FROM overage_purchases "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (pi_id, user_id),
+        ).fetchone()
+        if cur and cur[2] == "pending":
+            db.increment_prepaid_balance(user_id, int(cur[1]))
+            db._conn.execute(
+                "UPDATE overage_purchases SET status='succeeded' WHERE id=?",
+                (cur[0],),
+            )
+            logger.info(
+                "stripe: checkout.session.completed credited %d to user=%s from pi=%s",
+                cur[1], user_id, pi_id,
+            )
+        elif not cur and credits > 0:
+            # Defensive: no pending row but metadata contains credit count.
+            # Synthesize a row and credit.  Should not happen in normal flow.
+            db.increment_prepaid_balance(user_id, credits)
+            db._conn.execute(
+                "INSERT INTO overage_purchases "
+                "(user_id, ts, credits_purchased, cost_charged_micro_usd, "
+                "kind, stripe_payment_intent_id, status) "
+                "VALUES (?, ?, ?, ?, 'one_time', ?, 'succeeded')",
+                (user_id, time.time(), credits, credits * 20_000, pi_id),
+            )
+            logger.warning(
+                "stripe: checkout.session.completed: no pending row found; "
+                "synthesized credit=%d for user=%s", credits, user_id,
+            )
+        return {"ok": True}
+
+    if evt_type == "setup_intent.succeeded":
+        if not user_id:
+            logger.warning("stripe webhook: setup_intent.succeeded missing user_id")
+            return {"ok": True}
+        pm = data.get("payment_method")
+        customer = data.get("customer")
+        db._conn.execute(
+            "UPDATE quotas SET "
+            "stripe_payment_method_id=?, "
+            "stripe_customer_id=COALESCE(?, stripe_customer_id), "
+            "updated_at=? WHERE user_id=?",
+            (pm, customer, time.time(), user_id),
+        )
+        logger.info(
+            "stripe: setup_intent.succeeded saved payment_method=%s customer=%s for user=%s",
+            pm, customer, user_id,
+        )
+        return {"ok": True}
+
+    if evt_type == "payment_intent.succeeded":
+        if not user_id:
+            logger.warning("stripe webhook: payment_intent.succeeded missing user_id")
+            return {"ok": True}
+        pi_id = data.get("id")
+        cur = db._conn.execute(
+            "SELECT id, credits_purchased, status FROM overage_purchases "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (pi_id, user_id),
+        ).fetchone()
+        if cur and cur[2] == "pending":
+            db.increment_prepaid_balance(user_id, int(cur[1]))
+            db._conn.execute(
+                "UPDATE overage_purchases SET status='succeeded' WHERE id=?",
+                (cur[0],),
+            )
+            logger.info(
+                "stripe: payment_intent.succeeded credited %d to user=%s pi=%s",
+                cur[1], user_id, pi_id,
+            )
+        return {"ok": True}
+
+    if evt_type == "payment_intent.payment_failed":
+        if not user_id:
+            logger.warning("stripe webhook: payment_intent.payment_failed missing user_id")
+            return {"ok": True}
+        reason = (data.get("last_payment_error") or {}).get("message", "unknown")
+        pi_id = data.get("id")
+        db._conn.execute(
+            "UPDATE overage_purchases SET status='failed', failure_reason=? "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (reason, pi_id, user_id),
+        )
+        # Disable auto-recharge so the user is not bombarded with repeated
+        # failures.  They must explicitly re-enable from the billing screen.
+        db._conn.execute(
+            "UPDATE quotas SET auto_recharge_mode=0, overage_enabled=0, updated_at=? "
+            "WHERE user_id=?",
+            (time.time(), user_id),
+        )
+        logger.warning(
+            "stripe: payment_failed user=%s reason=%s; auto-recharge disabled",
+            user_id, reason,
+        )
+        # Sprint 46 A14: emit a spend-alert notification.  Best-effort —
+        # notifications.py is created in A14; wrap in try/except so A13
+        # stays fully testable before A14 lands.
+        try:
+            from .notifications import emit_notification
+            await emit_notification(
+                db, user_id,
+                kind="auto_recharge_failed",
+                severity="error",
+                payload={"reason": reason},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stripe webhook: emit_notification raised: %s", exc)
+        return {"ok": True}
+
+    # All other event types: accept-and-no-op.  Returning 200 prevents
+    # Stripe from retrying the delivery indefinitely.
+    logger.debug("stripe webhook: unhandled event type %s", evt_type)
+    return {"ok": True}
 
 
 @app.get("/admin/agent_roles")
