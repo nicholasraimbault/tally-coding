@@ -1,9 +1,10 @@
 # services/orchestrator/tally_orchestrator/cost_estimate.py
 """Sprint 46: per-team cost estimation.
 
-Placeholder heuristic.  Sprint 1.5 will calibrate constants from
-real samples (see spec "Open items" §1).  The shape of the returned
-dict is stable so callers don't change.
+Constants below are placeholders calibrated by hand from a few
+Sprint 42 sample tasks.  Re-calibrate from real production traffic
+post-launch — see `docs/SPRINT-46-CALIBRATION-PROCEDURE.md`.
+The shape of the returned dict is stable so callers don't change.
 """
 from __future__ import annotations
 
