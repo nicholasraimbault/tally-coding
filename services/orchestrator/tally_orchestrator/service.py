@@ -3998,6 +3998,10 @@ async def submit_task(
             # Pill call surfaces token usage into cost_events.  Per-
             # agent worker cost is captured separately at result-event
             # time once workers start reporting `usage_tokens`.
+            # Sprint 46: capture the event loop NOW (we're in async
+            # context); the closure runs inside asyncio.to_thread where
+            # asyncio.get_event_loop() raises on Python 3.10+.
+            _loop_for_recorder = asyncio.get_running_loop()
             def _record_architect_cost(model: str, usage: dict) -> None:
                 prompt = int(usage.get("prompt_tokens", 0) or 0)
                 completion = int(usage.get("completion_tokens", 0) or 0)
@@ -4024,9 +4028,8 @@ async def submit_task(
                 try:
                     from .notifications import evaluate_rules_for_cost_event, fan_out_push
                     fired = evaluate_rules_for_cost_event(db, user.id)
-                    loop = asyncio.get_event_loop()
                     for f in fired:
-                        loop.call_soon_threadsafe(
+                        _loop_for_recorder.call_soon_threadsafe(
                             asyncio.create_task,
                             fan_out_push(db, user.id, f["id"]),
                         )
