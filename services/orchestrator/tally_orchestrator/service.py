@@ -468,6 +468,32 @@ class TaskResponse(BaseModel):
     child_task_ids: list[str] = []
 
 
+# ── Sprint 46 A12: billing request models ─────────────────────────────────────
+
+
+class CreditsCheckoutRequest(BaseModel):
+    credits: int
+    success_url: str = "tallycoding://billing/success"
+    cancel_url: str = "tallycoding://billing/cancel"
+
+
+class AutoRechargeSetupRequest(BaseModel):
+    success_url: str = "tallycoding://billing/auto-recharge/success"
+    cancel_url: str = "tallycoding://billing/auto-recharge/cancel"
+
+
+class AutoRechargePatchRequest(BaseModel):
+    mode: int | None = None  # 0, 1, 2, 3
+    block_credits: int | None = None
+    monthly_cap_micro_usd: int | None = None
+
+
+class CapsPatchRequest(BaseModel):
+    per_task_cap_credits: int | None = None
+    daily_spend_cap_credits: int | None = None
+    weekly_spend_cap_credits: int | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -4880,6 +4906,145 @@ async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
     db: Db = state["db"]
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
     return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
+
+
+# ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
+
+
+@app.get("/billing/credits")
+async def get_credits_balance(
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: credit balance + plan summary for the billing screen."""
+    db: Db = state["db"]
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
+    plan = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
+    used = db.credits_used_this_period(user.id, quota["period_start"])
+    available = db.credits_available(user.id)
+    return {
+        "plan": quota["plan"],
+        "plan_label": plan["label"],
+        "is_beta": plan.get("is_beta", False),
+        "period_start": quota["period_start"],
+        "included_credits": plan["included_credits"],
+        "used_credits": used,
+        "available_credits": available,
+        "prepaid_credit_balance": int(quota.get("prepaid_credit_balance") or 0),
+        "overage_enabled": bool(quota.get("overage_enabled") or 0),
+        "auto_recharge_mode": int(quota.get("auto_recharge_mode") or 0),
+        "auto_recharge_block_credits": int(quota.get("auto_recharge_block_credits") or 500),
+        "auto_recharge_monthly_cap_micro_usd": quota.get("auto_recharge_monthly_cap_micro_usd"),
+        "auto_recharge_spent_this_month_micro_usd": int(
+            quota.get("auto_recharge_spent_this_month_micro_usd") or 0
+        ),
+        "stripe_payment_method_id": quota.get("stripe_payment_method_id"),
+        "spend_alert_threshold_pct": int(quota.get("spend_alert_threshold_pct") or 80),
+    }
+
+
+@app.get("/billing/caps")
+async def get_caps(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: spending caps for the calling user."""
+    db: Db = state["db"]
+    quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
+    return {
+        "per_task_cap_credits": db.effective_per_task_cap_credits(user.id),
+        "daily_spend_cap_credits": quota.get("daily_spend_cap_credits"),
+        "weekly_spend_cap_credits": quota.get("weekly_spend_cap_credits"),
+    }
+
+
+@app.patch("/billing/caps")
+async def patch_caps(
+    body: CapsPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: update spending caps.  Returns the updated caps dict."""
+    db: Db = state["db"]
+    db.get_or_create_quota(user.id, plan_hint=user.plan)
+    if body.per_task_cap_credits is not None:
+        plan = QUOTA_PLANS.get(user.plan or "free", QUOTA_PLANS["free"])
+        max_cap = plan.get("max_per_task_cap_credits")
+        if max_cap is not None and body.per_task_cap_credits > max_cap:
+            raise HTTPException(400, f"per_task_cap exceeds plan max ({max_cap})")
+        db.set_per_task_cap(user.id, body.per_task_cap_credits)
+    if body.daily_spend_cap_credits is not None:
+        db.set_daily_cap(user.id, body.daily_spend_cap_credits)
+    if body.weekly_spend_cap_credits is not None:
+        db.set_weekly_cap(user.id, body.weekly_spend_cap_credits)
+    return await get_caps(user=user)
+
+
+@app.post("/billing/credits/checkout")
+async def post_credits_checkout(
+    body: CreditsCheckoutRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a Stripe Checkout Session for a one-time credit purchase."""
+    db: Db = state["db"]
+    from .stripe_direct import create_credits_checkout_session, StripeNotConfiguredError
+    try:
+        out = create_credits_checkout_session(
+            db, user_id=user.id, credits=body.credits,
+            success_url=body.success_url, cancel_url=body.cancel_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except StripeNotConfiguredError:
+        raise HTTPException(503, "Stripe billing not configured")
+    return out
+
+
+@app.post("/billing/auto-recharge/setup")
+async def post_auto_recharge_setup(
+    body: AutoRechargeSetupRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a Stripe Setup Session to save a payment method."""
+    db: Db = state["db"]
+    from .stripe_direct import create_setup_session, StripeNotConfiguredError
+    try:
+        return create_setup_session(
+            db, user_id=user.id, success_url=body.success_url, cancel_url=body.cancel_url,
+        )
+    except StripeNotConfiguredError:
+        raise HTTPException(503, "Stripe billing not configured")
+
+
+@app.patch("/billing/auto-recharge")
+async def patch_auto_recharge(
+    body: AutoRechargePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: configure auto-recharge mode, block size, and monthly cap."""
+    db: Db = state["db"]
+    db.get_or_create_quota(user.id, plan_hint=user.plan)
+    fields: list[str] = []
+    values: list = []
+    if body.mode is not None:
+        if body.mode not in (0, 1, 2, 3):
+            raise HTTPException(400, "mode must be 0, 1, 2, or 3")
+        fields.append("auto_recharge_mode=?")
+        values.append(body.mode)
+        fields.append("overage_enabled=?")
+        values.append(0 if body.mode == 0 else 1)
+    if body.block_credits is not None:
+        if body.block_credits < 250:
+            raise HTTPException(400, "block_credits minimum is 250 ($5)")
+        fields.append("auto_recharge_block_credits=?")
+        values.append(body.block_credits)
+    if body.monthly_cap_micro_usd is not None:
+        fields.append("auto_recharge_monthly_cap_micro_usd=?")
+        values.append(body.monthly_cap_micro_usd)
+    if not fields:
+        raise HTTPException(400, "no fields to update")
+    fields.append("updated_at=?")
+    values.append(time.time())
+    values.append(user.id)
+    db._conn.execute(
+        f"UPDATE quotas SET {', '.join(fields)} WHERE user_id=?", values,
+    )
+    return await get_credits_balance(user=user)
 
 
 @app.get("/tasks/{task_id}/cost")
