@@ -1823,6 +1823,14 @@ class Db:
                 (plan_hint, now, user_id),
             )
             stored_plan = plan_hint
+            # Sprint 46: seed default rules on plan upgrade.  Best-effort —
+            # never let alert seeding fail an opportunistic plan sync.
+            if plan_hint != "free":
+                try:
+                    from .notifications import seed_default_rules
+                    seed_default_rules(self, user_id, plan=plan_hint)
+                except Exception:
+                    pass
         return {
             "user_id": user_id, "plan": stored_plan,
             "stripe_customer_id": row[1], "stripe_subscription_id": row[2],
@@ -4008,6 +4016,22 @@ async def submit_task(
                     "architect call: user=%s model=%s tokens=%d cost=%s",
                     user.id, model, total, format_micro_usd(cost),
                 )
+                # Sprint 46: Checkpoint 7 — evaluate alert rules after each
+                # architect cost event.  _record_architect_cost runs inside
+                # asyncio.to_thread so we must use call_soon_threadsafe to
+                # schedule coroutines back on the event loop.
+                # Worker-side wiring deferred to A18.
+                try:
+                    from .notifications import evaluate_rules_for_cost_event, fan_out_push
+                    fired = evaluate_rules_for_cost_event(db, user.id)
+                    loop = asyncio.get_event_loop()
+                    for f in fired:
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            fan_out_push(db, user.id, f["id"]),
+                        )
+                except Exception as exc:
+                    logger.warning("alert evaluation raised: %s", exc)
 
             plan_caps_for_arch = QUOTA_PLANS.get(user.plan or "free", QUOTA_PLANS["free"])
             team_spec = await asyncio.to_thread(
@@ -5384,6 +5408,12 @@ async def clerk_webhook(request: Request) -> dict:
             stripe_customer_id=None,  # Clerk owns payer state; no separate id
             stripe_subscription_id=evt.subscription_id,
         )
+        # Sprint 46: seed default alert rules for newly paid users
+        try:
+            from .notifications import seed_default_rules
+            seed_default_rules(db, evt.user_id, plan=new_plan)
+        except Exception as exc:
+            logger.warning("seed_default_rules raised: %s", exc)
         logger.info("clerk webhook %s → user=%s plan=%s sub=%s",
                     evt.type, evt.user_id, new_plan, evt.subscription_id)
         return {"received": True, "event": evt.type, "applied": True}
