@@ -426,6 +426,24 @@ def b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _verify_stripe_signature(payload: bytes, sig_header: str) -> dict:
+    """Verify a Stripe webhook signature; return the parsed event.
+
+    Raises HTTPException(503) when STRIPE_WEBHOOK_SECRET is not set.
+    Raises HTTPException(400) on any signature failure.
+    Must be a module-level function so tests can monkeypatch it via
+    ``tally_orchestrator.service._verify_stripe_signature``.
+    """
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(503, "STRIPE_WEBHOOK_SECRET not configured")
+    try:
+        import stripe
+        return stripe.Webhook.construct_event(payload, sig_header, secret)
+    except Exception as exc:
+        raise HTTPException(400, f"invalid stripe signature: {exc}")
+
+
 class TaskSubmit(BaseModel):
     description: str
     # Sprint 22: optional pre-architected team. When omitted, the legacy
@@ -5165,6 +5183,154 @@ async def clerk_webhook(request: Request) -> dict:
     # Other event families (paymentAttempt.*, etc.): accepted, not acted on.
     logger.debug("clerk webhook: ignored event_type=%s", evt.type)
     return {"received": True, "event": evt.type, "applied": False}
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request) -> dict:
+    """Sprint 46: Stripe → Tally webhook receiver.
+
+    Events we act on:
+      - checkout.session.completed: one-time credit purchase completed
+      - setup_intent.succeeded: save card for auto-recharge
+      - payment_intent.succeeded: auto-recharge fired successfully
+      - payment_intent.payment_failed: disable auto-recharge + notify
+
+    Other events: 200 OK, no-op (Stripe retries on non-2xx indefinitely).
+    Idempotency is enforced via the ``overage_purchases.status='pending'``
+    guard — duplicate deliveries see status='succeeded' and are silently
+    dropped.
+    """
+    db: Db = state["db"]
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature") or ""
+    event = _verify_stripe_signature(payload, sig)
+    evt_type = event.get("type", "")
+    data = (event.get("data") or {}).get("object") or {}
+    metadata = data.get("metadata") or {}
+    user_id = metadata.get("user_id")
+
+    if evt_type == "checkout.session.completed":
+        if not user_id:
+            logger.warning("stripe webhook: checkout.session.completed missing user_id")
+            return {"ok": True}
+        pi_id = data.get("payment_intent")
+        credits = int(metadata.get("credits", "0") or 0)
+        # Idempotent: only credit if the matching overage_purchases row is
+        # still 'pending'.  Re-deliveries find status='succeeded' and no-op.
+        cur = db._conn.execute(
+            "SELECT id, credits_purchased, status FROM overage_purchases "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (pi_id, user_id),
+        ).fetchone()
+        if cur and cur[2] == "pending":
+            db.increment_prepaid_balance(user_id, int(cur[1]))
+            db._conn.execute(
+                "UPDATE overage_purchases SET status='succeeded' WHERE id=?",
+                (cur[0],),
+            )
+            logger.info(
+                "stripe: checkout.session.completed credited %d to user=%s from pi=%s",
+                cur[1], user_id, pi_id,
+            )
+        elif not cur and credits > 0:
+            # Defensive: no pending row but metadata contains credit count.
+            # Synthesize a row and credit.  Should not happen in normal flow.
+            db.increment_prepaid_balance(user_id, credits)
+            db._conn.execute(
+                "INSERT INTO overage_purchases "
+                "(user_id, ts, credits_purchased, cost_charged_micro_usd, "
+                "kind, stripe_payment_intent_id, status) "
+                "VALUES (?, ?, ?, ?, 'one_time', ?, 'succeeded')",
+                (user_id, time.time(), credits, credits * 20_000, pi_id),
+            )
+            logger.warning(
+                "stripe: checkout.session.completed: no pending row found; "
+                "synthesized credit=%d for user=%s", credits, user_id,
+            )
+        return {"ok": True}
+
+    if evt_type == "setup_intent.succeeded":
+        if not user_id:
+            logger.warning("stripe webhook: setup_intent.succeeded missing user_id")
+            return {"ok": True}
+        pm = data.get("payment_method")
+        customer = data.get("customer")
+        db._conn.execute(
+            "UPDATE quotas SET "
+            "stripe_payment_method_id=?, "
+            "stripe_customer_id=COALESCE(?, stripe_customer_id), "
+            "updated_at=? WHERE user_id=?",
+            (pm, customer, time.time(), user_id),
+        )
+        logger.info(
+            "stripe: setup_intent.succeeded saved payment_method=%s customer=%s for user=%s",
+            pm, customer, user_id,
+        )
+        return {"ok": True}
+
+    if evt_type == "payment_intent.succeeded":
+        if not user_id:
+            logger.warning("stripe webhook: payment_intent.succeeded missing user_id")
+            return {"ok": True}
+        pi_id = data.get("id")
+        cur = db._conn.execute(
+            "SELECT id, credits_purchased, status FROM overage_purchases "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (pi_id, user_id),
+        ).fetchone()
+        if cur and cur[2] == "pending":
+            db.increment_prepaid_balance(user_id, int(cur[1]))
+            db._conn.execute(
+                "UPDATE overage_purchases SET status='succeeded' WHERE id=?",
+                (cur[0],),
+            )
+            logger.info(
+                "stripe: payment_intent.succeeded credited %d to user=%s pi=%s",
+                cur[1], user_id, pi_id,
+            )
+        return {"ok": True}
+
+    if evt_type == "payment_intent.payment_failed":
+        if not user_id:
+            logger.warning("stripe webhook: payment_intent.payment_failed missing user_id")
+            return {"ok": True}
+        reason = (data.get("last_payment_error") or {}).get("message", "unknown")
+        pi_id = data.get("id")
+        db._conn.execute(
+            "UPDATE overage_purchases SET status='failed', failure_reason=? "
+            "WHERE stripe_payment_intent_id=? AND user_id=?",
+            (reason, pi_id, user_id),
+        )
+        # Disable auto-recharge so the user is not bombarded with repeated
+        # failures.  They must explicitly re-enable from the billing screen.
+        db._conn.execute(
+            "UPDATE quotas SET auto_recharge_mode=0, overage_enabled=0, updated_at=? "
+            "WHERE user_id=?",
+            (time.time(), user_id),
+        )
+        logger.warning(
+            "stripe: payment_failed user=%s reason=%s; auto-recharge disabled",
+            user_id, reason,
+        )
+        # Sprint 46 A14: emit a spend-alert notification.  Best-effort —
+        # notifications.py is created in A14; wrap in try/except so A13
+        # stays fully testable before A14 lands.
+        try:
+            from .notifications import emit_notification
+            await emit_notification(
+                db, user_id,
+                kind="auto_recharge_failed",
+                severity="error",
+                payload={"reason": reason},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stripe webhook: emit_notification raised: %s", exc)
+        return {"ok": True}
+
+    # All other event types: accept-and-no-op.  Returning 200 prevents
+    # Stripe from retrying the delivery indefinitely.
+    logger.debug("stripe webhook: unhandled event type %s", evt_type)
+    return {"ok": True}
 
 
 @app.get("/admin/agent_roles")
