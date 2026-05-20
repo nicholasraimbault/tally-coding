@@ -287,6 +287,59 @@ CREATE TABLE IF NOT EXISTS quotas (
     period_agent_seconds_used     INTEGER NOT NULL DEFAULT 0,
     updated_at                    REAL NOT NULL
 );
+
+-- Sprint 46: overage purchases — one row per successful credit top-up.
+CREATE TABLE IF NOT EXISTS overage_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    credits_purchased INTEGER NOT NULL,
+    cost_charged_micro_usd INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    stripe_payment_intent_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_overage_user_ts ON overage_purchases(user_id, ts DESC);
+
+-- Sprint 46: per-user notification rules (spend alerts, etc.).
+CREATE TABLE IF NOT EXISTS notification_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    threshold INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_fired_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_rules_user ON notification_rules(user_id, enabled);
+
+-- Sprint 46: notification log.
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    rule_id INTEGER,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info',
+    payload_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    dismissed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, dismissed_at, created_at DESC);
+
+-- Sprint 46: registered push devices for server-sent alerts.
+CREATE TABLE IF NOT EXISTS push_devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_url TEXT,
+    label TEXT,
+    platform TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_seen_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, enabled);
 """
 
 # Sprint 33: plan caps. Keep them in code, not the DB, so tuning is a
@@ -437,6 +490,29 @@ class Db:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_share_token "
             "ON team_templates(share_token) WHERE share_token IS NOT NULL"
         )
+        # Sprint 46: credit-based pricing extends `quotas` with cap +
+        # overage + alert columns.  All additive; existing rows get
+        # NULL/default and behave as "no cap, overage off".
+        _s46_quota_cols = [
+            ("per_task_cap_credits", "INTEGER"),
+            ("daily_spend_cap_credits", "INTEGER"),
+            ("weekly_spend_cap_credits", "INTEGER"),
+            ("overage_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("auto_recharge_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("auto_recharge_block_credits", "INTEGER NOT NULL DEFAULT 500"),
+            ("auto_recharge_monthly_cap_micro_usd", "INTEGER"),
+            ("auto_recharge_spent_this_month_micro_usd", "INTEGER NOT NULL DEFAULT 0"),
+            ("stripe_payment_method_id", "TEXT"),
+            ("prepaid_credit_balance", "INTEGER NOT NULL DEFAULT 0"),
+            ("spend_alert_threshold_pct", "INTEGER NOT NULL DEFAULT 80"),
+            ("alert_80_sent_at", "REAL"),
+            ("alert_100_sent_at", "REAL"),
+        ]
+        for col, ddl in _s46_quota_cols:
+            try:
+                self._conn.execute(f"ALTER TABLE quotas ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
         self._seed_agent_roles()
 
     def _seed_agent_roles(self) -> None:
