@@ -2863,6 +2863,36 @@ class Orchestrator:
                 {"error": result.get("error", "agent failed"), "agent_role": target_agent["role"]},
             )
             return
+        # Sprint 46: Checkpoint 5 — mid-run per-task cap.  If the
+        # cumulative cost for this task has crossed the user's per-task
+        # cap, abort the remaining stages.  S41's task_artifacts
+        # retention rule applies — partials stay.
+        try:
+            from .credits import micro_usd_to_credits
+            task_cost_micro = self.db.task_cost(task_id)["total_micro_usd"]
+            task_cost_credits = micro_usd_to_credits(task_cost_micro)
+            _task_for_cap = self.db.get_task(task_id)
+            user_id = (_task_for_cap.get("user_id") if _task_for_cap else None) or "legacy-admin"
+            effective_cap = self.db.effective_per_task_cap_credits(user_id)
+            if task_cost_credits > effective_cap:
+                self.db.mark_failed(
+                    task_id,
+                    f"cost cap reached: {task_cost_credits} > {effective_cap}",
+                )
+                self._task_artifacts.pop(task_id, None)
+                await self._publish_status(task_id, "aborted_cost_cap", {
+                    "cost_credits": task_cost_credits,
+                    "cap_credits": effective_cap,
+                })
+                logger.info(
+                    "task %s aborted: cost cap %d > %d",
+                    task_id[:8], task_cost_credits, effective_cap,
+                )
+                return
+        except Exception as exc:
+            # Cost cap is safety, not feature — never crash the
+            # orchestrator if accounting fails.
+            logger.warning("cost cap check failed for task %s: %s", task_id[:8], exc)
         # Sprint 27: stage-aware advancement. The agent we just finished
         # is in some stage; only advance to the *next* stage when EVERY
         # agent in this stage has reached a terminal status. Sequential
