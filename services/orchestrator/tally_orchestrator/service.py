@@ -3911,6 +3911,7 @@ async def submit_task(
                     user.id, model, total, format_micro_usd(cost),
                 )
 
+            plan_caps_for_arch = QUOTA_PLANS.get(user.plan or "free", QUOTA_PLANS["free"])
             team_spec = await asyncio.to_thread(
                 architect_team,
                 description=body.description,
@@ -3919,6 +3920,7 @@ async def submit_task(
                 redpill_base=orch.redpill_base,
                 templates=templates,
                 cost_recorder=_record_architect_cost,
+                model_allowlist=plan_caps_for_arch.get("model_allowlist"),
             )
             if isinstance(team_spec, dict) and team_spec.get("template_used"):
                 db.touch_template(team_spec["template_used"], user_id=scope)

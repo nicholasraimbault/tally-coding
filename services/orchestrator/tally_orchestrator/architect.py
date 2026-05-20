@@ -58,6 +58,7 @@ def architect_team(
     model: str = ARCHITECT_MODEL,
     templates: list[dict] | None = None,
     cost_recorder: Callable[[str, dict], None] | None = None,
+    model_allowlist: set[str] | None = None,
 ) -> dict:
     """Ask Tally to build a custom team for this task.
 
@@ -106,6 +107,19 @@ def architect_team(
         logger.warning("architect returned invalid team_spec; using fallback. raw[:200]=%r",
                        raw[:200] if raw else "")
         return dict(FALLBACK_TEAM)
+    # Sprint 46: free tier restricts to llama-only.  If the architect
+    # picked anything else, silently override each agent's model.  The
+    # allowlist's first member is the fallback target.
+    if model_allowlist:
+        fallback_model = next(iter(model_allowlist))
+        for agent in cleaned.get("agents", []):
+            picked = agent.get("model")
+            if picked is not None and picked not in model_allowlist:
+                logger.info(
+                    "allowlist: replacing architect's pick %r with %r for role=%s",
+                    picked, fallback_model, agent.get("role"),
+                )
+                agent["model"] = fallback_model
     # Sprint 29: carry forward template_used IFF the model named a real
     # template AND the team matches that template's shape (cheap sanity
     # check; the orchestrator validates fully before bumping use_count).
