@@ -313,7 +313,7 @@ class _AutoRechargeCardState extends State<_AutoRechargeCard> {
 
   @override
   Widget build(BuildContext context) {
-    final hasCard = widget.balance['stripe_payment_method_id'] != null;
+    final hasCard = widget.balance['has_saved_card'] == true;
     return Card(
       color: const Color(0xFF2B2D31),
       child: Padding(

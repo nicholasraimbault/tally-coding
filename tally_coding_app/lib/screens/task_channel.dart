@@ -143,6 +143,7 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
                 showDialog(
                   context: context,
                   builder: (_) => CapAbortDialog(
+                    reason: detail['reason'] as String? ?? 'per_task_cap',
                     costCredits: (detail['cost_credits'] as num?)?.toInt() ?? 0,
                     capCredits: (detail['cap_credits'] as num?)?.toInt() ?? 0,
                     onViewPartial: () {
