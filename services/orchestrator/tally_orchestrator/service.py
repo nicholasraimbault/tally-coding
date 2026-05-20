@@ -3930,7 +3930,6 @@ async def submit_task(
     # spend caps.  Admin's `unlimited` plan has 10**8 included
     # credits so this check is a no-op for them.
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
-    plan_caps = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
     available = db.credits_available(user.id)
     if available <= 0:
         # Mode 3 (full auto unlimited) auto-tops-up before failing
