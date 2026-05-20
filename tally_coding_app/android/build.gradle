@@ -13,6 +13,20 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
+// Sprint 46.5 (build infra): unifiedpush_android 2.3.0 pins its
+// Kotlin language version to 1.7 which Kotlin 2.x dropped.  Force
+// every subproject's Kotlin compile to use language 1.9 / api 1.9
+// so the build works against modern Kotlin without forking the
+// plugin.
+subprojects {
+    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+        kotlinOptions {
+            languageVersion = "1.9"
+            apiVersion = "1.9"
+        }
+    }
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }

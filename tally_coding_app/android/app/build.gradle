@@ -11,6 +11,9 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // Sprint 46.5 (build infra): flutter_local_notifications requires
+        // core library desugaring to use java.time on older API levels.
+        coreLibraryDesugaringEnabled true
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
@@ -24,7 +27,11 @@ android {
         applicationId = "com.tallycoding.flutter_app"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // Sprint 46.5 (build infra): bump minSdk to 23 — required by
+        // flutter_local_notifications and passkeys_android.  Flutter's
+        // default minSdk is 21; android-23 is Marshmallow (2015) so
+        // this drops <0.5% of historical devices.
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -41,4 +48,8 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.4"
 }
