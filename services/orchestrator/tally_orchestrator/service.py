@@ -2963,8 +2963,16 @@ class Orchestrator:
                                         )
                                         self._task_artifacts.pop(task_id, None)
                                         self.db.delete_artifacts(task_id)
+                                        # Sprint 46 follow-up: unified payload
+                                        # shape across both abort sites so the
+                                        # Flutter CapAbortDialog can render the
+                                        # right copy via the `reason` field.
+                                        from .credits import micro_usd_to_credits
+                                        task_cost_micro = self.db.task_cost(task_id)["total_micro_usd"]
                                         await self._publish_status(task_id, "aborted_cost_cap", {
-                                            "reason": "period_cap_reached",
+                                            "reason": "period_cap",
+                                            "cost_credits": micro_usd_to_credits(task_cost_micro),
+                                            "cap_credits": 0,
                                             "available_credits": 0,
                                         })
                                         logger.info(
@@ -3024,8 +3032,10 @@ class Orchestrator:
                 # so child tasks can hydrate from them.
                 self.db.delete_artifacts(task_id)
                 await self._publish_status(task_id, "aborted_cost_cap", {
+                    "reason": "per_task_cap",
                     "cost_credits": task_cost_credits,
                     "cap_credits": effective_cap,
+                    "available_credits": self.db.credits_available(user_id),
                 })
                 logger.info(
                     "task %s aborted: cost cap %d > %d",
@@ -5069,7 +5079,10 @@ async def get_credits_balance(
         "auto_recharge_spent_this_month_micro_usd": int(
             quota.get("auto_recharge_spent_this_month_micro_usd") or 0
         ),
-        "stripe_payment_method_id": quota.get("stripe_payment_method_id"),
+        # Sprint 46 follow-up: don't leak the Stripe payment-method id to
+        # clients — surface a boolean instead so the Flutter UI can render
+        # the "saved card" badge without knowing the pm_*** token.
+        "has_saved_card": bool(quota.get("stripe_payment_method_id")),
         "spend_alert_threshold_pct": int(quota.get("spend_alert_threshold_pct") or 80),
     }
 
