@@ -52,7 +52,9 @@ def insert_notification(db: "Db", user_id: str, *, kind: str, severity: str = "i
         "VALUES (?, ?, ?, ?, ?, ?)",
         (user_id, rule_id, kind, severity, json.dumps(payload or {}), time.time()),
     )
-    return cur.lastrowid
+    # cur.lastrowid is `int | None` per sqlite3 typing, but is always an
+    # int after a successful INSERT with a ROWID/AUTOINCREMENT PK.
+    return int(cur.lastrowid or 0)
 
 
 def list_notifications(db: "Db", user_id: str, *, limit: int = 50,

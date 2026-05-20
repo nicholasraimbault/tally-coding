@@ -1,7 +1,6 @@
 # services/orchestrator/tests/test_notification_rules.py
 """Sprint 46: notification rule evaluation."""
 import json
-import pytest
 from tally_orchestrator.notifications import (
     evaluate_rules_for_cost_event,
     seed_default_rules,
