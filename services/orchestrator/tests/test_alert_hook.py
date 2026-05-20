@@ -1,6 +1,5 @@
 # services/orchestrator/tests/test_alert_hook.py
 """Sprint 46: Checkpoint 7 — alert evaluation fires after cost events."""
-import pytest
 
 
 async def test_emit_notification_fires_when_threshold_crossed(db):
