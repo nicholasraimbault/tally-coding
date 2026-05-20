@@ -512,6 +512,26 @@ class CapsPatchRequest(BaseModel):
     weekly_spend_cap_credits: int | None = None
 
 
+# ── Sprint 46 A15: notification + push device request models ──────────────────
+
+class NotificationRuleRequest(BaseModel):
+    kind: str  # 'period_pct' | 'daily_amount' | 'weekly_amount' | 'per_task_amount' | 'auto_recharge_monthly_pct'
+    threshold: int
+    enabled: bool = True
+
+
+class NotificationRulePatchRequest(BaseModel):
+    threshold: int | None = None
+    enabled: bool | None = None
+
+
+class PushDeviceRequest(BaseModel):
+    provider: str  # 'unifiedpush' | 'desktop_local'
+    endpoint_url: str | None = None
+    label: str | None = None
+    platform: str | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -5072,6 +5092,194 @@ async def patch_auto_recharge(
         f"UPDATE quotas SET {', '.join(fields)} WHERE user_id=?", values,
     )
     return await get_credits_balance(user=user)
+
+
+# ── Sprint 46 A15: notifications + notification_rules + push devices ──────────
+
+_NOTIFICATION_RULE_KINDS = {
+    "period_pct", "daily_amount", "weekly_amount",
+    "per_task_amount", "auto_recharge_monthly_pct",
+}
+_PUSH_PROVIDERS = {"unifiedpush", "desktop_local"}
+
+
+@app.get("/notifications")
+async def get_notifications(
+    limit: int = 50,
+    since_id: int | None = None,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: list undismissed notifications for the calling user."""
+    from .notifications import list_notifications
+    db: Db = state["db"]
+    items = list_notifications(db, user.id, limit=limit, since_id=since_id)
+    next_since = max((n["id"] for n in items), default=since_id or 0)
+    return {"notifications": items, "next_since_id": next_since}
+
+
+@app.post("/notifications/{notification_id}/dismiss")
+async def post_dismiss_notification(
+    notification_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: mark one notification dismissed; 404 if not found."""
+    from .notifications import dismiss_notification
+    db: Db = state["db"]
+    if not dismiss_notification(db, user.id, notification_id):
+        raise HTTPException(404, "notification not found")
+    return {"ok": True}
+
+
+@app.get("/notification_rules")
+async def get_notification_rules(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: list all notification rules for the calling user."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, kind, threshold, enabled, last_fired_at, created_at "
+        "FROM notification_rules WHERE user_id=? ORDER BY created_at",
+        (user.id,),
+    ).fetchall()
+    rules = [
+        {"id": r[0], "kind": r[1], "threshold": r[2],
+         "enabled": bool(r[3]), "last_fired_at": r[4], "created_at": r[5]}
+        for r in rows
+    ]
+    return {"rules": rules}
+
+
+@app.post("/notification_rules")
+async def post_notification_rule(
+    body: NotificationRuleRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: create a notification rule; validates kind + threshold."""
+    if body.kind not in _NOTIFICATION_RULE_KINDS:
+        raise HTTPException(400, f"unknown kind: {body.kind}")
+    if body.threshold <= 0:
+        raise HTTPException(400, "threshold must be > 0")
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "INSERT INTO notification_rules "
+        "(user_id, kind, threshold, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user.id, body.kind, body.threshold, int(body.enabled), time.time()),
+    )
+    return {
+        "id": cur.lastrowid, "kind": body.kind, "threshold": body.threshold,
+        "enabled": body.enabled,
+    }
+
+
+@app.patch("/notification_rules/{rule_id}")
+async def patch_notification_rule(
+    rule_id: int,
+    body: NotificationRulePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: partial update of a notification rule.  Scoped to the calling user."""
+    db: Db = state["db"]
+    fields: list[str] = []
+    values: list = []
+    if body.threshold is not None:
+        if body.threshold <= 0:
+            raise HTTPException(400, "threshold must be > 0")
+        fields.append("threshold=?")
+        values.append(body.threshold)
+    if body.enabled is not None:
+        fields.append("enabled=?")
+        values.append(int(body.enabled))
+    if not fields:
+        raise HTTPException(400, "no fields to update")
+    values += [rule_id, user.id]
+    cur = db._conn.execute(
+        f"UPDATE notification_rules SET {', '.join(fields)} WHERE id=? AND user_id=?",
+        values,
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "rule not found")
+    row = db._conn.execute(
+        "SELECT id, kind, threshold, enabled, last_fired_at, created_at "
+        "FROM notification_rules WHERE id=? AND user_id=?",
+        (rule_id, user.id),
+    ).fetchone()
+    return {
+        "id": row[0], "kind": row[1], "threshold": row[2],
+        "enabled": bool(row[3]), "last_fired_at": row[4], "created_at": row[5],
+    }
+
+
+@app.delete("/notification_rules/{rule_id}")
+async def delete_notification_rule(
+    rule_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: delete a notification rule; 404 if not owned by calling user."""
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "DELETE FROM notification_rules WHERE id=? AND user_id=?",
+        (rule_id, user.id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "rule not found")
+    return {"ok": True}
+
+
+@app.get("/push/devices")
+async def get_push_devices(user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 46: list registered push devices for the calling user."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, provider, endpoint_url, label, platform, enabled, last_seen_at, created_at "
+        "FROM push_devices WHERE user_id=? ORDER BY created_at DESC",
+        (user.id,),
+    ).fetchall()
+    devices = [
+        {"id": r[0], "provider": r[1], "endpoint_url": r[2], "label": r[3],
+         "platform": r[4], "enabled": bool(r[5]), "last_seen_at": r[6],
+         "created_at": r[7]}
+        for r in rows
+    ]
+    return {"devices": devices}
+
+
+@app.post("/push/devices")
+async def post_push_device(
+    body: PushDeviceRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: register a push device.  unifiedpush requires endpoint_url."""
+    if body.provider not in _PUSH_PROVIDERS:
+        raise HTTPException(400, f"unknown provider: {body.provider}")
+    if body.provider == "unifiedpush" and not body.endpoint_url:
+        raise HTTPException(400, "unifiedpush requires endpoint_url")
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "INSERT INTO push_devices "
+        "(user_id, provider, endpoint_url, label, platform, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?)",
+        (user.id, body.provider, body.endpoint_url, body.label, body.platform, time.time()),
+    )
+    return {
+        "id": cur.lastrowid, "provider": body.provider,
+        "endpoint_url": body.endpoint_url, "label": body.label,
+        "platform": body.platform, "enabled": True,
+    }
+
+
+@app.delete("/push/devices/{device_id}")
+async def delete_push_device(
+    device_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 46: deregister a push device; 404 if not owned by calling user."""
+    db: Db = state["db"]
+    cur = db._conn.execute(
+        "DELETE FROM push_devices WHERE id=? AND user_id=?",
+        (device_id, user.id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "device not found")
+    return {"ok": True}
 
 
 @app.get("/tasks/{task_id}/cost")
