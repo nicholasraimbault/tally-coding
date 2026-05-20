@@ -36,6 +36,30 @@ def test_idempotency_key_format():
     assert key == "recharge_u1_1700000000_500"
 
 
+def test_capped_recharge_returns_false_when_monthly_cap_exceeded(monkeypatch, db):
+    """Mode 2: if (already_spent + block_cost) > monthly_cap, return False without Stripe call."""
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_xxx")
+    db.get_or_create_quota("u1", plan_hint="pro_beta")
+    # Already spent $20 of $25 cap; one block at 500 credits = $10 → over cap
+    db._conn.execute(
+        "UPDATE quotas SET auto_recharge_mode=2, "
+        "auto_recharge_monthly_cap_micro_usd=25_000_000, "
+        "auto_recharge_spent_this_month_micro_usd=20_000_000, "
+        "auto_recharge_block_credits=500 WHERE user_id=?",
+        ("u1",),
+    )
+
+    fake = MagicMock()
+    fake.PaymentIntent.create = MagicMock()
+    with patch.dict("sys.modules", {"stripe": fake}):
+        import importlib, tally_orchestrator.stripe_direct as sd
+        importlib.reload(sd)
+        import asyncio
+        result = asyncio.run(sd.trigger_auto_recharge_capped(db, "u1"))
+        assert result is False
+    fake.PaymentIntent.create.assert_not_called()
+
+
 def test_unlimited_recharge_raises_when_stripe_down(monkeypatch, db):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_xxx")
     db.get_or_create_quota("u1", plan_hint="pro_beta")
