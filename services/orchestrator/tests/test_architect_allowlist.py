@@ -1,5 +1,4 @@
 """Sprint 46: architect honors model_allowlist (Checkpoint 3)."""
-from unittest.mock import patch
 from tally_orchestrator.architect import architect_team
 
 
