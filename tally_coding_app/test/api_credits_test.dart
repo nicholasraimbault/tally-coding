@@ -19,9 +19,9 @@ void main() {
         headers: {'content-type': 'application/json'},
       );
     });
-    final api = TallyApi(
+    final api = TallyOrchClient(
       baseUrl: Uri.parse('http://test'),
-      bearerProvider: () async => 'token',
+      provider: () async => 'token',
       client: mock,
     );
     final out = await api.getCreditsBalance();
@@ -38,9 +38,9 @@ void main() {
         headers: {'content-type': 'application/json'},
       );
     });
-    final api = TallyApi(
+    final api = TallyOrchClient(
       baseUrl: Uri.parse('http://test'),
-      bearerProvider: () async => 'token',
+      provider: () async => 'token',
       client: mock,
     );
     final out = await api.postCreditsCheckout(credits: 500);

@@ -641,22 +641,6 @@ class TallyOrchClient {
     );
   }
 
-  void close() => _http.close();
-}
-
-/// Sprint 46: TallyApi extends TallyOrchClient with credits, caps, checkout,
-/// auto-recharge, notifications, and push device endpoints.
-///
-/// Uses `bearerProvider` as the constructor parameter name (matching the
-/// Sprint 46 API client contract) while delegating to [TallyOrchClient]'s
-/// internals (`_http`, `baseUrl`, `_authHeaders`) via inheritance.
-class TallyApi extends TallyOrchClient {
-  TallyApi({
-    required super.baseUrl,
-    required BearerProvider bearerProvider,
-    super.client,
-  }) : super(provider: bearerProvider);
-
   // ── Sprint 46: credit-based billing ─────────────────────────────────────
 
   Future<Map<String, dynamic>> getCreditsBalance() async {
@@ -891,4 +875,6 @@ class TallyApi extends TallyOrchClient {
     }
     return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
+
+  void close() => _http.close();
 }
