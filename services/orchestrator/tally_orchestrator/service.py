@@ -2923,6 +2923,73 @@ class Orchestrator:
                                 task_id[:8], agent_idx, target_agent["role"],
                                 model, total, format_micro_usd(cost),
                             )
+                            # Sprint 46 Checkpoint 6 — mid-run period cap +
+                            # auto-recharge.  After this cost event, if the
+                            # user's period pool just went negative AND they
+                            # have Mode 2/3 auto-recharge with overage
+                            # enabled, try a top-up.  If they don't (or
+                            # top-up fails), abort the task with
+                            # period_cap_reached.
+                            try:
+                                avail = self.db.credits_available(owner)
+                                if avail <= 0:
+                                    quota = self.db.get_or_create_quota(owner)
+                                    mode = int(quota.get("auto_recharge_mode") or 0)
+                                    handled = False
+                                    if mode == 3:
+                                        try:
+                                            from .stripe_direct import trigger_auto_recharge_unlimited
+                                            await trigger_auto_recharge_unlimited(self.db, owner)
+                                            handled = True
+                                        except Exception as rex:
+                                            logger.warning(
+                                                "mid-run auto-recharge (mode 3) failed for %s: %s",
+                                                owner, rex,
+                                            )
+                                    elif mode == 2:
+                                        try:
+                                            from .stripe_direct import trigger_auto_recharge_capped
+                                            if await trigger_auto_recharge_capped(self.db, owner):
+                                                handled = True
+                                        except Exception as rex:
+                                            logger.warning(
+                                                "mid-run auto-recharge (mode 2) failed for %s: %s",
+                                                owner, rex,
+                                            )
+                                    if not handled:
+                                        self.db.mark_failed(
+                                            task_id,
+                                            "period cap reached: no credits available",
+                                        )
+                                        self._task_artifacts.pop(task_id, None)
+                                        self.db.delete_artifacts(task_id)
+                                        await self._publish_status(task_id, "aborted_cost_cap", {
+                                            "reason": "period_cap_reached",
+                                            "available_credits": 0,
+                                        })
+                                        logger.info(
+                                            "task %s aborted: period cap reached for user=%s",
+                                            task_id[:8], owner,
+                                        )
+                                        return
+                            except Exception as exc:
+                                logger.warning(
+                                    "period cap check failed for task %s: %s",
+                                    task_id[:8], exc,
+                                )
+                            # Sprint 46 Checkpoint 7 — alert eval on every
+                            # agent cost event.  Fires notification rules
+                            # whose threshold was just crossed.
+                            try:
+                                from .notifications import (
+                                    evaluate_rules_for_cost_event,
+                                    fan_out_push,
+                                )
+                                fired = evaluate_rules_for_cost_event(self.db, owner)
+                                for f in fired:
+                                    asyncio.create_task(fan_out_push(self.db, owner, f["id"]))
+                            except Exception as exc:
+                                logger.warning("alert eval (agent) raised: %s", exc)
             except Exception as exc:
                 logger.warning("usage-accounting raised; ignoring: %s", exc)
         # Did this agent fail? Short-circuit the rest of the workflow.
