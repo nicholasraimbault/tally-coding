@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../api.dart';
 import '../widgets/credit_balance_widget.dart';
+import 'notifications_screen.dart';
 
 /// Sprint 46: credit-based billing screen.  Replaces the Sprint 33
 /// Clerk-portal screen with a full credit management UI:
@@ -194,10 +195,11 @@ class _BillingScreenState extends State<BillingScreen> {
                         ),
                         trailing: const Icon(Icons.chevron_right, color: Colors.white54),
                         onTap: () {
-                          // B7 will register the /notifications route.
-                          // Until then, show a placeholder snackbar.
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Notifications — coming soon')),
+                          Navigator.of(context).push<void>(
+                            MaterialPageRoute(
+                              builder: (_) =>
+                                  NotificationsScreen(client: widget.client),
+                            ),
                           );
                         },
                       ),
