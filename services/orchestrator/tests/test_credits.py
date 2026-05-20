@@ -1,4 +1,10 @@
 """Sprint 46: credit math + plan config."""
+from tally_orchestrator.credits import (
+    MIN_PURCHASE_CREDITS,
+    OVERAGE_CREDIT_PRICE_MICRO_USD,
+    credits_to_micro_usd,
+    micro_usd_to_credits,
+)
 from tally_orchestrator.service import QUOTA_PLANS
 
 
@@ -42,14 +48,6 @@ def test_free_tier_restricts_to_llama():
 def test_unlimited_bypasses_caps():
     plan = QUOTA_PLANS["unlimited"]
     assert plan["included_credits"] >= 10**8
-
-
-from tally_orchestrator.credits import (
-    micro_usd_to_credits,
-    credits_to_micro_usd,
-    OVERAGE_CREDIT_PRICE_MICRO_USD,
-    MIN_PURCHASE_CREDITS,
-)
 
 
 def test_micro_usd_to_credits_rounds_up():
