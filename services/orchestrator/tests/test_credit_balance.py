@@ -1,7 +1,5 @@
 """Sprint 46: credit balance / period usage / prepaid Db methods."""
-import time
-import pytest
-from tally_orchestrator.service import Db, QUOTA_PLANS
+from tally_orchestrator.service import Db
 
 
 def test_credits_used_this_period_zero_when_no_events(db: Db):
