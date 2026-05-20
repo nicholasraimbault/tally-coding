@@ -3925,28 +3925,75 @@ async def submit_task(
         except Exception as exc:
             logger.exception("architect call raised; falling back to single-agent: %s", exc)
             team_spec = None
-    # Sprint 33: per-user quota enforcement. Admin path bypasses by
-    # virtue of get_or_create_quota assigning 'unlimited'. Everyone
-    # else: check `period_tasks_used` against the plan's cap before
-    # we burn the architect's LLM call cost on a 429.
+    # Sprint 46: credit-based pre-submit gates.  Replace the old
+    # task-count cap with credit-of-COGS accounting + daily/weekly
+    # spend caps.  Admin's `unlimited` plan has 10**8 included
+    # credits so this check is a no-op for them.
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
     plan_caps = QUOTA_PLANS.get(quota["plan"], QUOTA_PLANS["free"])
-    if quota["period_tasks_used"] >= plan_caps["tasks"]:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "quota_exceeded",
-                "plan": quota["plan"],
-                "cap": plan_caps["tasks"],
-                "used": quota["period_tasks_used"],
-                "metric": "tasks_per_period",
-                # Sprint 33-rest: clients should open the Clerk-hosted
-                # PricingTable widget (in-app via clerk_flutter) to
-                # upgrade; no orchestrator-side checkout endpoint
-                # exists anymore.
-                "upgrade_action": "open_pricing_table",
-            },
-        )
+    available = db.credits_available(user.id)
+    if available <= 0:
+        # Mode 3 (full auto unlimited) auto-tops-up before failing
+        mode = int(quota.get("auto_recharge_mode") or 0)
+        recharged = False
+        if mode == 3:
+            try:
+                from .stripe_direct import trigger_auto_recharge_unlimited
+                await trigger_auto_recharge_unlimited(db, user.id)
+                recharged = True
+            except Exception as exc:
+                logger.warning("auto_recharge_unlimited failed for %s: %s", user.id, exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "auto_recharge_payment_failed",
+                            "message": "Stripe unreachable, retry shortly"},
+                )
+        elif mode == 2:
+            try:
+                from .stripe_direct import trigger_auto_recharge_capped
+                if await trigger_auto_recharge_capped(db, user.id):
+                    recharged = True
+            except Exception as exc:
+                logger.warning("auto_recharge_capped failed for %s: %s", user.id, exc)
+        if not recharged:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "no_credits_remaining",
+                    "plan": quota["plan"],
+                    "available_credits": 0,
+                    "overage_enabled": bool(quota.get("overage_enabled") or 0),
+                    "upgrade_action": "open_pricing_table",
+                },
+            )
+    # Daily cap (rolling 24h)
+    daily_cap = quota.get("daily_spend_cap_credits")
+    if daily_cap is not None and int(daily_cap) > 0:
+        day_since = time.time() - 86400
+        daily_used = db.credits_used_in_window(user.id, day_since)
+        if daily_used >= int(daily_cap):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "daily_cap_reached",
+                    "cap_credits": int(daily_cap),
+                    "used_credits": daily_used,
+                },
+            )
+    # Weekly cap (rolling 7d)
+    weekly_cap = quota.get("weekly_spend_cap_credits")
+    if weekly_cap is not None and int(weekly_cap) > 0:
+        week_since = time.time() - 7 * 86400
+        weekly_used = db.credits_used_in_window(user.id, week_since)
+        if weekly_used >= int(weekly_cap):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "weekly_cap_reached",
+                    "cap_credits": int(weekly_cap),
+                    "used_credits": weekly_used,
+                },
+            )
     # Sprint 37: validate project_id (if supplied) before binding the
     # task to it.  Owner-scoped so a Clerk user can't smuggle their
     # task into someone else's project.
