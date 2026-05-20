@@ -1509,6 +1509,99 @@ class Db:
             "calls": int(row[2] or 0),
         }
 
+    # ── Sprint 46: credit balance + period usage + overage state ───────────
+
+    def credits_used_this_period(self, user_id: str, period_start: float) -> int:
+        """Credits consumed since `period_start`.  Derived from
+        `cost_events.cost_micro_usd` (single source of truth — no
+        denormalized counter on `quotas`)."""
+        from .credits import micro_usd_to_credits
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM cost_events "
+            "WHERE user_id=? AND ts >= ?",
+            (user_id, period_start),
+        ).fetchone()
+        return micro_usd_to_credits(int(row[0] or 0))
+
+    def credits_used_in_window(self, user_id: str, since_ts: float) -> int:
+        """Credits in a rolling window (used for daily / weekly cap checks)."""
+        from .credits import micro_usd_to_credits
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM cost_events "
+            "WHERE user_id=? AND ts >= ?",
+            (user_id, since_ts),
+        ).fetchone()
+        return micro_usd_to_credits(int(row[0] or 0))
+
+    def credits_available(self, user_id: str) -> int:
+        """Subscription pool remaining + prepaid balance.
+
+        Negative values clamp to 0 — we don't allow negative
+        available-credit anywhere callers might branch on `> 0`.
+        """
+        q = self.get_or_create_quota(user_id)
+        plan = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
+        used = self.credits_used_this_period(user_id, q["period_start"])
+        subscription_left = max(0, plan["included_credits"] - used)
+        return subscription_left + int(q.get("prepaid_credit_balance") or 0)
+
+    def get_prepaid_balance(self, user_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT prepaid_credit_balance FROM quotas WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_prepaid_balance(self, user_id: str, credits: int) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def increment_prepaid_balance(self, user_id: str, delta: int) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance = prepaid_credit_balance + ?, "
+            "updated_at=? WHERE user_id=?",
+            (delta, time.time(), user_id),
+        )
+
+    def consume_prepaid_balance(self, user_id: str, credits: int) -> None:
+        """Decrement (clamped at 0).  Called from the cost-event insert
+        path when a task's cost lands and subscription credits are
+        already exhausted."""
+        self._conn.execute(
+            "UPDATE quotas SET prepaid_credit_balance = MAX(0, prepaid_credit_balance - ?), "
+            "updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def effective_per_task_cap_credits(self, user_id: str) -> int:
+        """Quota override wins; plan default otherwise."""
+        q = self.get_or_create_quota(user_id)
+        override = q.get("per_task_cap_credits")
+        if override is not None:
+            return int(override)
+        plan = QUOTA_PLANS.get(q["plan"], QUOTA_PLANS["free"])
+        return int(plan["default_per_task_cap_credits"])
+
+    def set_per_task_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET per_task_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def set_daily_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET daily_spend_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
+    def set_weekly_cap(self, user_id: str, credits: int | None) -> None:
+        self._conn.execute(
+            "UPDATE quotas SET weekly_spend_cap_credits=?, updated_at=? WHERE user_id=?",
+            (credits, time.time(), user_id),
+        )
+
     # ── Sprint 38: encrypted per-user credentials ──────────────────────────
 
     def put_credential(self, *, user_id: str, kind: str, ciphertext: bytes) -> None:
@@ -1625,7 +1718,12 @@ class Db:
         """
         row = self._conn.execute(
             "SELECT plan, stripe_customer_id, stripe_subscription_id, "
-            "period_start, period_tasks_used, period_agent_seconds_used, updated_at "
+            "period_start, period_tasks_used, period_agent_seconds_used, updated_at, "
+            "per_task_cap_credits, daily_spend_cap_credits, weekly_spend_cap_credits, "
+            "overage_enabled, auto_recharge_mode, auto_recharge_block_credits, "
+            "auto_recharge_monthly_cap_micro_usd, auto_recharge_spent_this_month_micro_usd, "
+            "stripe_payment_method_id, prepaid_credit_balance, spend_alert_threshold_pct, "
+            "alert_80_sent_at, alert_100_sent_at "
             "FROM quotas WHERE user_id=?", (user_id,),
         ).fetchone()
         is_admin = user_id in ("admin", "legacy-admin")
@@ -1642,6 +1740,19 @@ class Db:
                 "stripe_customer_id": None, "stripe_subscription_id": None,
                 "period_start": now, "period_tasks_used": 0,
                 "period_agent_seconds_used": 0, "updated_at": now,
+                "per_task_cap_credits": None,
+                "daily_spend_cap_credits": None,
+                "weekly_spend_cap_credits": None,
+                "overage_enabled": 0,
+                "auto_recharge_mode": 0,
+                "auto_recharge_block_credits": 500,
+                "auto_recharge_monthly_cap_micro_usd": None,
+                "auto_recharge_spent_this_month_micro_usd": 0,
+                "stripe_payment_method_id": None,
+                "prepaid_credit_balance": 0,
+                "spend_alert_threshold_pct": 80,
+                "alert_80_sent_at": None,
+                "alert_100_sent_at": None,
             }
         stored_plan = row[0]
         if plan_hint and not is_admin and plan_hint != stored_plan:
@@ -1656,6 +1767,19 @@ class Db:
             "stripe_customer_id": row[1], "stripe_subscription_id": row[2],
             "period_start": row[3], "period_tasks_used": row[4],
             "period_agent_seconds_used": row[5], "updated_at": row[6],
+            "per_task_cap_credits": row[7],
+            "daily_spend_cap_credits": row[8],
+            "weekly_spend_cap_credits": row[9],
+            "overage_enabled": row[10],
+            "auto_recharge_mode": row[11],
+            "auto_recharge_block_credits": row[12],
+            "auto_recharge_monthly_cap_micro_usd": row[13],
+            "auto_recharge_spent_this_month_micro_usd": row[14],
+            "stripe_payment_method_id": row[15],
+            "prepaid_credit_balance": row[16],
+            "spend_alert_threshold_pct": row[17],
+            "alert_80_sent_at": row[18],
+            "alert_100_sent_at": row[19],
         }
 
     def increment_task_count(self, user_id: str, delta: int = 1) -> None:
