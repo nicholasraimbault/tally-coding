@@ -1,7 +1,5 @@
 """Sprint 46: mid-run per-task cap abort (Checkpoint 5)."""
-import asyncio
-import pytest
-from tally_orchestrator.service import Db, QUOTA_PLANS
+from tally_orchestrator.service import Db
 
 
 def test_task_aborts_when_cumulative_cost_exceeds_cap(db: Db):
