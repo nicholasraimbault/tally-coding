@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -5307,6 +5307,59 @@ async def delete_push_device(
     if cur.rowcount == 0:
         raise HTTPException(404, "device not found")
     return {"ok": True}
+
+
+# ── Sprint 46 A17: WebSocket notification feed ────────────────────────────────
+
+
+async def _ws_authenticate(websocket: WebSocket) -> str:
+    """Bearer-token (admin) or Clerk JWT auth via ?token query param.
+
+    Returns the resolved user_id string; closes the WebSocket and raises
+    WebSocketDisconnect(4401) on any authentication failure.
+    """
+    token = websocket.query_params.get("token", "")
+    if not token:
+        await websocket.close(code=4401, reason="missing token")
+        raise WebSocketDisconnect(code=4401)
+    bearer = os.environ.get("TALLY_API_TOKEN", "").strip()
+    if bearer and token == bearer:
+        return "admin"
+    try:
+        from .clerk_auth import _verify_session_token
+        validator: ClerkValidator | None = state.get("clerk_validator")
+        if validator is None:
+            raise ValueError("Clerk validator not configured")
+        claims = _verify_session_token(token, validator=validator)
+        return claims.get("sub") or "anon"
+    except Exception:
+        await websocket.close(code=4401, reason="invalid token")
+        raise WebSocketDisconnect(code=4401)
+
+
+@app.websocket("/ws/notifications")
+async def ws_notifications(websocket: WebSocket) -> None:
+    """Sprint 46: live notification feed.
+
+    Client connects with ?token=<bearer-or-jwt>; receives hello then signals.
+    Ping/pong keepalive: client sends ``{"type": "ping"}``, server replies
+    ``{"type": "pong"}``.  ``fan_out_push`` delivers
+    ``{"type": "new_notification", "id": N}`` to all registered sockets.
+    """
+    await websocket.accept()
+    user_id = await _ws_authenticate(websocket)
+    from .notifications import register_websocket, unregister_websocket
+    register_websocket(user_id, websocket)
+    await websocket.send_json({"type": "hello", "user_id": user_id})
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            if msg.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        unregister_websocket(user_id, websocket)
 
 
 @app.get("/tasks/{task_id}/cost")
