@@ -106,3 +106,27 @@ def test_passes_when_credits_available(client, monkeypatch):
         assert "id" in r.json()
     finally:
         svc.app.dependency_overrides.clear()
+
+
+def test_estimated_cost_over_cap_returns_402(client):
+    import tally_orchestrator.service as svc
+    db = svc.state["db"]
+    db.get_or_create_quota("u1", plan_hint="pro_beta")
+    db.set_per_task_cap("u1", 1)  # ridiculously low
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="u1", source="clerk", plan="pro_beta", email="u1@x.com",
+    )
+    try:
+        # Without architect (REDPILL_KEY empty), the path that triggers
+        # cost estimate runs on user-supplied team_spec.
+        r = client.post(
+            "/tasks",
+            json={"description": "x" * 5000,
+                  "team_spec": {"agents": [{"role": "Coder", "model": "moonshotai/kimi-k2.6-instruct"}]}},
+            headers=_headers(),
+        )
+        assert r.status_code == 402
+        assert r.json()["detail"]["error"] == "task_cap_estimated_exceeds"
+    finally:
+        svc.app.dependency_overrides.clear()

@@ -3995,6 +3995,29 @@ async def submit_task(
                     "used_credits": weekly_used,
                 },
             )
+    # Sprint 46: Checkpoint 4 — estimated-cost pre-check.  If the team
+    # team_spec's estimated cost exceeds the user's per-task cap, try
+    # rerouting to cheap models; if still over, abort with a 402
+    # before we burn agent compute.
+    from .cost_estimate import estimate_team_cost_credits, reroute_to_cheap_models
+    if team_spec and team_spec.get("agents"):
+        cap = db.effective_per_task_cap_credits(user.id)
+        estimate = estimate_team_cost_credits(team_spec, len(body.description))
+        if estimate["total_credits"] > cap:
+            # Try one re-route pass to llama-only
+            cheap_allowlist = {"meta-llama/llama-3.3-70b-instruct"}
+            team_spec = reroute_to_cheap_models(team_spec, cheap_allowlist)
+            estimate = estimate_team_cost_credits(team_spec, len(body.description))
+        if estimate["total_credits"] > cap:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "task_cap_estimated_exceeds",
+                    "estimated_credits": estimate["total_credits"],
+                    "cap_credits": cap,
+                    "per_agent": estimate["per_agent"],
+                },
+            )
     # Sprint 37: validate project_id (if supplied) before binding the
     # task to it.  Owner-scoped so a Clerk user can't smuggle their
     # task into someone else's project.
