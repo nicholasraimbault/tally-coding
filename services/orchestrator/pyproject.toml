@@ -2,6 +2,8 @@
 name = "tally-orchestrator"
 version = "0.1.0"
 description = "HTTP orchestration service: bootstraps an MLS session with a long-lived worker CVM and dispatches tasks over Tally Workers wakes"
+license = "BUSL-1.1"
+license-files = ["../../LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",

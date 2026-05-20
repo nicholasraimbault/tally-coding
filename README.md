@@ -106,7 +106,17 @@ See [`docs/tally-coding-stack-integration-2026-05-16.md`](docs/tally-coding-stac
 
 ## License
 
-TBD. Likely permissive (MIT or Apache 2.0) for open-source components; commercial license for hosted platform service. Decided closer to v1.0 launch.
+**Business Source License 1.1** — source-available; converts to Apache 2.0
+on 2030-05-20 (4 years from first publication). The full text is in
+[`LICENSE`](LICENSE).
+
+**Additional Use Grant:** you may use, modify, and redistribute the
+Licensed Work, but you may not provide it to third parties as a hosted
+or managed service.
+
+Skytale primitives (the encryption SDK, relay, CLI) remain
+[Apache 2.0](https://github.com/nicholasraimbault/skytale/blob/master/LICENSE) —
+Tally Coding builds the commercial value-add layer on top.
 
 ## Timeline
 
