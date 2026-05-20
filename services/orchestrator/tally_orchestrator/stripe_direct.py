@@ -37,13 +37,28 @@ class StripeNotConfiguredError(RuntimeError):
 
 
 def _stripe():
-    """Return the configured stripe module or raise."""
+    """Return the configured stripe module or raise.
+
+    Kept for backward compatibility with `stripe.Webhook.construct_event`,
+    which is still a static call in stripe-python 15.x.  All Checkout
+    Session and PaymentIntent calls use `_stripe_client()` instead —
+    the static-class API was dropped in stripe-python 15.0.
+    """
     key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
     if not key:
         raise StripeNotConfiguredError("STRIPE_SECRET_KEY not configured")
     import stripe
     stripe.api_key = key
     return stripe
+
+
+def _stripe_client():
+    """Return a configured StripeClient (stripe-python 15.x API)."""
+    key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+    if not key:
+        raise StripeNotConfiguredError("STRIPE_SECRET_KEY not configured")
+    import stripe
+    return stripe.StripeClient(key)
 
 
 def recharge_idempotency_key(*, user_id: str, period_start: float, already_spent: int) -> str:
@@ -70,15 +85,14 @@ def create_credits_checkout_session(
             f"minimum purchase is {MIN_PURCHASE_CREDITS} credits "
             f"(${MIN_PURCHASE_CREDITS * OVERAGE_CREDIT_PRICE_MICRO_USD // 10000 / 100:.2f})"
         )
-    stripe = _stripe()
+    client = _stripe_client()
     quota = db.get_or_create_quota(user_id)
     amount_cents = credits * OVERAGE_CREDIT_PRICE_MICRO_USD // 10_000  # micro_usd → cents
-    session = stripe.Checkout.Session.create(
-        mode="payment",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        customer=quota.get("stripe_customer_id"),  # None creates a new one
-        line_items=[{
+    params = {
+        "mode": "payment",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "line_items": [{
             "price_data": {
                 "currency": "usd",
                 "product_data": {"name": f"{credits} Tally credits"},
@@ -86,12 +100,16 @@ def create_credits_checkout_session(
             },
             "quantity": 1,
         }],
-        metadata={
+        "metadata": {
             "user_id": user_id,
             "credits": str(credits),
             "purchase_kind": "one_time",
         },
-    )
+    }
+    customer_id = quota.get("stripe_customer_id")
+    if customer_id:
+        params["customer"] = customer_id  # omit → Stripe creates a new Customer
+    session = client.checkout.sessions.create(params)
     db._conn.execute(
         "INSERT INTO overage_purchases "
         "(user_id, ts, credits_purchased, cost_charged_micro_usd, kind, status, stripe_payment_intent_id) "
@@ -117,18 +135,25 @@ def create_setup_session(
     Used by Modes 2 + 3 to capture a payment method that we later
     charge off-session.
     """
-    stripe = _stripe()
+    client = _stripe_client()
     quota = db.get_or_create_quota(user_id)
-    session = stripe.Checkout.Session.create(
-        mode="setup",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        customer=quota.get("stripe_customer_id"),
-        metadata={
+    params = {
+        "mode": "setup",
+        # Stripe requires `currency` for setup-mode Checkout — it's the
+        # currency of any future off-session charges against the saved
+        # card.  Tally bills USD.
+        "currency": "usd",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {
             "user_id": user_id,
             "purchase_kind": "auto_recharge_setup",
         },
-    )
+    }
+    customer_id = quota.get("stripe_customer_id")
+    if customer_id:
+        params["customer"] = customer_id
+    session = client.checkout.sessions.create(params)
     return {"session_id": session.id, "url": session.url}
 
 
@@ -158,7 +183,7 @@ async def trigger_auto_recharge_capped(db: "Db", user_id: str) -> bool:
 
 async def _trigger_off_session_charge(db: "Db", user_id: str, *, capped: bool) -> int:
     """Common path for both auto-recharge modes."""
-    stripe = _stripe()
+    client = _stripe_client()
     quota = db.get_or_create_quota(user_id)
     pm = quota.get("stripe_payment_method_id")
     customer = quota.get("stripe_customer_id")
@@ -189,16 +214,21 @@ async def _trigger_off_session_charge(db: "Db", user_id: str, *, capped: bool) -
     pending_row_id = cursor.lastrowid
 
     def _create_pi():
-        return stripe.PaymentIntent.create(
-            amount=amount_cents, currency="usd",
-            customer=customer, payment_method=pm,
-            off_session=True, confirm=True,
-            idempotency_key=key,
-            metadata={
-                "user_id": user_id,
-                "credits": str(block_credits),
-                "purchase_kind": kind,
+        return client.payment_intents.create(
+            {
+                "amount": amount_cents,
+                "currency": "usd",
+                "customer": customer,
+                "payment_method": pm,
+                "off_session": True,
+                "confirm": True,
+                "metadata": {
+                    "user_id": user_id,
+                    "credits": str(block_credits),
+                    "purchase_kind": kind,
+                },
             },
+            options={"idempotency_key": key},
         )
 
     try:

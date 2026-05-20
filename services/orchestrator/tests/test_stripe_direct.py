@@ -15,10 +15,13 @@ def test_create_checkout_session_calls_stripe(monkeypatch, db):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_xxx")
     db.get_or_create_quota("u1", plan_hint="pro_beta")
 
-    fake = MagicMock()
-    fake.Checkout.Session.create = MagicMock(
+    # stripe-python 15.x: instance-based client (StripeClient).
+    fake_client = MagicMock()
+    fake_client.checkout.sessions.create = MagicMock(
         return_value=MagicMock(id="cs_test_123", url="https://checkout.stripe.com/cs_test_123"),
     )
+    fake = MagicMock()
+    fake.StripeClient = MagicMock(return_value=fake_client)
     with patch.dict("sys.modules", {"stripe": fake}):
         import importlib, tally_orchestrator.stripe_direct as sd
         importlib.reload(sd)
@@ -27,7 +30,7 @@ def test_create_checkout_session_calls_stripe(monkeypatch, db):
         )
         assert out["url"].startswith("https://checkout.stripe.com/")
         assert out["session_id"] == "cs_test_123"
-    fake.Checkout.Session.create.assert_called_once()
+    fake_client.checkout.sessions.create.assert_called_once()
 
 
 def test_idempotency_key_format():

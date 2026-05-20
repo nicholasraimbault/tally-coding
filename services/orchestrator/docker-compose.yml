@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v26
+    image: ghcr.io/nicholasraimbault/tally-orch:v26.2
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
     # survive CVM restarts so the orchestrator doesn't re-bootstrap MLS
@@ -50,6 +50,19 @@ services:
       # with GitHub" don't need to paste a PAT.  Falls back to the
       # stored PAT (S38) on failure.  Optional: empty = PAT-only flow.
       - CLERK_SECRET_KEY=${CLERK_SECRET_KEY:-}
+      # Sprint 46.5: Stripe direct API access (via Clerk's bring-your-
+      # own-Stripe linkage).  Used by stripe_direct.py for one-time
+      # credit purchases (Checkout Sessions) + off-session PaymentIntent
+      # for auto-recharge.  Empty = /billing/credits/checkout +
+      # /billing/auto-recharge/* return 503; subscription tiers still
+      # work via Clerk.
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      # Sprint 46.5: signing secret for the /webhooks/stripe endpoint
+      # (from Stripe dashboard → Developers → Webhooks → endpoint
+      # detail → signing secret).  Verifies webhook authenticity for
+      # checkout.session.completed / setup_intent.succeeded /
+      # payment_intent.{succeeded,payment_failed}.
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
     volumes:
       - data:/data
 
