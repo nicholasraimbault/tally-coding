@@ -127,9 +127,19 @@ def evaluate_rules_for_cost_event(db: "Db", user_id: str) -> list[dict]:
         "WHERE user_id=? AND enabled=1",
         (user_id,),
     ).fetchall()
+    now = time.time()
     for rid, kind, threshold, last_fired_at in rules:
-        if last_fired_at is not None and last_fired_at >= quota["period_start"]:
-            continue
+        # Per-rule-kind idempotency window: period_pct resets at billing
+        # period rollover (30d); daily/weekly reset on their own clocks.
+        if kind == "period_pct":
+            if last_fired_at is not None and last_fired_at >= quota["period_start"]:
+                continue
+        elif kind == "daily_amount":
+            if last_fired_at is not None and last_fired_at >= (now - 86400):
+                continue
+        elif kind == "weekly_amount":
+            if last_fired_at is not None and last_fired_at >= (now - 7 * 86400):
+                continue
         if kind == "period_pct" and pct >= int(threshold):
             nid = insert_notification(db, user_id, kind="period_pct_crossed",
                 severity="warning" if int(threshold) >= 100 else "info",
@@ -140,7 +150,7 @@ def evaluate_rules_for_cost_event(db: "Db", user_id: str) -> list[dict]:
                 (time.time(), rid))
             fired.append({"id": nid, "kind": "period_pct_crossed", "threshold": int(threshold)})
         elif kind == "daily_amount":
-            day_used = db.credits_used_in_window(user_id, time.time() - 86400)
+            day_used = db.credits_used_in_window(user_id, now - 86400)
             if day_used >= int(threshold):
                 nid = insert_notification(db, user_id, kind="daily_amount_reached",
                     severity="info", payload={"threshold": int(threshold), "used": day_used},
@@ -149,7 +159,7 @@ def evaluate_rules_for_cost_event(db: "Db", user_id: str) -> list[dict]:
                     (time.time(), rid))
                 fired.append({"id": nid, "kind": "daily_amount_reached"})
         elif kind == "weekly_amount":
-            week_used = db.credits_used_in_window(user_id, time.time() - 7 * 86400)
+            week_used = db.credits_used_in_window(user_id, now - 7 * 86400)
             if week_used >= int(threshold):
                 nid = insert_notification(db, user_id, kind="weekly_amount_reached",
                     severity="info", payload={"threshold": int(threshold), "used": week_used},

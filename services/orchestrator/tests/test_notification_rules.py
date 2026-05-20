@@ -1,6 +1,7 @@
 # services/orchestrator/tests/test_notification_rules.py
 """Sprint 46: notification rule evaluation."""
 import json
+import time
 from tally_orchestrator.notifications import (
     evaluate_rules_for_cost_event,
     seed_default_rules,
@@ -56,6 +57,34 @@ def test_evaluate_fires_period_pct_only_once(db):
     assert len(first) > 0
     second = evaluate_rules_for_cost_event(db, "u1")
     assert second == []
+
+
+def test_daily_amount_refires_after_24h(db):
+    """Daily rules should reset every 24h, not at billing period start."""
+    db.get_or_create_quota("u1", plan_hint="pro_beta")
+    db._conn.execute(
+        "INSERT INTO notification_rules (user_id, kind, threshold, enabled, created_at) "
+        "VALUES ('u1', 'daily_amount', 10, 1, ?)",
+        (time.time() - 100,),
+    )
+    # Push 20 credits of usage
+    db.record_cost_event(
+        user_id="u1", kind="worker", model="meta-llama/llama-3.3-70b-instruct",
+        prompt_tokens=0, completion_tokens=0, total_tokens=0,
+        cost_micro_usd=200_000,
+    )
+    first = evaluate_rules_for_cost_event(db, "u1")
+    assert any(n["kind"] == "daily_amount_reached" for n in first)
+    # Re-evaluate immediately → no re-fire (still within 24h)
+    second = evaluate_rules_for_cost_event(db, "u1")
+    assert second == []
+    # Force last_fired_at backward by 25h → rule should be eligible to refire
+    db._conn.execute(
+        "UPDATE notification_rules SET last_fired_at=? WHERE user_id='u1' AND kind='daily_amount'",
+        (time.time() - 25 * 3600,),
+    )
+    third = evaluate_rules_for_cost_event(db, "u1")
+    assert any(n["kind"] == "daily_amount_reached" for n in third)
 
 
 def test_insert_notification_and_list(db):
