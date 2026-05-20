@@ -2,9 +2,10 @@
 """Sprint 46: direct Stripe integration for one-time credit purchases
 and off-session auto-recharge.
 
-Path resolved before implementation (spec §"Stripe access path"):
-[fill in once Clerk dashboard is checked — either restricted
-sk_*** key, or fallback to Clerk Billing metered subscription items].
+`STRIPE_SECRET_KEY` is the operator-supplied restricted Stripe API key
+with scopes: charges:write, payment_intents:write,
+checkout_sessions:write, customers:read, payment_methods:read.
+Webhooks land at `/webhooks/stripe` (handler in service.py).
 
 Idempotency: every off-session PaymentIntent.create uses
 `recharge_{user_id}_{int(period_start)}_{already_spent}` so retries
@@ -170,6 +171,22 @@ async def _trigger_off_session_charge(db: "Db", user_id: str, *, capped: bool) -
     key = recharge_idempotency_key(
         user_id=user_id, period_start=quota["period_start"], already_spent=already_spent,
     )
+    kind = "auto_recharge" + ("_capped" if capped else "_unlimited")
+
+    # Record the pending purchase BEFORE the Stripe call so a crash
+    # between charge and INSERT can't strand a real charge with no
+    # local row.  Webhook `payment_intent.succeeded` finalizes status
+    # to 'succeeded' and credits the balance.  The row's `stripe_payment_intent_id`
+    # column is filled in after the Stripe call succeeds; the idempotency
+    # key + (user_id, ts) is enough to dedupe webhook retries until
+    # then.
+    cursor = db._conn.execute(
+        "INSERT INTO overage_purchases "
+        "(user_id, ts, credits_purchased, cost_charged_micro_usd, kind, status) "
+        "VALUES (?, ?, ?, ?, ?, 'pending')",
+        (user_id, time.time(), block_credits, amount_micro, kind),
+    )
+    pending_row_id = cursor.lastrowid
 
     def _create_pi():
         return stripe.PaymentIntent.create(
@@ -180,23 +197,23 @@ async def _trigger_off_session_charge(db: "Db", user_id: str, *, capped: bool) -
             metadata={
                 "user_id": user_id,
                 "credits": str(block_credits),
-                "purchase_kind": "auto_recharge" + ("_capped" if capped else "_unlimited"),
+                "purchase_kind": kind,
             },
         )
 
-    pi = await asyncio.to_thread(_create_pi)
-    # Optimistically record the pending purchase.  Webhook
-    # `payment_intent.succeeded` finalizes prepaid_credit_balance.
+    try:
+        pi = await asyncio.to_thread(_create_pi)
+    except Exception as exc:
+        # Mark the pending row failed so /billing/credits can show
+        # the failure reason without depending on the webhook.
+        db._conn.execute(
+            "UPDATE overage_purchases SET status='failed', failure_reason=? WHERE id=?",
+            (str(exc)[:500], pending_row_id),
+        )
+        raise
     db._conn.execute(
-        "INSERT INTO overage_purchases "
-        "(user_id, ts, credits_purchased, cost_charged_micro_usd, kind, "
-        "stripe_payment_intent_id, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-        (
-            user_id, time.time(), block_credits, amount_micro,
-            "auto_recharge" + ("_capped" if capped else "_unlimited"),
-            pi.id,
-        ),
+        "UPDATE overage_purchases SET stripe_payment_intent_id=? WHERE id=?",
+        (pi.id, pending_row_id),
     )
     db._conn.execute(
         "UPDATE quotas SET auto_recharge_spent_this_month_micro_usd = "
