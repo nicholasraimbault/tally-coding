@@ -5,11 +5,14 @@
 /// task channel (handled by the shell via onTaskSubmitted).
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
 import '../widgets/channel_header.dart';
+import '../widgets/cost_estimate_banner.dart';
 
 class GeneralChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
@@ -36,6 +39,30 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
   final _ctrl = TextEditingController();
   bool _submitting = false;
   String? _error;
+  int _availableCredits = 0;
+  int _perTaskCap = 100;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refreshCreditState());
+  }
+
+  Future<void> _refreshCreditState() async {
+    try {
+      final results = await Future.wait([
+        widget.client.getCreditsBalance(),
+        widget.client.getCaps(),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _availableCredits = results[0]['available_credits'] as int;
+        _perTaskCap = results[1]['per_task_cap_credits'] as int;
+      });
+    } catch (_) {
+      // banner stays at defaults; no UX impact
+    }
+  }
 
   Future<void> _submit({String? overrideDescription, Map<String, dynamic>? teamSpec}) async {
     final desc = (overrideDescription ?? _ctrl.text).trim();
@@ -86,6 +113,17 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
           ),
           if (widget.activeProjectId != null)
             _ActiveProjectStrip(projectId: widget.activeProjectId!),
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _ctrl,
+            builder: (context, value, _) {
+              final est = estimateCreditsClientSide(value.text);
+              return CostEstimateBanner(
+                estimatedCredits: est,
+                availableCredits: _availableCredits,
+                perTaskCapCredits: _perTaskCap,
+              );
+            },
+          ),
           _Composer(
             controller: _ctrl,
             submitting: _submitting,
