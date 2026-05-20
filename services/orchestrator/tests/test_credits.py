@@ -42,3 +42,30 @@ def test_free_tier_restricts_to_llama():
 def test_unlimited_bypasses_caps():
     plan = QUOTA_PLANS["unlimited"]
     assert plan["included_credits"] >= 10**8
+
+
+from tally_orchestrator.credits import (
+    micro_usd_to_credits,
+    credits_to_micro_usd,
+    OVERAGE_CREDIT_PRICE_MICRO_USD,
+    MIN_PURCHASE_CREDITS,
+)
+
+
+def test_micro_usd_to_credits_rounds_up():
+    # 1 credit = $0.01 = 10_000 micro_usd
+    assert micro_usd_to_credits(10_000) == 1
+    assert micro_usd_to_credits(10_001) == 2  # round up — never undercount usage
+    assert micro_usd_to_credits(9_999) == 1
+    assert micro_usd_to_credits(0) == 0
+
+
+def test_credits_to_micro_usd_at_overage_rate():
+    # User-facing overage: $0.02/credit = 20_000 micro_usd
+    assert credits_to_micro_usd(1) == 20_000
+    assert credits_to_micro_usd(250) == 5_000_000  # $5 minimum
+
+
+def test_overage_constants():
+    assert OVERAGE_CREDIT_PRICE_MICRO_USD == 20_000
+    assert MIN_PURCHASE_CREDITS == 250  # $5 floor (Stripe fixed fee economics)
