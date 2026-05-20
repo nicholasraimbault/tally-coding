@@ -1,8 +1,6 @@
 """Sprint 46 A17: /ws/notifications WebSocket endpoint."""
 from __future__ import annotations
 
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -61,7 +59,6 @@ def test_websocket_rejects_without_token(client):
 
 async def test_websocket_receives_notification_signal(client, monkeypatch):
     """fan_out_push delivers new_notification to registered WebSocket."""
-    import asyncio
     import tally_orchestrator.service as svc
     from tally_orchestrator.notifications import insert_notification, fan_out_push
 
