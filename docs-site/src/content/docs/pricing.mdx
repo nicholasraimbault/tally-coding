@@ -1,0 +1,94 @@
+---
+title: Pricing
+description: Privacy-first beta pricing for Tally Coding.
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Beta pricing — locked for the life of your subscription
+
+Tally Coding is in private beta. Beta subscribers lock these rates
+forever — when we ship stable, new customers pay higher prices, but
+yours stays the same as long as you don't cancel.
+
+<CardGrid>
+  <Card title="Free">
+    **$0/mo**
+
+    - 50 credits ($0.50 of compute)
+    - 25-credit cap per task
+    - llama-3.3-70b only
+    - No overage
+  </Card>
+  <Card title="Pro (Beta)">
+    **$15/mo**
+
+    - 1,000 credits ($10 of compute)
+    - 100-credit cap per task (adjustable)
+    - All models, S42 routing
+    - Overage available
+  </Card>
+  <Card title="Max (Beta)">
+    **$75/mo**
+
+    - 5,000 credits ($50 of compute)
+    - 500-credit cap per task (adjustable)
+    - All models, S42 routing
+    - Overage available
+  </Card>
+  <Card title="Ultra (Beta)">
+    **$150/mo**
+
+    - 10,000 credits ($100 of compute)
+    - 1,000-credit cap per task (adjustable)
+    - All models, S42 routing
+    - Overage available
+  </Card>
+</CardGrid>
+
+## How credits work
+
+1 credit = $0.01 of LLM compute. Every model call (architect, agents)
+costs credits based on actual token usage. We surface real-time spend
+in the app — you'll never get a surprise bill.
+
+- **Subscription credits** roll over monthly, expire at period end.
+- **Overage credits** (one-time purchase or auto-recharge) never expire.
+- **Overage rate**: $0.02 per credit across all tiers.
+
+## Hard caps
+
+Every paid tier has a per-task cost cap (default shown above; you can
+raise or lower it). When a task hits its cap, remaining agents are
+skipped to protect your balance. Partial artifacts are preserved.
+
+You can also set daily and weekly spend caps. Combined, these make it
+**mathematically impossible** to spend more than you intend.
+
+## Overage modes
+
+| Mode | What happens at zero balance |
+|---|---|
+| Subscription only | Hard stop until next period |
+| Pre-paid manual | Hard stop; you top up when ready |
+| Auto-recharge with cap | Auto-buys up to your monthly limit |
+| Full auto (no cap) | Never runs out; bills as usage grows |
+
+## FAQ
+
+**Will my beta price increase?**
+Not as long as you don't cancel. When stable launches, new customers
+pay the stable rate; you keep the beta rate.
+
+**What if I exceed my cap?**
+The task aborts gracefully with partial artifacts preserved. You can
+raise the cap and re-run, or work with what completed.
+
+**Do I need to give you my LLM API key?**
+No. Beta includes inference. Enterprise (post-beta) supports bring-
+your-own keys for Anthropic, OpenAI, and Red Pill.
+
+**How private are notifications?**
+Push wakes use the "doorbell pattern": empty signals only. Content
+fetches over authenticated TLS directly from us. No notification
+content transits Google FCM, Apple APNs, or any third-party service.
