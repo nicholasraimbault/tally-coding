@@ -2880,6 +2880,10 @@ class Orchestrator:
                     f"cost cap reached: {task_cost_credits} > {effective_cap}",
                 )
                 self._task_artifacts.pop(task_id, None)
+                # Match other abort paths (failed agent, end-of-task failure):
+                # durable artifact rows are only retained for SUCCESSFUL tasks
+                # so child tasks can hydrate from them.
+                self.db.delete_artifacts(task_id)
                 await self._publish_status(task_id, "aborted_cost_cap", {
                     "cost_credits": task_cost_credits,
                     "cap_credits": effective_cap,
