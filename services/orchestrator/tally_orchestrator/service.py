@@ -1524,14 +1524,11 @@ class Db:
         return micro_usd_to_credits(int(row[0] or 0))
 
     def credits_used_in_window(self, user_id: str, since_ts: float) -> int:
-        """Credits in a rolling window (used for daily / weekly cap checks)."""
-        from .credits import micro_usd_to_credits
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM cost_events "
-            "WHERE user_id=? AND ts >= ?",
-            (user_id, since_ts),
-        ).fetchone()
-        return micro_usd_to_credits(int(row[0] or 0))
+        """Credits in a rolling window (used for daily / weekly cap checks).
+
+        Identical query shape to `credits_used_this_period`; delegates
+        to keep the SQL in one place."""
+        return self.credits_used_this_period(user_id, since_ts)
 
     def credits_available(self, user_id: str) -> int:
         """Subscription pool remaining + prepaid balance.

@@ -48,6 +48,14 @@ def test_increment_prepaid_balance_adds(db: Db):
     assert db.get_prepaid_balance("u1") == 250
 
 
+def test_consume_prepaid_balance_floors_at_zero(db: Db):
+    """Spending more credits than the prepaid balance clamps to 0, never negative."""
+    db.get_or_create_quota("u1", plan_hint="pro_beta")
+    db.set_prepaid_balance("u1", 100)
+    db.consume_prepaid_balance("u1", 250)  # over-consume
+    assert db.get_prepaid_balance("u1") == 0
+
+
 def test_effective_per_task_cap_credits_uses_quota_override(db: Db):
     db.get_or_create_quota("u1", plan_hint="pro_beta")
     # No override → falls back to plan default (100 for pro_beta)
