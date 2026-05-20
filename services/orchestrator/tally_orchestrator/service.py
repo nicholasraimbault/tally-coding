@@ -4992,6 +4992,10 @@ async def post_credits_checkout(
         raise HTTPException(400, str(exc))
     except StripeNotConfiguredError:
         raise HTTPException(503, "Stripe billing not configured")
+    except Exception as exc:
+        # Network blip / Stripe API error → 503 so client can retry.
+        logger.warning("checkout session creation failed: %s", exc)
+        raise HTTPException(503, "Stripe API error; retry shortly")
     return out
 
 
@@ -5009,6 +5013,9 @@ async def post_auto_recharge_setup(
         )
     except StripeNotConfiguredError:
         raise HTTPException(503, "Stripe billing not configured")
+    except Exception as exc:
+        logger.warning("setup session creation failed: %s", exc)
+        raise HTTPException(503, "Stripe API error; retry shortly")
 
 
 @app.patch("/billing/auto-recharge")
@@ -5034,6 +5041,8 @@ async def patch_auto_recharge(
         fields.append("auto_recharge_block_credits=?")
         values.append(body.block_credits)
     if body.monthly_cap_micro_usd is not None:
+        if body.monthly_cap_micro_usd <= 0:
+            raise HTTPException(400, "monthly_cap_micro_usd must be > 0")
         fields.append("auto_recharge_monthly_cap_micro_usd=?")
         values.append(body.monthly_cap_micro_usd)
     if not fields:
