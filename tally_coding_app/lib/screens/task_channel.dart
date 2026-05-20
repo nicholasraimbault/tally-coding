@@ -13,7 +13,10 @@ import 'package:flutter/material.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
+import '../widgets/cap_abort_dialog.dart';
 import '../widgets/channel_header.dart';
+import '../widgets/task_cost_ticker.dart';
+import 'billing_screen.dart';
 import 'file_tree.dart';
 
 class TaskChannelScreen extends StatefulWidget {
@@ -35,12 +38,24 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   String? _filesError;
   bool _filesLoading = false;
   final _scrollCtrl = ScrollController();
+  int _perTaskCap = 100; // default until getCaps() resolves
 
   @override
   void initState() {
     super.initState();
     _fetchInitial();
     _connectStream();
+    _fetchCaps();
+  }
+
+  Future<void> _fetchCaps() async {
+    try {
+      final caps = await widget.client.getCaps();
+      if (!mounted) return;
+      setState(() {
+        _perTaskCap = (caps['per_task_cap_credits'] as num?)?.toInt() ?? 100;
+      });
+    } catch (_) {/* non-critical — keep default */}
   }
 
   @override
@@ -121,6 +136,31 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
             if (newStatus == 'completed' || newStatus == 'failed') {
               _fetchInitial();
             }
+            if (newStatus == 'aborted_cost_cap') {
+              final detail = frame.data['extra'] as Map<String, dynamic>? ?? {};
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!mounted) return;
+                showDialog(
+                  context: context,
+                  builder: (_) => CapAbortDialog(
+                    costCredits: (detail['cost_credits'] as num?)?.toInt() ?? 0,
+                    capCredits: (detail['cap_credits'] as num?)?.toInt() ?? 0,
+                    onViewPartial: () {
+                      Navigator.pop(context);
+                      // artifacts are already visible in the channel body
+                    },
+                    onRaiseCapAndRetry: () {
+                      Navigator.pop(context);
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => BillingScreen(client: widget.client),
+                        ),
+                      );
+                    },
+                  ),
+                );
+              });
+            }
           }
           _error = null;
         });
@@ -165,10 +205,23 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
             glyph: '#',
             name: t?.id.substring(0, 8) ?? widget.taskId.substring(0, 8),
             description: t?.description ?? 'Loading…',
-            trailing: t == null ? null : _HeaderTrailing(
-              task: t,
-              onSaveTemplate: () => _promptSaveTemplate(t),
-              onBranch: () => _promptBranch(t),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TaskCostTicker(
+                  client: widget.client,
+                  taskId: widget.taskId,
+                  perTaskCapCredits: _perTaskCap,
+                  taskStatus: t?.status ?? 'pending',
+                ),
+                const SizedBox(width: 8),
+                if (t != null)
+                  _HeaderTrailing(
+                    task: t,
+                    onSaveTemplate: () => _promptSaveTemplate(t),
+                    onBranch: () => _promptBranch(t),
+                  ),
+              ],
             ),
           ),
           Expanded(child: _body(t)),
