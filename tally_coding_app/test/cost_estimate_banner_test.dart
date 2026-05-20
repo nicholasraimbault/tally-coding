@@ -21,8 +21,11 @@ void main() {
   });
 
   test('estimateCreditsClientSide scales with length', () {
-    final small = estimateCreditsClientSide('x' * 100);
-    final big = estimateCreditsClientSide('x' * 10000);
+    // At 0.01-USD/credit granularity the heuristic needs ~50k chars to
+    // cross 1 credit.  Use inputs spanning the boundary so credit values
+    // genuinely differ.
+    final small = estimateCreditsClientSide('x' * 50000);
+    final big = estimateCreditsClientSide('x' * 500000);
     expect(big, greaterThan(small));
   });
 }

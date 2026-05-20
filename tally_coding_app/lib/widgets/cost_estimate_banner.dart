@@ -20,8 +20,8 @@ class CostEstimateBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // estimatedCredits is in micro-dollars (1 unit = $0.000001); convert to USD.
-    final usd = estimatedCredits / 1000000;
+    // 1 credit = $0.01 user-facing (matches the server's accounting unit).
+    final usd = estimatedCredits * 0.02;
     final color = _color();
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -43,8 +43,14 @@ class CostEstimateBanner extends StatelessWidget {
   }
 }
 
-/// Sprint 46: client-side cost estimate. Heuristic only — server
+/// Sprint 46: client-side cost estimate.  Heuristic only — server
 /// authoritatively rejects at the credit gate.
+///
+/// 1 credit = $0.01 of COGS (matches server semantics).  Real agent
+/// runs cost 50-100+ credits because of system prompts; this client
+/// hint only accounts for the description-driven tokens, so it
+/// underestimates by design and is best used to feel cost SHAPE
+/// (small/medium/huge), not exact spend.
 int estimateCreditsClientSide(String description) {
   if (description.isEmpty) return 0;
   // 4 chars ≈ 1 prompt token; llama-3.3 70b: $0.59/M prompt + $0.79/M completion
@@ -53,7 +59,7 @@ int estimateCreditsClientSide(String description) {
   final usdProm = tokens * 0.59 / 1000000;
   final usdComp = tokens * 0.2 * 0.79 / 1000000;
   final usdTotal = usdProm + usdComp;
-  // Return micro-dollars (1 unit = $0.000001) for sub-cent resolution so
-  // the estimate scales visibly even for short prompts.
-  return (usdTotal * 1000000).ceil();
+  // Convert USD → credits at $0.01/credit, round up so small spend
+  // shows as ≥1 credit.
+  return (usdTotal * 100).ceil();
 }
