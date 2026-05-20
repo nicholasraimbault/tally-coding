@@ -178,7 +178,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       MaterialPageRoute(
         builder: (_) => BillingScreen(
           client: widget.client,
-          publishableKey: clerkPublishableKey,
         ),
       ),
     );

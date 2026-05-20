@@ -1,90 +1,91 @@
-import 'dart:convert';
-
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
-
 import '../api.dart';
+import '../widgets/credit_balance_widget.dart';
 
-/// Sprint 33-rest: read-only billing screen.  Reads `/billing/usage`
-/// to show plan + period counters + caps.  "Manage subscription"
-/// launches the Clerk Account Portal in the system browser, where
-/// the user can subscribe / change plan via the hosted PricingTable.
-/// On return, the screen refetches usage so the new plan shows up
-/// (orchestrator opportunistically syncs from the JWT `pla` claim;
-/// the Clerk webhook is the authoritative async path).
+/// Sprint 46: credit-based billing screen.  Replaces the Sprint 33
+/// Clerk-portal screen with a full credit management UI:
+///   • Credit balance widget (subscription + prepaid split)
+///   • Buy credits one-time (Stripe Checkout redirect)
+///   • Auto-recharge setup (Stripe SetupIntent redirect)
+///   • Auto-recharge mode + block-size + monthly-cap controls
+///   • Per-task / daily / weekly spend caps
+///   • Notifications & alerts shortcut tile
 class BillingScreen extends StatefulWidget {
   final TallyOrchClient client;
-  final String publishableKey;
-  const BillingScreen({super.key, required this.client, required this.publishableKey});
+  const BillingScreen({super.key, required this.client});
 
   @override
   State<BillingScreen> createState() => _BillingScreenState();
 }
 
 class _BillingScreenState extends State<BillingScreen> {
-  Future<Map<String, dynamic>>? _usage;
-  Future<Map<String, dynamic>>? _cost;
+  Map<String, dynamic>? _balance;
+  Map<String, dynamic>? _caps;
+  String? _error;
+  bool _loading = true;
+  Timer? _poll;
 
   @override
   void initState() {
     super.initState();
     _refresh();
+    _poll = Timer.periodic(const Duration(seconds: 30), (_) => _refresh());
   }
 
-  void _refresh() {
-    setState(() {
-      _usage = widget.client.billingUsage();
-      _cost = widget.client.billingCost();
-    });
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
   }
 
-  /// Derive the Clerk Account Portal URL from the publishable key.
-  ///
-  /// **Important:** the *frontend API host* (where the SDK fetches
-  /// `/v1/environment` etc.) is `<slug>.clerk.accounts.dev`, but the
-  /// *hosted Account Portal* (the user-facing profile + billing
-  /// pages) is `<slug>.accounts.dev` — no `clerk.` prefix.  We have
-  /// to strip the `clerk.` segment when building the portal URL or
-  /// users get a 404.  Billing lives inside the UserProfile widget
-  /// as a tab; the public route is `/user` and Clerk auto-selects
-  /// the Billing tab when you append `#/billing` to the hash route.
-  Uri? _billingPortalUri() {
-    final pk = widget.publishableKey;
-    for (final prefix in ['pk_test_', 'pk_live_']) {
-      if (!pk.startsWith(prefix)) continue;
-      final tail = pk.substring(prefix.length);
-      try {
-        final padded = tail.padRight(((tail.length + 3) ~/ 4) * 4, '=');
-        final decoded = utf8.decode(base64.decode(padded));
-        final frontend = decoded.endsWith(r'$')
-            ? decoded.substring(0, decoded.length - 1)
-            : decoded;
-        // Strip the leading `clerk.` segment to get the portal host.
-        final portalHost = frontend.startsWith('clerk.')
-            ? frontend.substring('clerk.'.length)
-            : frontend.replaceFirst('.clerk.', '.');
-        return Uri.parse('https://$portalHost/user#/billing');
-      } catch (_) {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  Future<void> _openPortal() async {
-    final uri = _billingPortalUri();
-    if (uri == null) {
+  Future<void> _refresh() async {
+    try {
+      final results = await Future.wait([
+        widget.client.getCreditsBalance(),
+        widget.client.getCaps(),
+      ]);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not derive Clerk billing portal URL from publishable key.')),
-      );
-      return;
+      setState(() {
+        _balance = results[0];
+        _caps = results[1];
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
     }
-    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!ok && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to open $uri')),
-      );
+  }
+
+  Future<void> _buyCredits() async {
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (_) => const _CreditPickerDialog(),
+    );
+    if (picked == null) return;
+    try {
+      final out = await widget.client.postCreditsCheckout(credits: picked);
+      final url = Uri.parse(out['url'] as String);
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _setupAutoRecharge() async {
+    try {
+      final out = await widget.client.postAutoRechargeSetup();
+      final url = Uri.parse(out['url'] as String);
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     }
   }
 
@@ -95,7 +96,7 @@ class _BillingScreenState extends State<BillingScreen> {
       appBar: AppBar(
         backgroundColor: const Color(0xFF1E1F22),
         foregroundColor: Colors.white,
-        title: const Text('Billing & Usage'),
+        title: const Text('Billing'),
         actions: [
           IconButton(
             tooltip: 'Refresh',
@@ -104,367 +105,398 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
         ],
       ),
-      body: FutureBuilder<Map<String, dynamic>>(
-        future: _usage,
-        builder: (context, snap) {
-          if (snap.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (snap.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.redAccent, size: 48),
-                    const SizedBox(height: 12),
-                    Text(
-                      '${snap.error}',
-                      style: const TextStyle(color: Colors.white70),
-                      textAlign: TextAlign.center,
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.error_outline, color: Colors.redAccent, size: 48),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Error: $_error',
+                          style: const TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 16),
+                        TextButton(
+                          onPressed: () {
+                            setState(() {
+                              _loading = true;
+                              _error = null;
+                            });
+                            _refresh();
+                          },
+                          child: const Text('Retry'),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-              ),
-            );
-          }
-          final data = snap.data!;
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _PlanCard(plan: data['plan'] as String, label: data['plan_label'] as String),
-                const SizedBox(height: 16),
-                _UsageCard(
-                  title: 'Tasks this period',
-                  used: (data['tasks']?['used'] as num?)?.toInt() ?? 0,
-                  cap: (data['tasks']?['cap'] as num?)?.toInt() ?? 0,
-                ),
-                const SizedBox(height: 12),
-                _UsageCard(
-                  title: 'Agent seconds this period',
-                  used: (data['agent_seconds']?['used'] as num?)?.toInt() ?? 0,
-                  cap: (data['agent_seconds']?['cap'] as num?)?.toInt() ?? 0,
-                  formatter: _formatSeconds,
-                ),
-                const SizedBox(height: 12),
-                _CostCard(future: _cost),
-                const SizedBox(height: 24),
-                Row(
+                  ),
+                )
+              : ListView(
+                  padding: const EdgeInsets.all(16),
                   children: [
-                    ElevatedButton.icon(
-                      onPressed: _openPortal,
-                      icon: const Icon(Icons.credit_card),
-                      label: const Text('Manage subscription'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF7C5CFC),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                    CreditBalanceWidget(
+                      planLabel: _balance!['plan_label'] as String,
+                      isBeta: _balance!['is_beta'] as bool,
+                      usedCredits: _balance!['used_credits'] as int,
+                      includedCredits: _balance!['included_credits'] as int,
+                      prepaidCreditBalance: _balance!['prepaid_credit_balance'] as int,
+                      periodStart: (_balance!['period_start'] as num).toDouble(),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            icon: const Icon(Icons.add),
+                            label: const Text('Buy credits'),
+                            onPressed: _buyCredits,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            icon: const Icon(Icons.autorenew),
+                            label: const Text('Auto-recharge'),
+                            onPressed: _setupAutoRecharge,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    _AutoRechargeCard(
+                      client: widget.client,
+                      balance: _balance!,
+                      onChanged: _refresh,
+                    ),
+                    const SizedBox(height: 16),
+                    _CapsCard(
+                      client: widget.client,
+                      caps: _caps!,
+                      onChanged: _refresh,
+                    ),
+                    const SizedBox(height: 16),
+                    Card(
+                      color: const Color(0xFF2B2D31),
+                      child: ListTile(
+                        leading: const Icon(Icons.notifications_outlined, color: Colors.white70),
+                        title: const Text(
+                          'Notifications & alerts',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        subtitle: const Text(
+                          'Configure spend alerts and devices',
+                          style: TextStyle(color: Color(0xFFB9BBBE)),
+                        ),
+                        trailing: const Icon(Icons.chevron_right, color: Colors.white54),
+                        onTap: () {
+                          // B7 will register the /notifications route.
+                          // Until then, show a placeholder snackbar.
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Notifications — coming soon')),
+                          );
+                        },
                       ),
                     ),
-                    const SizedBox(width: 12),
-                    TextButton(
-                      onPressed: _refresh,
-                      style: TextButton.styleFrom(foregroundColor: const Color(0xFFB9BBBE)),
-                      child: const Text("I've subscribed — refresh"),
-                    ),
                   ],
                 ),
-                const SizedBox(height: 24),
-                const Text(
-                  'Plans are managed by Clerk. Your subscription state syncs into Tally automatically when you upgrade or cancel.',
-                  style: TextStyle(color: Color(0xFF99AAB5), fontSize: 12),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
     );
-  }
-
-  static String _formatSeconds(int s) {
-    if (s < 60) return '${s}s';
-    if (s < 3600) return '${(s / 60).toStringAsFixed(1)}m';
-    return '${(s / 3600).toStringAsFixed(1)}h';
   }
 }
 
-/// Sprint 39: cost breakdown panel — total LLM spend this period
-/// plus per-kind (architect / agent) and per-model splits.  Numbers
-/// are estimates based on the orchestrator's static price table;
-/// real billing is on Red Pill's side and only available there.
-class _CostCard extends StatelessWidget {
-  final Future<Map<String, dynamic>>? future;
-  const _CostCard({required this.future});
+// ─── _CreditPickerDialog ────────────────────────────────────────────────────
+
+class _CreditPickerDialog extends StatefulWidget {
+  const _CreditPickerDialog();
+
+  @override
+  State<_CreditPickerDialog> createState() => _CreditPickerDialogState();
+}
+
+class _CreditPickerDialogState extends State<_CreditPickerDialog> {
+  int _credits = 500;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF2B2D31),
-        borderRadius: BorderRadius.circular(8),
+    final usd = _credits * 0.02;
+    return AlertDialog(
+      title: const Text('Buy credits'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Slider(
+            value: _credits.toDouble(),
+            min: 250,
+            max: 5000,
+            divisions: 19,
+            label: '$_credits credits',
+            onChanged: (v) => setState(() => _credits = v.round()),
+          ),
+          Text('$_credits credits · \$${usd.toStringAsFixed(2)}'),
+          const SizedBox(height: 8),
+          const Text(
+            'Minimum: 250 credits (\$5)',
+            style: TextStyle(fontSize: 12),
+          ),
+        ],
       ),
-      child: FutureBuilder<Map<String, dynamic>>(
-        future: future,
-        builder: (context, snap) {
-          if (snap.connectionState != ConnectionState.done) {
-            return const SizedBox(
-              height: 80,
-              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
-            );
-          }
-          if (snap.hasError) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('LLM cost this period',
-                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _credits),
+          child: const Text('Buy'),
+        ),
+      ],
+    );
+  }
+}
+
+// ─── _AutoRechargeCard ──────────────────────────────────────────────────────
+
+class _AutoRechargeCard extends StatefulWidget {
+  final TallyOrchClient client;
+  final Map<String, dynamic> balance;
+  final VoidCallback onChanged;
+
+  const _AutoRechargeCard({
+    required this.client,
+    required this.balance,
+    required this.onChanged,
+  });
+
+  @override
+  State<_AutoRechargeCard> createState() => _AutoRechargeCardState();
+}
+
+class _AutoRechargeCardState extends State<_AutoRechargeCard> {
+  late int _mode;
+  late int _blockCredits;
+  late int? _monthlyCapMicroUsd;
+
+  @override
+  void initState() {
+    super.initState();
+    _mode = widget.balance['auto_recharge_mode'] as int;
+    _blockCredits = widget.balance['auto_recharge_block_credits'] as int;
+    _monthlyCapMicroUsd = widget.balance['auto_recharge_monthly_cap_micro_usd'] as int?;
+  }
+
+  Future<void> _save() async {
+    try {
+      await widget.client.patchAutoRecharge(
+        mode: _mode,
+        blockCredits: _blockCredits,
+        monthlyCapMicroUsd: _monthlyCapMicroUsd,
+      );
+      widget.onChanged();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  static const _modes = [
+    (0, 'Subscription only', 'Hard stop when credits run out'),
+    (1, 'Pre-paid manual', 'Buy credit blocks; no auto-charge'),
+    (2, 'Auto-recharge with cap', 'Auto-buy blocks up to monthly limit'),
+    (3, 'Full auto (no cap)', 'Never run out; bills as usage grows'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final hasCard = widget.balance['stripe_payment_method_id'] != null;
+    return Card(
+      color: const Color(0xFF2B2D31),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Auto-recharge',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(color: Colors.white),
+            ),
+            const SizedBox(height: 8),
+            for (final (id, label, desc) in _modes)
+              RadioListTile<int>(
+                value: id,
+                groupValue: _mode,
+                onChanged: (v) => setState(() => _mode = v!),
+                title: Text(label, style: const TextStyle(color: Colors.white)),
+                subtitle: Text(desc, style: const TextStyle(color: Color(0xFFB9BBBE))),
+                dense: true,
+                activeColor: const Color(0xFF7C5CFC),
+              ),
+            if (_mode >= 2) ...[
+              const Divider(color: Color(0xFF3F4147)),
+              Text(
+                'Block size: $_blockCredits credits · \$${(_blockCredits * 0.02).toStringAsFixed(2)}',
+                style: const TextStyle(color: Colors.white70),
+              ),
+              Slider(
+                value: _blockCredits.toDouble(),
+                min: 250,
+                max: 2500,
+                divisions: 9,
+                activeColor: const Color(0xFF7C5CFC),
+                onChanged: (v) => setState(() => _blockCredits = v.round()),
+              ),
+              if (_mode == 2) ...[
                 const SizedBox(height: 8),
                 Text(
-                  '${snap.error}',
-                  style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 12),
+                  'Monthly cap: \$${((_monthlyCapMicroUsd ?? 0) / 1000000).toStringAsFixed(2)}',
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                Slider(
+                  value: ((_monthlyCapMicroUsd ?? 20000000) / 1000000).clamp(5, 500),
+                  min: 5,
+                  max: 500,
+                  divisions: 99,
+                  activeColor: const Color(0xFF7C5CFC),
+                  onChanged: (v) => setState(() {
+                    _monthlyCapMicroUsd = (v * 1000000).round();
+                  }),
                 ),
               ],
-            );
-          }
-          final data = snap.data!;
-          final totalMicro = (data['total_micro_usd'] as num?)?.toInt() ?? 0;
-          final totalTokens = (data['total_tokens'] as num?)?.toInt() ?? 0;
-          final byKind = (data['by_kind'] as List?) ?? const [];
-          final byModel = (data['by_model'] as List?) ?? const [];
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('LLM cost this period',
-                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-              const SizedBox(height: 4),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.baseline,
-                textBaseline: TextBaseline.alphabetic,
-                children: [
-                  Text(
-                    _formatUsd(totalMicro),
-                    style: const TextStyle(
-                      color: Color(0xFF57F287),
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '${_thousands(totalTokens)} tokens',
-                    style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 12),
-                  ),
-                ],
-              ),
-              if (byKind.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                const Text('By kind',
-                    style: TextStyle(color: Color(0xFF8E9297), fontSize: 11, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 4),
-                for (final k in byKind.cast<Map<String, dynamic>>())
-                  _CostRow(
-                    label: '${k['kind']}',
-                    micro: (k['total_micro_usd'] as num?)?.toInt() ?? 0,
-                    tokens: (k['total_tokens'] as num?)?.toInt() ?? 0,
-                    calls: (k['calls'] as num?)?.toInt() ?? 0,
-                  ),
+              if (!hasCard) ...[
+                const SizedBox(height: 12),
+                const Text(
+                  'No saved card. Use "Auto-recharge" button above to add one.',
+                  style: TextStyle(color: Colors.orange),
+                ),
               ],
-              if (byModel.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                const Text('By model',
-                    style: TextStyle(color: Color(0xFF8E9297), fontSize: 11, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 4),
-                for (final m in byModel.cast<Map<String, dynamic>>())
-                  _CostRow(
-                    label: _shortModel('${m['model']}'),
-                    micro: (m['total_micro_usd'] as num?)?.toInt() ?? 0,
-                    tokens: (m['total_tokens'] as num?)?.toInt() ?? 0,
-                    calls: (m['calls'] as num?)?.toInt() ?? 0,
-                  ),
-              ],
-              const SizedBox(height: 10),
-              const Text(
-                'Estimates from orchestrator-side price table. Real billing on Red Pill.',
-                style: TextStyle(color: Color(0xFF6E7378), fontSize: 10),
-              ),
             ],
-          );
-        },
-      ),
-    );
-  }
-
-  static String _formatUsd(int microUsd) {
-    final usd = microUsd / 1_000_000;
-    if (usd >= 0.01) return '\$${usd.toStringAsFixed(2)}';
-    if (usd > 0) return '\$${usd.toStringAsFixed(4)}';
-    return '\$0.00';
-  }
-
-  static String _thousands(int n) {
-    final s = n.toString();
-    final buf = StringBuffer();
-    for (var i = 0; i < s.length; i++) {
-      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
-      buf.write(s[i]);
-    }
-    return buf.toString();
-  }
-
-  static String _shortModel(String full) {
-    // "meta-llama/llama-3.3-70b-instruct" → "llama-3.3-70b"
-    final slash = full.lastIndexOf('/');
-    var trimmed = slash >= 0 ? full.substring(slash + 1) : full;
-    trimmed = trimmed.replaceAll('-instruct', '');
-    return trimmed;
-  }
-}
-
-class _CostRow extends StatelessWidget {
-  final String label;
-  final int micro;
-  final int tokens;
-  final int calls;
-  const _CostRow({
-    required this.label,
-    required this.micro,
-    required this.tokens,
-    required this.calls,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(color: Color(0xFFC4C9CE), fontSize: 12),
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            _CostCard._formatUsd(micro),
-            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w500),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            '$calls call${calls == 1 ? '' : 's'}',
-            style: const TextStyle(color: Color(0xFF8E9297), fontSize: 11),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _PlanCard extends StatelessWidget {
-  final String plan;
-  final String label;
-  const _PlanCard({required this.plan, required this.label});
-
-  Color get _accent {
-    switch (plan) {
-      case 'pro':
-        return const Color(0xFF57F287);
-      case 'team':
-        return const Color(0xFFFAA61A);
-      case 'unlimited':
-        return const Color(0xFFEB459E);
-      default:
-        return const Color(0xFF99AAB5);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: const Color(0xFF2B2D31),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: _accent.withValues(alpha: 0.4)),
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: _accent.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              label,
-              style: TextStyle(color: _accent, fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-          ),
-          const SizedBox(width: 16),
-          const Expanded(
-            child: Text(
-              'Current plan',
-              style: TextStyle(color: Color(0xFFB9BBBE)),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _UsageCard extends StatelessWidget {
-  final String title;
-  final int used;
-  final int cap;
-  final String Function(int)? formatter;
-  const _UsageCard({
-    required this.title,
-    required this.used,
-    required this.cap,
-    this.formatter,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final fraction = cap > 0 ? (used / cap).clamp(0.0, 1.0) : 0.0;
-    final fmt = formatter ?? (int i) => i.toString();
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF2B2D31),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 8),
-          Text(
-            '${fmt(used)} / ${fmt(cap)}',
-            style: const TextStyle(color: Color(0xFFB9BBBE)),
-          ),
-          const SizedBox(height: 8),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: fraction,
-              backgroundColor: const Color(0xFF1E1F22),
-              valueColor: AlwaysStoppedAnimation(
-                fraction > 0.9
-                    ? const Color(0xFFED4245)
-                    : (fraction > 0.7 ? const Color(0xFFFAA61A) : const Color(0xFF7C5CFC)),
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton(
+                onPressed: _save,
+                child: const Text('Save'),
               ),
-              minHeight: 6,
             ),
-          ),
-        ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── _CapsCard ──────────────────────────────────────────────────────────────
+
+class _CapsCard extends StatefulWidget {
+  final TallyOrchClient client;
+  final Map<String, dynamic> caps;
+  final VoidCallback onChanged;
+
+  const _CapsCard({
+    required this.client,
+    required this.caps,
+    required this.onChanged,
+  });
+
+  @override
+  State<_CapsCard> createState() => _CapsCardState();
+}
+
+class _CapsCardState extends State<_CapsCard> {
+  late TextEditingController _perTask;
+  late TextEditingController _daily;
+  late TextEditingController _weekly;
+
+  @override
+  void initState() {
+    super.initState();
+    _perTask = TextEditingController(
+      text: '${widget.caps['per_task_cap_credits'] ?? ''}',
+    );
+    _daily = TextEditingController(
+      text: '${widget.caps['daily_spend_cap_credits'] ?? ''}',
+    );
+    _weekly = TextEditingController(
+      text: '${widget.caps['weekly_spend_cap_credits'] ?? ''}',
+    );
+  }
+
+  @override
+  void dispose() {
+    _perTask.dispose();
+    _daily.dispose();
+    _weekly.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    int? parse(String s) => s.trim().isEmpty ? null : int.tryParse(s.trim());
+    try {
+      await widget.client.patchCaps(
+        perTaskCapCredits: parse(_perTask.text),
+        dailySpendCapCredits: parse(_daily.text),
+        weeklySpendCapCredits: parse(_weekly.text),
+      );
+      widget.onChanged();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFF2B2D31),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Spend caps',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(color: Colors.white),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _perTask,
+              decoration: const InputDecoration(
+                labelText: 'Per-task cap (credits)',
+                hintText: 'e.g. 100',
+              ),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _daily,
+              decoration: const InputDecoration(
+                labelText: 'Daily cap (credits)',
+                hintText: 'optional',
+              ),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _weekly,
+              decoration: const InputDecoration(
+                labelText: 'Weekly cap (credits)',
+                hintText: 'optional',
+              ),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton(
+                onPressed: _save,
+                child: const Text('Save'),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
