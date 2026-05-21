@@ -29,7 +29,6 @@ import 'general_channel.dart';
 import 'notifications_screen.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
-import 'team_builder.dart';
 import 'templates_screen.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
@@ -168,19 +167,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     setState(() => _selected = TaskSelected(t.id));
   }
 
-  /// Sprint 30: server rail ⚙ → push the team builder. When the builder
-  /// runs a task (returns a Task), jump to that channel.
-  Future<void> _openBuilder(BuildContext context) async {
-    final result = await Navigator.of(context).push<Task>(
-      MaterialPageRoute(builder: (_) => TeamBuilderScreen(client: widget.client)),
-    );
-    if (result == null || !mounted) return;
-    await _fetch();
-    if (!mounted) return;
-    setState(() => _selected = TaskSelected(result.id));
-  }
-
-  /// Sprint 33-rest: server rail 💳 → push the billing screen.
+/// Sprint 33-rest: server rail 💳 → push the billing screen.
   Future<void> _openBilling(BuildContext context) async {
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
@@ -271,7 +258,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                 children: [
                   _ServerRail(
                     onSignOut: () => resetTallyConfig(context),
-                    onOpenBuilder: () => _openBuilder(context),
                     onOpenBilling: () => _openBilling(context),
                     onOpenTemplates: () => _openTemplates(context),
                     onOpenProjects: () => _openProjects(context),
@@ -330,10 +316,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           Navigator.of(context).pop();
         },
         onRetry: _fetch,
-        onOpenBuilder: () {
-          Navigator.of(context).pop();
-          _openBuilder(context);
-        },
         onOpenBilling: () {
           Navigator.of(context).pop();
           _openBilling(context);
@@ -491,7 +473,6 @@ class _PoolWarmingBanner extends StatelessWidget {
 /// Sprint 34's templates catalogue entry.
 class _ServerRail extends StatelessWidget {
   final VoidCallback onSignOut;
-  final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
   final VoidCallback onOpenProjects;
@@ -499,7 +480,6 @@ class _ServerRail extends StatelessWidget {
   final VoidCallback onOpenNotifications;
   const _ServerRail({
     required this.onSignOut,
-    required this.onOpenBuilder,
     required this.onOpenBilling,
     required this.onOpenTemplates,
     required this.onOpenProjects,
@@ -523,11 +503,6 @@ class _ServerRail extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           const Divider(color: Color(0xFF2B2D31), thickness: 2, indent: 16, endIndent: 16),
-          IconButton(
-            tooltip: 'Team builder',
-            icon: const Icon(Icons.settings, color: Color(0xFF99AAB5)),
-            onPressed: onOpenBuilder,
-          ),
           IconButton(
             tooltip: 'Projects',
             icon: const Icon(Icons.folder_outlined, color: Color(0xFF99AAB5)),
@@ -1038,7 +1013,6 @@ class _NarrowDrawer extends StatelessWidget {
   final String? error;
   final ValueChanged<ChannelSelection> onSelect;
   final VoidCallback onRetry;
-  final VoidCallback onOpenBuilder;
   final VoidCallback onOpenBilling;
   final VoidCallback onOpenTemplates;
   final VoidCallback onOpenProjects;
@@ -1051,7 +1025,6 @@ class _NarrowDrawer extends StatelessWidget {
     required this.error,
     required this.onSelect,
     required this.onRetry,
-    required this.onOpenBuilder,
     required this.onOpenBilling,
     required this.onOpenTemplates,
     required this.onOpenProjects,
@@ -1082,15 +1055,6 @@ class _NarrowDrawer extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               child: Row(
                 children: [
-                  Expanded(
-                    child: TextButton.icon(
-                      icon: const Icon(Icons.settings, size: 16,
-                          color: Color(0xFF99AAB5)),
-                      label: const Text('Team builder',
-                          style: TextStyle(color: Color(0xFFC4C9CE))),
-                      onPressed: onOpenBuilder,
-                    ),
-                  ),
                   IconButton(
                     tooltip: 'Projects',
                     icon: const Icon(Icons.folder_outlined, size: 18,
