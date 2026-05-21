@@ -1,8 +1,8 @@
 # Sprint 46.5 — Clerk + Stripe overage integration
 
-**Status:** Shipped (`tally-orch:v26.2` deployed 2026-05-20)
+**Status:** Shipped + end-to-end verified (`tally-orch:v26.4` deployed 2026-05-20)
 **Date:** 2026-05-20
-**Branch / tag:** `main` / `s46.5-deployed-v26.2`
+**Branch / tag:** `main` / `s46.5-deployed-v26.4`
 
 ## Why this exists
 
@@ -93,23 +93,55 @@ complete payment if loaded in a browser.  Webhook delivery + balance
 crediting was not exercised end-to-end yet — see "Known limitations"
 below.
 
-## Known limitations
+## Three additional bugs surfaced + fixed during end-to-end verification
 
-1. **Stripe account capabilities pending.** The fresh Stripe account
-   is in `card_payments: inactive` state pending Stripe's automated
-   review (the orange "Multiple capabilities paused" banner in the
-   dashboard).  Direct API calls work because tally.pronoic.dev's
-   actual charge path goes through Checkout Sessions — those create
-   pending payment intents that can't be confirmed until capabilities
-   activate.  Expected to clear within hours; production requires
-   manual identity + bank verification.
+After Stripe capabilities activated, the live test flow surfaced
+three more issues the v26.1 mocks didn't catch:
 
-2. **Webhook end-to-end NOT yet verified.**  A real test-card
-   completion in the Checkout UI would fire `checkout.session.completed`
-   → our `/webhooks/stripe` handler → `prepaid_credit_balance` += 500.
-   Blocked on point #1 (capabilities pending).  Re-run the smoke
-   from `docs/SPRINT-46-DEPLOY-PROCEDURE.md` §"Live smoke tests"
-   once capabilities activate.
+### Bug 4: `mode="setup"` Checkout requires `currency`
+
+Stripe 15.x rejects setup-mode Checkout Sessions without a
+`currency` parameter (used to validate any future off-session
+charges).  Added `"currency": "usd"`.  Fixed in v26.2.
+
+### Bug 5: `stripe.Event.get(...)` raises `AttributeError`
+
+`stripe.Webhook.construct_event(...)` returns a `StripeObject` (not
+a plain dict).  Its custom `__getattr__` shadows the inherited
+`.get()` dict method, so the handler's `event.get("type", "")`
+raised `AttributeError` → FastAPI 500.  Fixed by calling
+`event.to_dict()` at the boundary to get plain nested dicts.  Fixed
+in v26.4.
+
+### Bug 6: Cloudflare blocks Stripe's outbound webhook calls
+
+`tally.pronoic.dev` is fronted by Cloudflare (cloudflared tunnel
+from the Phala CVM).  Cloudflare's default Browser Integrity Check
+returned `403 error code 1010` to Stripe's webhook delivery (Stripe
+sends `Stripe/1.0 (+https://stripe.com/docs/webhooks)` UA which
+fails the check).  Fixed via a Cloudflare Page Rule:
+
+- **URL:** `tally.pronoic.dev/webhooks/stripe`
+- **Setting:** Browser Integrity Check → Off
+
+This is operator-side config (not in git).  If Cloudflare or DNS
+changes, the rule must be re-created.
+
+## End-to-end verification (post-fixes)
+
+Two test-card purchases ($10 each = 500 credits each):
+
+| Step | Result |
+|---|---|
+| `POST /billing/credits/checkout {"credits":500}` | 200 → `cs_test_*` URL |
+| Open URL, pay with `4242 4242 4242 4242` | Checkout completes |
+| Stripe `checkout.session.completed` webhook | Delivered (CF lets through) |
+| Orchestrator credits balance via webhook handler | `prepaid_credit_balance += 500` |
+| `GET /billing/credits` after 2 purchases | `prepaid: 1000`, `available: 100000999` |
+| Idempotency: status='pending'→'succeeded' guard | Confirmed via repeat replay |
+
+All Sprint 46 cost-enforcement checkpoints + Sprint 46.5 Stripe paths
+verified live on `tally.pronoic.dev`.
 
 3. **`stripe_customer_id` not populated for admin user.**  The
    admin user has no Clerk subscription, so `quota.stripe_customer_id`
@@ -156,5 +188,5 @@ below.
 - Deploy procedure: [`../../SPRINT-46-DEPLOY-PROCEDURE.md`](../../SPRINT-46-DEPLOY-PROCEDURE.md)
 - Clerk bring-your-own-Stripe: https://clerk.com/changelog/2025-11-14-clerk-billing-existing-stripe-accounts
 - Stripe-Python 15.x migration: https://github.com/stripe/stripe-python/wiki/v1-namespace-in-StripeClient
-- Commit: `b2088b3` (s46.5 migration)
-- Tag: `s46.5-deployed-v26.2`
+- Commit: `b2088b3` (Stripe API migration), `348c2d2` (Event.to_dict fix)
+- Tag: `s46.5-deployed-v26.4`
