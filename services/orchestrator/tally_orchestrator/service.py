@@ -6790,6 +6790,47 @@ async def get_workspace_audit_log_route(
     )}
 
 
+@app.get("/workspaces/{wid}/audit-log/export")
+async def export_workspace_audit_log_route(
+    wid: int,
+    kind: str | None = Query(default=None, max_length=64),
+    actor_user_id: str | None = Query(default=None, max_length=128),
+    since: float | None = Query(default=None, ge=0),
+    until: float | None = Query(default=None, ge=0),
+    user: ClerkUser = Depends(require_user),
+) -> Response:
+    """Sprint 52: export audit log as CSV.  Owner+Admin only.  10,000 row cap."""
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    entries = db.list_audit_log(
+        workspace_id=wid, limit=10000,
+        kind=kind, actor_user_id=actor_user_id, since=since, until=until,
+    )
+    import csv as _csv
+    import io
+    buf = io.StringIO()
+    writer = _csv.writer(buf, quoting=_csv.QUOTE_ALL)
+    writer.writerow(["id", "created_at", "actor_user_id", "actor_kind", "kind",
+                     "target_kind", "target_id", "payload_json"])
+    for e in entries:
+        writer.writerow([
+            e["id"], e["created_at"], e["actor_user_id"], e["actor_kind"],
+            e["kind"], e["target_kind"] or "", e["target_id"] or "",
+            json.dumps(e["payload"]),
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="audit-log-ws{wid}.csv"'},
+    )
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 
