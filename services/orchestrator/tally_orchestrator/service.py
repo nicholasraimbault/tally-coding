@@ -6186,6 +6186,45 @@ async def create_workspace_route(
     return {"id": wid, "name": name, "role": "owner"}
 
 
+class WorkspacePatchRequest(BaseModel):
+    name: str | None = None
+    settings: dict | None = None
+
+
+@app.patch("/workspaces/{wid}")
+async def patch_workspace_route(
+    wid: int,
+    body: WorkspacePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: update workspace name and/or merge settings_json. Owner-only."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id, name, settings_json FROM workspaces WHERE id=? AND deleted_at IS NULL",
+        (wid,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    owner, current_name, current_settings = row
+    if owner != user.id:
+        raise HTTPException(403, "owner only")
+    sets: list[str] = []
+    params: list = []
+    if body.name is not None:
+        sets.append("name=?")
+        params.append(body.name.strip())
+    if body.settings is not None:
+        merged = json.loads(current_settings or "{}")
+        merged.update(body.settings)
+        sets.append("settings_json=?")
+        params.append(json.dumps(merged))
+    if not sets:
+        return {"id": wid, "name": current_name}
+    params.append(wid)
+    db._conn.execute(f"UPDATE workspaces SET {', '.join(sets)} WHERE id=?", tuple(params))
+    return {"id": wid}
+
+
 @app.get("/me/workspaces")
 async def list_my_workspaces(
     user: ClerkUser = Depends(require_user),
