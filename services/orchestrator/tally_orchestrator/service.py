@@ -735,6 +735,13 @@ class Db:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Sprint 48: track which iteration of a back-edge cycle each agent is on.
+        try:
+            self._conn.execute(
+                "ALTER TABLE agents ADD COLUMN iteration_idx INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Sprint 47: backfill workspaces + channels for pre-existing data.
         # Idempotent — only creates rows when they're missing.
         self._backfill_workspaces_and_channels()

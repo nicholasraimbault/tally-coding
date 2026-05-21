@@ -98,6 +98,12 @@ def test_backfill_existing_tasks_get_channels(db: Db):
     assert all(row[0] == "admin" for row in member_rows)
 
 
+def test_agents_iteration_idx_column(db: Db):
+    """Sprint 48: agents.iteration_idx column exists (back-edge cycle tracker)."""
+    cols = {row[1] for row in db._conn.execute("PRAGMA table_info(agents)").fetchall()}
+    assert "iteration_idx" in cols
+
+
 def test_new_task_creates_task_channel(db: Db):
     """When a task is created via Db.create_task, an immediate task channel
     is inserted (not waiting for next backfill cycle)."""
