@@ -349,6 +349,21 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     dmChannels: _dmChannels,
                     scheduledChannels: _scheduledChannels,
                     customChannels: _customChannels,
+                    // Sprint 51 B4: archive a custom channel from the rail.
+                    onArchiveChannel: (channelId) async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      try {
+                        await widget.client.archiveChannel(channelId: channelId);
+                        await _fetchDirectChannels();
+                        messenger.showSnackBar(
+                          const SnackBar(content: Text('Channel archived')),
+                        );
+                      } catch (e) {
+                        messenger.showSnackBar(
+                          SnackBar(content: Text('Archive failed: $e')),
+                        );
+                      }
+                    },
                     onNewScheduled: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => PersistentAgentsScreen(
@@ -443,6 +458,22 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         dmChannels: _dmChannels,
         scheduledChannels: _scheduledChannels,
         customChannels: _customChannels,
+        // Sprint 51 B4: archive a custom channel from the narrow drawer.
+        onArchiveChannel: (channelId) async {
+          Navigator.of(context).pop(); // close drawer
+          final messenger = ScaffoldMessenger.of(context);
+          try {
+            await widget.client.archiveChannel(channelId: channelId);
+            await _fetchDirectChannels();
+            messenger.showSnackBar(
+              const SnackBar(content: Text('Channel archived')),
+            );
+          } catch (e) {
+            messenger.showSnackBar(
+              SnackBar(content: Text('Archive failed: $e')),
+            );
+          }
+        },
         onSelect: (sel) {
           setState(() => _selected = sel);
           Navigator.of(context).pop();
@@ -795,6 +826,8 @@ class _ChannelList extends StatelessWidget {
   final List<Map<String, dynamic>> scheduledChannels;
   // Sprint 50 B7: custom channels from the API.
   final List<Map<String, dynamic>> customChannels;
+  /// Sprint 51 B4: archive a custom channel by id.
+  final void Function(int channelId)? onArchiveChannel;
   /// Sprint 31: when null the list fills its parent (drawer mode);
   /// when set it pins to that width (desktop left rail = 240).
   final double? width;
@@ -812,6 +845,7 @@ class _ChannelList extends StatelessWidget {
     this.dmChannels = const [],
     this.scheduledChannels = const [],
     this.customChannels = const [],
+    this.onArchiveChannel,
     this.width = 240,
   });
 
@@ -871,9 +905,10 @@ class _ChannelList extends StatelessWidget {
           onTap: () => onSelect(const GeneralSelected()),
         ),
         // Sprint 50 B7: CHANNELS category — kind='custom' channels.
+        // Sprint 51 B4: custom tiles get an archive context menu.
         const SizedBox(height: 12),
         _categoryHeader(context, 'CHANNELS'),
-        ..._directChannelItems(context, customChannels),
+        ..._customChannelItems(context, customChannels),
         _NewTile(label: '+ New channel', onTap: onNewChannel),
         const SizedBox(height: 12),
         _categoryHeader(context, 'TASKS'),
@@ -912,6 +947,34 @@ class _ChannelList extends StatelessWidget {
           )),
           trailing: (ch['_unread_escalation'] == true)
               ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              : null,
+        ),
+    ];
+  }
+
+  /// Sprint 51 B4: render tiles for kind='custom' channels.
+  /// Identical to [_directChannelItems] but also wires [onArchive] so each
+  /// tile shows a 3-dot context menu with an "Archive" action.
+  List<Widget> _customChannelItems(
+    BuildContext context,
+    List<Map<String, dynamic>> channels,
+  ) {
+    return [
+      for (final ch in channels)
+        _ChannelTile(
+          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          label: ch['name'] as String? ?? 'channel',
+          selected: selected is DirectChannelSelected &&
+              (selected as DirectChannelSelected).channelId == ch['id'] as int,
+          onTap: () => onSelect(DirectChannelSelected(
+            ch['id'] as int,
+            ch['name'] as String? ?? 'channel',
+          )),
+          trailing: (ch['_unread_escalation'] == true)
+              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              : null,
+          onArchive: onArchiveChannel != null
+              ? () => onArchiveChannel!(ch['id'] as int)
               : null,
         ),
     ];
@@ -1036,6 +1099,9 @@ class _ChannelTile extends StatelessWidget {
   final VoidCallback onTap;
   /// Sprint 49 B7: optional trailing widget (e.g. escalation indicator dot).
   final Widget? trailing;
+  /// Sprint 51 B4: when non-null, renders a trailing 3-dot menu with
+  /// "Archive". Only passed for kind='custom' channels.
+  final VoidCallback? onArchive;
   const _ChannelTile({
     required this.icon,
     required this.label,
@@ -1043,6 +1109,7 @@ class _ChannelTile extends StatelessWidget {
     required this.selected,
     required this.onTap,
     this.trailing,
+    this.onArchive,
   });
 
   @override
@@ -1093,6 +1160,29 @@ class _ChannelTile extends StatelessWidget {
                   const SizedBox(width: 4),
                   trailing!,
                 ],
+                // Sprint 51 B4: 3-dot context menu for custom channels.
+                if (onArchive != null)
+                  SizedBox(
+                    width: 24,
+                    child: PopupMenuButton<String>(
+                      icon: const Icon(
+                        Icons.more_horiz,
+                        size: 16,
+                        color: Color(0xFF8E9297),
+                      ),
+                      padding: EdgeInsets.zero,
+                      tooltip: 'Channel options',
+                      onSelected: (action) {
+                        if (action == 'archive') onArchive!();
+                      },
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(
+                          value: 'archive',
+                          child: Text('Archive'),
+                        ),
+                      ],
+                    ),
+                  ),
               ],
             ),
           ),
@@ -1359,6 +1449,8 @@ class _NarrowDrawer extends StatelessWidget {
   final List<Map<String, dynamic>> scheduledChannels;
   // Sprint 50 B7: custom channels from the API.
   final List<Map<String, dynamic>> customChannels;
+  /// Sprint 51 B4: archive a custom channel by id.
+  final void Function(int channelId)? onArchiveChannel;
   const _NarrowDrawer({
     required this.tasks,
     required this.selected,
@@ -1378,6 +1470,7 @@ class _NarrowDrawer extends StatelessWidget {
     this.dmChannels = const [],
     this.scheduledChannels = const [],
     this.customChannels = const [],
+    this.onArchiveChannel,
   });
 
   @override
@@ -1402,6 +1495,8 @@ class _NarrowDrawer extends StatelessWidget {
                 dmChannels: dmChannels,
                 scheduledChannels: scheduledChannels,
                 customChannels: customChannels,
+                // Sprint 51 B4: thread archive callback through to the inner list.
+                onArchiveChannel: onArchiveChannel,
                 width: null,
               ),
             ),
