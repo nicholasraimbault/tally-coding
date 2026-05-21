@@ -6769,9 +6769,13 @@ async def get_workspace_audit_log_route(
     wid: int,
     limit: int = Query(default=100, ge=1, le=500),
     before_id: int | None = Query(default=None, ge=1),
+    kind: str | None = Query(default=None, max_length=64),
+    actor_user_id: str | None = Query(default=None, max_length=128),
+    since: float | None = Query(default=None, ge=0),
+    until: float | None = Query(default=None, ge=0),
     user: ClerkUser = Depends(require_user),
 ) -> dict:
-    """Sprint 51: read the workspace audit log.  Owner + Admin only."""
+    """Sprint 51 + 52: owner+admin audit-log read with keyset pagination + filters."""
     db: Db = state["db"]
     caller = db._conn.execute(
         "SELECT role FROM workspace_members "
@@ -6780,7 +6784,10 @@ async def get_workspace_audit_log_route(
     ).fetchone()
     if caller is None or caller[0] not in ("owner", "admin"):
         raise HTTPException(403, "owner+admin only")
-    return {"entries": db.list_audit_log(workspace_id=wid, limit=limit, before_id=before_id)}
+    return {"entries": db.list_audit_log(
+        workspace_id=wid, limit=limit, before_id=before_id,
+        kind=kind, actor_user_id=actor_user_id, since=since, until=until,
+    )}
 
 
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────

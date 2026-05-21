@@ -85,3 +85,43 @@ def test_get_audit_log_keyset_pagination(client):
     first_ids = {e["id"] for e in first}
     next_ids = {e["id"] for e in next_page}
     assert first_ids.isdisjoint(next_ids)
+
+
+def test_get_audit_log_kind_filter(client):
+    """Sprint 52: GET /audit-log?kind=... returns only entries of that kind."""
+    # Generate events of different kinds
+    client.post("/workspaces/1/members", json={"user_id": "user_bob", "role": "member"})  # member_invited
+    client.delete("/workspaces/1/members/user_bob")  # member_removed
+    client.post("/channels", json={"workspace_id": 1, "kind": "custom", "name": "x", "members": [{"kind": "human", "id": "admin"}]})  # channel_created
+    r = client.get("/workspaces/1/audit-log?kind=channel_created")
+    assert r.status_code == 200
+    entries = r.json()["entries"]
+    assert all(e["kind"] == "channel_created" for e in entries)
+    assert len(entries) >= 1
+
+
+def test_get_audit_log_actor_filter(client):
+    """Sprint 52: GET /audit-log?actor_user_id=... returns only entries by that actor."""
+    client.post("/workspaces/1/members", json={"user_id": "user_bob", "role": "member"})
+    r = client.get("/workspaces/1/audit-log?actor_user_id=admin")
+    assert r.status_code == 200
+    entries = r.json()["entries"]
+    assert all(e["actor_user_id"] == "admin" for e in entries)
+    assert len(entries) >= 1
+
+
+def test_get_audit_log_since_until_filter(client):
+    """Sprint 52: GET /audit-log?since=N&until=M slices by created_at window."""
+    import tally_orchestrator.service as svc
+    import time as _time
+    db = svc.state["db"]
+    db.audit_log(workspace_id=1, actor_user_id="admin", kind="old_event", payload={})
+    _time.sleep(0.02)
+    cutoff = _time.time()
+    _time.sleep(0.02)
+    db.audit_log(workspace_id=1, actor_user_id="admin", kind="new_event", payload={})
+    r = client.get(f"/workspaces/1/audit-log?since={cutoff}")
+    assert r.status_code == 200
+    kinds = {e["kind"] for e in r.json()["entries"]}
+    assert "new_event" in kinds
+    assert "old_event" not in kinds
