@@ -81,8 +81,18 @@ def test_backfill_existing_tasks_get_channels(db: Db):
     db.create_task("test task 1", team_spec=None, user_id="admin")
     db.create_task("test task 2", team_spec=None, user_id="admin")
     # Re-open Db to trigger backfill on the now-populated tasks table
-    db.__class__(db.path)  # second open
+    db2 = db.__class__(db.path)
 
-    cnt = db._conn.execute("SELECT COUNT(*) FROM channels WHERE kind='task'").fetchone()[0]
-    tasks_cnt = db._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    cnt = db2._conn.execute("SELECT COUNT(*) FROM channels WHERE kind='task'").fetchone()[0]
+    tasks_cnt = db2._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     assert cnt == tasks_cnt, f"expected one channel per task; got {cnt} channels for {tasks_cnt} tasks"
+
+    member_rows = db2._conn.execute(
+        "SELECT cm.user_id FROM channel_members cm "
+        "JOIN channels c ON cm.channel_id=c.id "
+        "WHERE c.kind='task'"
+    ).fetchall()
+    assert len(member_rows) == tasks_cnt, (
+        f"expected one channel_members row per task channel; got {len(member_rows)} for {tasks_cnt} tasks"
+    )
+    assert all(row[0] == "admin" for row in member_rows)

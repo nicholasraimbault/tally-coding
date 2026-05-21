@@ -760,10 +760,15 @@ class Db:
             if ws_row is None:
                 continue  # shouldn't happen given step 2 ran first
             archived_at = updated_at if status in ("completed", "failed") else None
-            self._conn.execute(
+            ch_cur = self._conn.execute(
                 "INSERT INTO channels (workspace_id, kind, name, task_id, created_at, archived_at) "
                 "VALUES (?, 'task', ?, ?, ?, ?)",
                 (ws_row[0], f"task-{task_id[:8]}", task_id, created_at, archived_at),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_cur.lastrowid, user_id, created_at),
             )
 
     def _seed_agent_roles(self) -> None:
