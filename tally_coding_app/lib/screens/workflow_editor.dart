@@ -1,13 +1,15 @@
 // tally_coding_app/lib/screens/workflow_editor.dart
 //
-// Sprint 48 B5: wires in vyuh_node_flow's NodeFlowEditor + per-node config dialog.
+// Sprint 48 B5+B6: wires in vyuh_node_flow's NodeFlowEditor + per-node config dialog
+// (B5) and per-edge condition + max_iterations config dialog (B6).
 //
 // Data flow:
 //   initialTeamSpec (nodes_v1 JSON)
 //     → _specToNodes / _specToConnections  (on init)
-//     → NodeFlowController<_AgentNodeData, void>
+//     → NodeFlowController<_AgentNodeData, _EdgeData>
 //     → NodeFlowEditor (interactive canvas with drag, connect, pan, zoom)
 //     → NodeEvents.onTap → _NodeConfigDialog → mutates node.data + syncs _spec
+//     → ConnectionEvents.onTap → _EdgeConfigDialog → mutates conn.data + label
 //     → NodeEvents.onDragStop, ConnectionEvents.onCreated/onDeleted → _syncSpec
 //     → Save → PATCH /tasks/{id}/team_spec
 //
@@ -20,6 +22,19 @@ import 'package:flutter_mobx/flutter_mobx.dart';
 import 'package:vyuh_node_flow/vyuh_node_flow.dart';
 
 import '../api.dart';
+
+// ---------------------------------------------------------------------------
+// Per-edge data model (carried as Connection<C>.data)
+// ---------------------------------------------------------------------------
+class _EdgeData {
+  /// One of: 'always' | 'if_succeeded' | 'if_failed'
+  String condition;
+
+  /// Optional iteration cap for back-edges (null means no limit).
+  int? maxIterations;
+
+  _EdgeData({this.condition = 'always', this.maxIterations});
+}
 
 // ---------------------------------------------------------------------------
 // Per-node data model (carried as Node<T>.data)
@@ -105,35 +120,49 @@ List<Port> _portsForKind(String kind) => [
   ),
 ];
 
-List<Connection<void>> _specToConnections(Map<String, dynamic> spec) {
+List<Connection<_EdgeData>> _specToConnections(Map<String, dynamic> spec) {
   final rawEdges = (spec['edges'] as List<dynamic>?) ?? [];
-  final result = <Connection<void>>[];
+  final result = <Connection<_EdgeData>>[];
   for (var i = 0; i < rawEdges.length; i++) {
     final e = rawEdges[i] as Map<String, dynamic>;
     final from = e['from'] as String?;
     final to = e['to'] as String?;
     if (from == null || to == null) continue;
-    final condition = (e['condition'] as String?) ?? '';
+    final condition = (e['condition'] as String?) ?? 'always';
+    final maxIter = e['max_iterations'] as int?;
+    final data = _EdgeData(condition: condition, maxIterations: maxIter);
     result.add(
-      Connection<void>(
+      Connection<_EdgeData>(
         id: 'e_${from}_${to}_$i',
         sourceNodeId: from,
         sourcePortId: 'out',
         targetNodeId: to,
         targetPortId: 'in',
-        label: condition.isNotEmpty
-            ? ConnectionLabel.center(text: condition)
-            : null,
+        data: data,
+        label: _edgeLabel(data),
       ),
     );
   }
   return result;
 }
 
+/// Builds the visible connection label from edge data, or null for the default
+/// (unlabelled 'always' with no iteration cap).
+ConnectionLabel? _edgeLabel(_EdgeData data) {
+  final showCondition = data.condition != 'always';
+  final showMax = data.maxIterations != null;
+  if (!showCondition && !showMax) return null;
+  final parts = [
+    if (showCondition) data.condition,
+    if (showMax) '×${data.maxIterations}',
+  ];
+  return ConnectionLabel.center(text: parts.join(' '));
+}
+
 /// Reads current controller state back into nodes_v1 format.
 /// Preserves __x/__y so reopening the editor keeps positions.
 Map<String, dynamic> _controllerToSpec(
-  NodeFlowController<_AgentNodeData, void> controller,
+  NodeFlowController<_AgentNodeData, _EdgeData> controller,
   Map<String, dynamic> existingSpec,
 ) {
   final nodes = controller.nodes.values.map((node) {
@@ -151,12 +180,16 @@ Map<String, dynamic> _controllerToSpec(
   }).toList();
 
   final edges = controller.connections.map((conn) {
-    final label = conn.label?.text ?? '';
-    return <String, dynamic>{
+    final data = conn.data;
+    final entry = <String, dynamic>{
       'from': conn.sourceNodeId,
       'to': conn.targetNodeId,
-      'condition': label,
+      'condition': data?.condition ?? 'always',
     };
+    if (data?.maxIterations != null) {
+      entry['max_iterations'] = data!.maxIterations;
+    }
+    return entry;
   }).toList();
 
   return <String, dynamic>{
@@ -188,7 +221,7 @@ class WorkflowEditorScreen extends StatefulWidget {
 
 class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
   late Map<String, dynamic> _spec;
-  late NodeFlowController<_AgentNodeData, void> _controller;
+  late NodeFlowController<_AgentNodeData, _EdgeData> _controller;
   bool _saving = false;
 
   @override
@@ -199,7 +232,7 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
     _spec['edges'] ??= <dynamic>[];
     _spec['format'] = 'nodes_v1';
 
-    _controller = NodeFlowController<_AgentNodeData, void>(
+    _controller = NodeFlowController<_AgentNodeData, _EdgeData>(
       nodes: _specToNodes(_spec),
       connections: _specToConnections(_spec),
     );
@@ -252,6 +285,26 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
     _syncSpec();
   }
 
+  Future<void> _onConnectionTap(Connection<_EdgeData> conn) async {
+    final initial = conn.data ?? _EdgeData();
+    final result = await showDialog<_EdgeData>(
+      context: context,
+      builder: (_) => _EdgeConfigDialog(initial: initial),
+    );
+    if (result == null || !mounted) return;
+
+    // Mutate the data in-place (data fields are non-final).
+    if (conn.data != null) {
+      conn.data!.condition = result.condition;
+      conn.data!.maxIterations = result.maxIterations;
+    }
+
+    // Update the visible label reactively via the observable setter.
+    conn.label = _edgeLabel(result);
+
+    _syncSpec();
+  }
+
   void _addNode(String kind, Offset canvasPosition) {
     final id = '${kind}_${DateTime.now().millisecondsSinceEpoch}';
     final node = Node<_AgentNodeData>(
@@ -275,13 +328,14 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
   Widget build(BuildContext context) {
     // Events are passed to NodeFlowEditor (the public API) not set on controller
     // directly, so we rebuild when _spec changes and the widget tree refreshes.
-    final events = NodeFlowEvents<_AgentNodeData, void>(
+    final events = NodeFlowEvents<_AgentNodeData, _EdgeData>(
       node: NodeEvents<_AgentNodeData>(
         onTap: _onNodeTap,
         onDragStop: (_) => _syncSpec(),
         onDeleted: (_) => _syncSpec(),
       ),
-      connection: ConnectionEvents<_AgentNodeData, void>(
+      connection: ConnectionEvents<_AgentNodeData, _EdgeData>(
+        onTap: _onConnectionTap,
         onCreated: (_) => _syncSpec(),
         onDeleted: (_) => _syncSpec(),
       ),
@@ -464,8 +518,8 @@ class _PaletteItem extends StatelessWidget {
 // _FlowCanvas — DragTarget wrapper around NodeFlowEditor
 // ---------------------------------------------------------------------------
 class _FlowCanvas extends StatelessWidget {
-  final NodeFlowController<_AgentNodeData, void> controller;
-  final NodeFlowEvents<_AgentNodeData, void> events;
+  final NodeFlowController<_AgentNodeData, _EdgeData> controller;
+  final NodeFlowEvents<_AgentNodeData, _EdgeData> events;
   final void Function(String kind, Offset localPosition) onDropKind;
 
   const _FlowCanvas({
@@ -485,7 +539,7 @@ class _FlowCanvas extends StatelessWidget {
       builder: (context, candidateData, _) {
         return Stack(
           children: [
-            NodeFlowEditor<_AgentNodeData, void>(
+            NodeFlowEditor<_AgentNodeData, _EdgeData>(
               controller: controller,
               theme: NodeFlowTheme.dark,
               events: events,
@@ -600,6 +654,104 @@ class _AgentNodeWidget extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// _EdgeConfigDialog — per-edge config: condition dropdown + max_iterations
+// ---------------------------------------------------------------------------
+class _EdgeConfigDialog extends StatefulWidget {
+  final _EdgeData initial;
+
+  const _EdgeConfigDialog({required this.initial});
+
+  @override
+  State<_EdgeConfigDialog> createState() => _EdgeConfigDialogState();
+}
+
+class _EdgeConfigDialogState extends State<_EdgeConfigDialog> {
+  late String _condition;
+  late TextEditingController _maxIterCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _condition = widget.initial.condition;
+    _maxIterCtrl = TextEditingController(
+      text: widget.initial.maxIterations?.toString() ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _maxIterCtrl.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final maxIter = int.tryParse(_maxIterCtrl.text.trim());
+    Navigator.of(context).pop(
+      _EdgeData(condition: _condition, maxIterations: maxIter),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edge condition'),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            DropdownButtonFormField<String>(
+              initialValue: _condition,
+              decoration: const InputDecoration(
+                labelText: 'When to fire',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: const [
+                DropdownMenuItem(value: 'always', child: Text('Always')),
+                DropdownMenuItem(
+                  value: 'if_succeeded',
+                  child: Text('If predecessor succeeded'),
+                ),
+                DropdownMenuItem(
+                  value: 'if_failed',
+                  child: Text('If predecessor failed'),
+                ),
+              ],
+              onChanged: (v) {
+                if (v != null) setState(() => _condition = v);
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _maxIterCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Max iterations',
+                hintText: 'Leave blank for no limit (back-edges only)',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _save,
+          child: const Text('Save'),
+        ),
+      ],
     );
   }
 }
