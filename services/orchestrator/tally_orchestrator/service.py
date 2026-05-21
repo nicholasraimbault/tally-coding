@@ -4914,7 +4914,46 @@ async def lifespan(app: FastAPI):
         "target_size": target_pool_size,
         "joined": 0,
         "last_error": None,
+        # Sprint 53: circuit-breaker fields. ``first_failure_ts`` is the
+        # wall-clock time at which the current sustained failure window
+        # began (None when pool is healthy). ``circuit_open_logged`` is
+        # the latch for the once-per-incident ERROR log so we don't spam
+        # ops with every retry iteration.
+        "first_failure_ts": None,
+        "circuit_open_logged": False,
     }
+    # Threshold (seconds) at which a sustained failure becomes a
+    # circuit-open event. 30 min default absorbs the worst-case bootstrap
+    # cadence (attempt 1: 60s + attempt 2: 300s + attempt 3: 900s
+    # ≈ 25 min) so cold-starts don't trip it. Tunable per deploy via env.
+    _circuit_breaker_threshold_s = float(os.environ.get("POOL_CIRCUIT_BREAKER_SECONDS", "1800"))
+    # Sprint 53: optional channel for orchestrator self-reports.  When set,
+    # the bootstrap loop posts text messages to this channel on
+    # state-change events (circuit-open transition + recovery).  Posts
+    # are best-effort: a failure to write to the ops channel must not
+    # break the bootstrap loop itself.  Empty/unset = silent (same
+    # pre-Sprint-53 behavior).
+    _ops_channel_id_str = os.environ.get("OPS_CHANNEL_ID", "").strip()
+    _ops_channel_id: int | None = int(_ops_channel_id_str) if _ops_channel_id_str.isdigit() else None
+
+    def _post_to_ops_channel(text: str) -> None:
+        """Sprint 53: best-effort message post to the ops channel.
+        Wraps the insert + broadcast in try/except so a misconfigured
+        channel id never breaks the bootstrap retry loop."""
+        if _ops_channel_id is None:
+            return
+        try:
+            from .channels import insert_message
+            msg_id = insert_message(
+                db, channel_id=_ops_channel_id,
+                author_kind="tally", kind="text",
+                payload={"text": text},
+            )
+            t = asyncio.create_task(_broadcast_new_message(_ops_channel_id, msg_id))
+            _background_tasks.add(t)
+            t.add_done_callback(_background_tasks.discard)
+        except Exception as exc:
+            logger.warning("ops channel post failed (text=%r): %s", text[:60], exc)
 
     # Sprint 43: retry schedule for the pool bootstrap.  Sequence
     # repeats indefinitely so the orchestrator self-heals when workers
@@ -4922,6 +4961,50 @@ async def lifespan(app: FastAPI):
     # bootstrap stays on the slowest cadence forever rather than
     # giving up.
     _retry_delays_s = [60, 300, 900]  # 1 min, 5 min, 15 min
+
+    def _record_bootstrap_failure(reason: str) -> None:
+        """Sprint 53: stamp the failure window + emit a one-shot ERROR
+        when the failure has lasted longer than the circuit-breaker
+        threshold. Called from both failure paths in the bootstrap loop.
+        On the same transition, posts a message to the ops channel if
+        OPS_CHANNEL_ID is configured."""
+        ps = state["pool_status"]
+        ps["last_error"] = reason
+        if ps["first_failure_ts"] is None:
+            ps["first_failure_ts"] = time.time()
+        elapsed = time.time() - ps["first_failure_ts"]
+        if elapsed > _circuit_breaker_threshold_s and not ps["circuit_open_logged"]:
+            logger.error(
+                "POOL CIRCUIT BREAKER OPEN: pool has been unhealthy for "
+                "%ds (threshold=%ds). Bootstrap is still retrying; external "
+                "monitors should be alerting now.",
+                int(elapsed), int(_circuit_breaker_threshold_s),
+            )
+            ps["circuit_open_logged"] = True
+            _post_to_ops_channel(
+                f"🔴 Pool circuit-breaker OPEN — orchestrator has been "
+                f"unable to bootstrap a worker for {int(elapsed // 60)} min. "
+                f"Last error: {reason}"
+            )
+
+    def _record_bootstrap_success() -> None:
+        """Sprint 53: clear the failure window. If we were previously
+        unhealthy, emit a recovery INFO + post recovery message to ops
+        channel."""
+        ps = state["pool_status"]
+        if ps["first_failure_ts"] is not None:
+            elapsed = time.time() - ps["first_failure_ts"]
+            logger.info("pool recovered after %ds of bootstrap failure", int(elapsed))
+            if ps["circuit_open_logged"]:
+                # Only post recovery if we previously posted an open event,
+                # to avoid spamming the channel on transient cold-start blips.
+                _post_to_ops_channel(
+                    f"🟢 Pool recovered — orchestrator joined a worker after "
+                    f"{int(elapsed // 60)} min of bootstrap failure."
+                )
+        ps["first_failure_ts"] = None
+        ps["circuit_open_logged"] = False
+        ps["last_error"] = None
 
     async def _bootstrap_pool_in_background() -> None:
         attempt = 0
@@ -4940,13 +5023,14 @@ async def lifespan(app: FastAPI):
                 ok = [h for h in handles if h is not None]
                 state["pool_status"]["joined"] = len(ok)
                 if not ok:
-                    state["pool_status"]["last_error"] = (
+                    reason = (
                         f"no workers bootstrapped (target={target_pool_size}; "
                         f"attempt={attempt})"
                     )
+                    _record_bootstrap_failure(reason)
                     logger.error(
                         "%s; sleeping %ds before retry",
-                        state["pool_status"]["last_error"],
+                        reason,
                         _retry_delays_s[min(attempt - 1, len(_retry_delays_s) - 1)],
                     )
                     # Sprint 43: don't crash, don't give up — sleep and
@@ -4967,7 +5051,7 @@ async def lifespan(app: FastAPI):
                     orchestrator.run_processor_loop()
                 )
                 state["pool_ready"] = True
-                state["pool_status"]["last_error"] = None  # clear on success
+                _record_bootstrap_success()
                 logger.info(
                     "pool ready (attempt=%d): %d worker(s) joined; "
                     "processor loop running",
@@ -4979,7 +5063,7 @@ async def lifespan(app: FastAPI):
                 # gets the cancellation it expects.
                 raise
             except Exception as exc:
-                state["pool_status"]["last_error"] = repr(exc)
+                _record_bootstrap_failure(repr(exc))
                 logger.exception(
                     "pool bootstrap raised (attempt=%d); sleeping before retry: %s",
                     attempt, exc,
@@ -5199,27 +5283,43 @@ async def admin_alerts() -> dict:
     return {"alerts": alerts, "count": len(alerts)}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health() -> dict:
     """Sprint 35: surface pool readiness alongside basic liveness so
     operators + the Flutter shell can render a "workers warming up"
     banner during cold-start instead of staring at a generic 503.
 
+    Sprint 53 adds the circuit-breaker fields (``pool_unhealthy_since_seconds``
+    and ``pool_circuit_open``) so external monitors can distinguish a
+    transient blip from a sustained outage without re-implementing the
+    threshold logic on every consumer.
+
     Returns:
-      status:           "ok"      — always (we're alive serving HTTP)
-      pool_ready:       bool      — workers joined and processor loop running
-      pool_target:      int       — desired pool size from TALLY_POOL_SIZE
-      pool_joined:      int       — workers that completed MLS bootstrap
-      pool_last_error:  str|None  — last bootstrap failure reason (cleared on success)
-      tasks_in_flight:  bool      — preserved from earlier versions
+      status:                       "ok"      — always (we're alive serving HTTP)
+      pool_ready:                   bool      — workers joined and processor loop running
+      pool_target:                  int       — desired pool size from TALLY_POOL_SIZE
+      pool_joined:                  int       — workers that completed MLS bootstrap
+      pool_last_error:              str|None  — last bootstrap failure reason (cleared on success)
+      pool_unhealthy_since_seconds: int|None  — seconds since the current failure window began (None when healthy)
+      pool_circuit_open:            bool      — true when unhealthy duration exceeds POOL_CIRCUIT_BREAKER_SECONDS (default 1800)
+      tasks_in_flight:              bool      — preserved from earlier versions
     """
     pool_status = state.get("pool_status") or {}
+    first_failure_ts = pool_status.get("first_failure_ts")
+    if first_failure_ts is not None:
+        unhealthy_since = int(time.time() - first_failure_ts)
+    else:
+        unhealthy_since = None
+    threshold = float(os.environ.get("POOL_CIRCUIT_BREAKER_SECONDS", "1800"))
+    circuit_open = unhealthy_since is not None and unhealthy_since > threshold
     return {
         "status": "ok",
         "pool_ready": bool(state.get("pool_ready")),
         "pool_target": pool_status.get("target_size", 0),
         "pool_joined": pool_status.get("joined", 0),
         "pool_last_error": pool_status.get("last_error"),
+        "pool_unhealthy_since_seconds": unhealthy_since,
+        "pool_circuit_open": circuit_open,
         "tasks_in_flight": state["db"].next_pending() is not None,
     }
 
