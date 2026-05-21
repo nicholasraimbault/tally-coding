@@ -82,3 +82,29 @@ async def test_validate_exception_skips_gracefully(monkeypatch):
     with patch("httpx.AsyncClient", return_value=FailingClient()):
         result = await _validate_clerk_user("user_123")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_validate_rejects_path_traversal(monkeypatch):
+    """Sprint 52 hardening: a user_id containing path separators is rejected
+    BEFORE the HTTP call, so an attacker cannot redirect the request to a
+    different Clerk endpoint via `user_x/../organizations`."""
+    from tally_orchestrator.service import _validate_clerk_user
+    monkeypatch.setenv("CLERK_SECRET_KEY", "sk_test_xxx")
+    # patch httpx so any actual call would crash the test loudly
+    with patch("httpx.AsyncClient", side_effect=AssertionError("httpx must NOT be called")):
+        result = await _validate_clerk_user("user_x/../organizations")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_validate_rejects_query_injection(monkeypatch):
+    """Sprint 52 hardening: a user_id containing `?` or `#` would change the
+    URL semantics and is rejected before the HTTP call."""
+    from tally_orchestrator.service import _validate_clerk_user
+    monkeypatch.setenv("CLERK_SECRET_KEY", "sk_test_xxx")
+    with patch("httpx.AsyncClient", side_effect=AssertionError("httpx must NOT be called")):
+        r1 = await _validate_clerk_user("user_x?foo=1")
+        r2 = await _validate_clerk_user("user_x#frag")
+    assert r1 is False
+    assert r2 is False

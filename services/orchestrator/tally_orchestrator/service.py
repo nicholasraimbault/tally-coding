@@ -29,6 +29,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -79,6 +80,10 @@ FS_READ_CONTEXT_ID = "task:fs:read"
 # Sprint 52: Clerk user validation
 CLERK_API_BASE = "https://api.clerk.com/v1"
 _CLERK_VALIDATE_TIMEOUT = httpx.Timeout(5.0)
+# Sprint 52 hardening: only allow well-formed Clerk user IDs to prevent
+# path-traversal / SSRF via values like `user_x/../organizations`.
+# fullmatch anchors both ends — match() alone would pass `user_x/../foo`.
+_CLERK_USER_ID_PATTERN = re.compile(r"user_[A-Za-z0-9]+")
 
 # Sprint 48: task lifecycle statuses
 TASK_STATUS_TERMINAL: frozenset[str] = frozenset({
@@ -8239,6 +8244,13 @@ async def _validate_clerk_user(user_id: str) -> bool | None:
     secret = os.environ.get("CLERK_SECRET_KEY", "").strip()
     if not secret:
         return None
+    # Sprint 52 hardening: reject malformed IDs before building the URL.
+    # A value like `user_x/../organizations` or `user_x?foo=1` would silently
+    # redirect the GET to a different Clerk endpoint.  Returning False here is
+    # semantically identical to Clerk's 404 — "this user does not exist."
+    if not _CLERK_USER_ID_PATTERN.fullmatch(user_id):
+        logger.warning("_validate_clerk_user: malformed user_id rejected")
+        return False
     try:
         async with httpx.AsyncClient(timeout=_CLERK_VALIDATE_TIMEOUT) as client:
             resp = await client.get(
