@@ -4517,6 +4517,28 @@ async def submit_task(
             task_id[:8], body.parent_task_id[:8],
         )
     db.increment_task_count(user.id)
+    # Sprint 48 A6: insert a team_proposal message in the user's #general
+    # channel so the Discord-shaped UI can show the proposed team and let
+    # the user approve/edit/cancel before any agent is dispatched.
+    # team_spec may be None when the client omits it and redpill is off;
+    # only insert the proposal when there is a team to propose.
+    if team_spec is not None:
+        from .channels import insert_team_proposal_message
+        msg_id = insert_team_proposal_message(
+            db,
+            task_id=task_id,
+            user_id=user.id,
+            description=body.description,
+            team_spec=team_spec,
+        )
+        if msg_id > 0:
+            row = db._conn.execute(
+                "SELECT channel_id FROM messages WHERE id=?", (msg_id,)
+            ).fetchone()
+            if row:
+                t = asyncio.create_task(_broadcast_new_message(row[0], msg_id))
+                _background_tasks.add(t)
+                t.add_done_callback(_background_tasks.discard)
     task = db.get_task(task_id)
     # Enrich the response with the parent/children edges so the
     # Flutter shell can render the relationship without an extra round
