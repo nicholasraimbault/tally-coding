@@ -6649,6 +6649,10 @@ async def invite_workspace_member_route(
         raise HTTPException(403, "not a member of this workspace")
     if caller[0] not in ("owner", "admin"):
         raise HTTPException(403, "admin+ only")
+    # Sprint 52: optional Clerk validation
+    exists = await _validate_clerk_user(body.user_id)
+    if exists is False:
+        raise HTTPException(404, {"error": "user_not_found", "user_id": body.user_id})
     db.add_workspace_member(workspace_id=wid, user_id=body.user_id, role=body.role)
     try:
         db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_invited",
