@@ -6831,6 +6831,45 @@ async def export_workspace_audit_log_route(
     )
 
 
+class AuditLogPruneRequest(BaseModel):
+    older_than_days: int
+
+
+@app.post("/workspaces/{wid}/audit-log/prune")
+async def prune_workspace_audit_log_route(
+    wid: int,
+    body: AuditLogPruneRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 52: prune audit log entries older than N days.  Owner+Admin only.
+    30-day floor (safety)."""
+    if body.older_than_days < 30:
+        raise HTTPException(400, "older_than_days must be >= 30")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    cutoff = time.time() - (body.older_than_days * 86400)
+    cur = db._conn.execute(
+        "DELETE FROM workspace_audit_log WHERE workspace_id=? AND created_at < ?",
+        (wid, cutoff),
+    )
+    deleted = cur.rowcount
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="audit_log_pruned",
+            payload={"deleted": deleted, "older_than_days": body.older_than_days},
+        )
+    except Exception as exc:
+        logger.warning("audit_log audit_log_pruned failed: %s", exc)
+    return {"ok": True, "deleted": deleted}
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 
