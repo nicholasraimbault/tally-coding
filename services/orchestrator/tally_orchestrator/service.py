@@ -6296,6 +6296,29 @@ async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
                     "ws send_new_message failed for user=%s: %s", user_id, exc
                 )
 
+    # Sprint 49: Tally escalation responder.  If the broadcast message is
+    # kind='escalation', create a DM with the workspace owner + post the
+    # templated Tally message.
+    try:
+        msg_row = db._conn.execute(
+            "SELECT kind FROM messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if msg_row and msg_row[0] == "escalation":
+            from .channels import handle_escalation
+            dm_ch = handle_escalation(db, channel_id=channel_id, message_id=message_id)
+            if dm_ch:
+                new_msg = db._conn.execute(
+                    "SELECT id FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1",
+                    (dm_ch,),
+                ).fetchone()
+                if new_msg:
+                    # Re-enter broadcast for the DM message.  Bounded:
+                    # the new message is kind='text', not 'escalation',
+                    # so this won't recurse further.
+                    await _broadcast_new_message(dm_ch, new_msg[0])
+    except Exception as exc:
+        logger.warning("escalation handler failed: %s", exc)
+
 
 # ── Sprint 49: persistent_agents routes ───────────────────────────────────────
 

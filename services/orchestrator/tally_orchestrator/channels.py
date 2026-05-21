@@ -248,3 +248,123 @@ def fetch_user_messages_since(
                 "created_at": created_at,
             })
     return out
+
+
+# ── Sprint 49: escalation helpers ─────────────────────────────────────────────
+
+ESCALATION_DM_TEMPLATE = (
+    "@{owner} — {agent_name} ({agent_role}) needs your input: \"{reason}\". "
+    "See #{channel_name}."
+)
+
+
+def ensure_dm_channel(
+    db: "Db",
+    *,
+    workspace_id: int,
+    kind_a: str,
+    id_a: str | None,
+    kind_b: str,
+    id_b: str | None,
+) -> int:
+    """Sprint 49: open or find a symmetric DM channel between two members.
+
+    Idempotent: if a DM already exists with BOTH parties as channel_members,
+    returns it; else creates a new one.
+
+    Example::
+
+        ch = ensure_dm_channel(
+            db, workspace_id=1,
+            kind_a="human", id_a="alice",
+            kind_b="tally", id_b=None,
+        )
+    """
+    now = time.time()
+    candidates = db._conn.execute(
+        "SELECT id FROM channels WHERE workspace_id=? AND kind='dm' AND archived_at IS NULL",
+        (workspace_id,),
+    ).fetchall()
+    for (ch_id,) in candidates:
+        members = db._conn.execute(
+            "SELECT member_kind, user_id FROM channel_members WHERE channel_id=?",
+            (ch_id,),
+        ).fetchall()
+        member_set = {(m, u) for m, u in members}
+        wanted = {(kind_a, id_a), (kind_b, id_b)}
+        if wanted.issubset(member_set):
+            return int(ch_id)
+    # Create a new DM channel.
+    def _label(kind: str, ident: str | None) -> str:
+        if kind == "human":
+            return ident or "?"
+        if kind == "tally":
+            return "tally"
+        return f"agent-{ident}"
+    name = "-".join(sorted([_label(kind_a, id_a), _label(kind_b, id_b)]))
+    cur = db._conn.execute(
+        "INSERT INTO channels (workspace_id, kind, name, created_at) "
+        "VALUES (?, 'dm', ?, ?)",
+        (workspace_id, name, now),
+    )
+    new_id = int(cur.lastrowid or 0)
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+        "VALUES (?, ?, ?, ?)",
+        (new_id, kind_a, id_a, now),
+    )
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+        "VALUES (?, ?, ?, ?)",
+        (new_id, kind_b, id_b, now),
+    )
+    return new_id
+
+
+def handle_escalation(db: "Db", *, channel_id: int, message_id: int) -> int | None:
+    """Sprint 49: react to a kind='escalation' message.
+
+    Identifies the workspace owner, ensures a Tally↔owner DM channel exists,
+    and posts a templated message in it.  Returns the DM channel_id, or None
+    if the message_id doesn't point to an escalation message or the source
+    channel's workspace can't be resolved.
+
+    Example::
+
+        dm_ch = handle_escalation(db, channel_id=sa_ch, message_id=msg_id)
+    """
+    msg_row = db._conn.execute(
+        "SELECT channel_id, payload_json FROM messages WHERE id=? AND kind='escalation'",
+        (message_id,),
+    ).fetchone()
+    if msg_row is None:
+        return None
+    payload = json.loads(msg_row[1])
+    reason = (payload.get("reason") or "").strip()
+    if len(reason) > 140:
+        reason = reason[:137] + "..."
+    agent_name = payload.get("agent_name") or "agent"
+    agent_role = payload.get("agent_role") or "Agent"
+    src_row = db._conn.execute(
+        "SELECT c.name, c.workspace_id, w.owner_user_id "
+        "FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE c.id=?",
+        (channel_id,),
+    ).fetchone()
+    if src_row is None:
+        return None
+    channel_name, workspace_id, owner_user_id = src_row
+    dm_ch = ensure_dm_channel(
+        db, workspace_id=workspace_id,
+        kind_a="human", id_a=owner_user_id,
+        kind_b="tally", id_b=None,
+    )
+    text = ESCALATION_DM_TEMPLATE.format(
+        owner=owner_user_id, agent_name=agent_name, agent_role=agent_role,
+        reason=reason, channel_name=channel_name,
+    )
+    insert_message(
+        db, channel_id=dm_ch, author_kind="tally", kind="text",
+        payload={"text": text},
+    )
+    return dm_ch
