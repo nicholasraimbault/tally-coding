@@ -88,3 +88,40 @@ def test_list_channels_non_member_returns_empty(client):
     r = client.get("/channels?workspace_id=1")
     assert r.status_code == 200
     assert r.json()["channels"] == []
+
+
+def test_post_channel_read_updates_last_read(client):
+    import tally_orchestrator.service as svc
+    db = svc.state["db"]
+    ch_id = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchone()[0]
+    # Post some messages
+    r1 = client.post(f"/channels/{ch_id}/messages", json={"text": "a"})
+    r2 = client.post(f"/channels/{ch_id}/messages", json={"text": "b"})
+    msg_id_b = r2.json()["id"]
+    # Mark read up to msg_id_b
+    r = client.post(f"/channels/{ch_id}/read", json={"last_read_message_id": msg_id_b})
+    assert r.status_code == 200
+    # Check the DB
+    row = db._conn.execute(
+        "SELECT last_read_message_id FROM channel_members WHERE channel_id=? AND user_id='admin'",
+        (ch_id,),
+    ).fetchone()
+    assert row[0] == msg_id_b
+
+
+def test_post_channel_read_non_member_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    db = svc.state["db"]
+    ch_id = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchone()[0]
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r = client.post(f"/channels/{ch_id}/read", json={"last_read_message_id": 1})
+    assert r.status_code == 403

@@ -610,6 +610,10 @@ class ChannelMemberRoleOverrideRequest(BaseModel):
     role_override: str | None = None  # None to clear, or one of: channel_admin, read_only
 
 
+class ChannelReadRequest(BaseModel):
+    last_read_message_id: int
+
+
 class MessageCreateRequest(BaseModel):
     text: str | None = None
     kind: str = "text"  # text | interactive_prompt_response
@@ -5268,6 +5272,31 @@ async def list_workspace_channels(
             for r in rows
         ],
     }
+
+
+@app.post("/channels/{channel_id}/read")
+async def post_channel_read(
+    channel_id: int,
+    body: ChannelReadRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: mark messages up to `last_read_message_id` as read for
+    the caller in this channel.  Returns 403 if caller isn't a member.
+
+    Uses MAX(last_read_message_id, ?) so out-of-order calls cannot
+    regress the read pointer.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_effective_role
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if role is None:
+        raise HTTPException(403, "permission denied")
+    cur = db._conn.execute(
+        "UPDATE channel_members SET last_read_message_id = MAX(last_read_message_id, ?) "
+        "WHERE channel_id=? AND user_id=?",
+        (body.last_read_message_id, channel_id, user.id),
+    )
+    return {"ok": True, "updated": cur.rowcount > 0}
 
 
 _background_tasks: set[asyncio.Task] = set()
