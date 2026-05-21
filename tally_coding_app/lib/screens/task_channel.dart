@@ -20,6 +20,7 @@ import '../widgets/message_feed.dart';
 import '../widgets/task_cost_ticker.dart';
 import 'billing_screen.dart';
 import 'file_tree.dart';
+import 'workflow_editor.dart';
 
 class TaskChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
@@ -358,6 +359,19 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     }
   }
 
+  // Sprint 48 B7: look up the team_proposal payload for a given taskId so the
+  // editor can be pre-populated with the current team_spec from the message.
+  Map<String, dynamic>? _findTeamProposalPayload(String taskId) {
+    for (final m in _messages) {
+      if (m['kind'] != 'team_proposal') continue;
+      try {
+        final p = jsonDecode(m['payload_json'] as String) as Map<String, dynamic>;
+        if (p['task_id'] == taskId) return p;
+      } catch (_) {}
+    }
+    return null;
+  }
+
   // Sprint 47 B7: body is now MessageFeed (REST + WS messages) + MessageComposer.
   // The old SSE agent-timeline (_events, _renderTimeline) is fully replaced.
   // Result card, workspace card, and error container still render below the
@@ -390,6 +404,47 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
                     SnackBar(content: Text('Answer failed: $e')),
                   );
                 }
+              }
+            },
+            // Sprint 48 B7: wire team_proposal card actions to API + editor.
+            onTeamProposalAction: (taskId, action) async {
+              switch (action) {
+                case 'approve':
+                  try {
+                    await widget.client.approveTask(taskId: taskId);
+                    if (mounted) await _loadMessages();
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Approve failed: $e')),
+                      );
+                    }
+                  }
+                case 'edit':
+                  final payload = _findTeamProposalPayload(taskId);
+                  if (payload == null) return;
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => WorkflowEditorScreen(
+                        client: widget.client,
+                        taskId: taskId,
+                        initialTeamSpec:
+                            Map<String, dynamic>.from(payload['team_spec'] as Map),
+                      ),
+                    ),
+                  );
+                  if (mounted) await _loadMessages();
+                case 'cancel':
+                  try {
+                    await widget.client.cancelTask(taskId: taskId);
+                    if (mounted) await _loadMessages();
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Cancel failed: $e')),
+                      );
+                    }
+                  }
               }
             },
           ),
