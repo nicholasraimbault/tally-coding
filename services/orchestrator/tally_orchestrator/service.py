@@ -1050,6 +1050,67 @@ class Db:
             for r in rows
         ]
 
+    def audit_log(
+        self,
+        *,
+        workspace_id: int,
+        actor_user_id: str | None,
+        actor_kind: str = "human",
+        kind: str,
+        target_kind: str | None = None,
+        target_id: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        """Sprint 51: append to workspace_audit_log.  Best-effort —
+        callers wrap in try/except so logging failure doesn't break the request."""
+        self._conn.execute(
+            "INSERT INTO workspace_audit_log "
+            "(workspace_id, actor_user_id, actor_kind, kind, target_kind, target_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace_id,
+                actor_user_id or "system",
+                actor_kind,
+                kind,
+                target_kind,
+                target_id,
+                json.dumps(payload or {}),
+                time.time(),
+            ),
+        )
+
+    def list_audit_log(
+        self,
+        *,
+        workspace_id: int,
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> list[dict]:
+        """Sprint 51: list audit log entries newest-first with keyset pagination."""
+        limit = min(max(1, limit), 500)
+        where = ["workspace_id=?"]
+        params: list = [workspace_id]
+        if before_id is not None:
+            where.append("id < ?")
+            params.append(before_id)
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT id, workspace_id, actor_user_id, actor_kind, kind, target_kind, target_id, payload_json, created_at "
+            f"FROM workspace_audit_log WHERE {' AND '.join(where)} "
+            f"ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "workspace_id": r[1], "actor_user_id": r[2],
+                "actor_kind": r[3], "kind": r[4],
+                "target_kind": r[5], "target_id": r[6],
+                "payload": json.loads(r[7]) if r[7] else {},
+                "created_at": r[8],
+            }
+            for r in rows
+        ]
+
     def add_workspace_member(
         self, *, workspace_id: int, user_id: str, role: str
     ) -> None:
