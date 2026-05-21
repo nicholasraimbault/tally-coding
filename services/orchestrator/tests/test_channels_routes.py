@@ -75,3 +75,16 @@ def test_list_channels_filters_archived(client):
     assert r2.status_code == 200
     archived = [c for c in r2.json()["channels"] if c["archived_at"] is not None]
     assert len(archived) >= 1
+
+
+def test_list_channels_non_member_returns_empty(client):
+    """Caller must be a workspace_members row; otherwise empty list (no leak)."""
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    # Override the user to someone not in admin's workspace.
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r = client.get("/channels?workspace_id=1")
+    assert r.status_code == 200
+    assert r.json()["channels"] == []

@@ -5226,8 +5226,18 @@ async def list_workspace_channels(
 ) -> dict:
     """Sprint 47: list channels in a workspace, filtered by the caller's
     visibility.  Only channels where the user is a `channel_members` row
-    are returned (so private custom channels stay hidden)."""
+    are returned (so private custom channels stay hidden).  Returns an
+    empty list if the caller is not a member of the workspace at all
+    (don't leak workspace existence)."""
     db: Db = state["db"]
+    # Workspace-isolation guard: caller must be a workspace_members row.
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"channels": []}
     where = ["c.workspace_id=?"]
     params: list = [workspace_id]
     if not include_archived:
