@@ -58,6 +58,18 @@ void main() {
     expect(find.text('Delete workspace', skipOffstage: false), findsNothing);
   });
 
+  testWidgets('owner sees Transfer ownership button', (tester) async {
+    final mock = MockClient((req) async => http.Response('{"members":[]}', 200, headers: {'content-type':'application/json'}));
+    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+      client: _mockClient(mock),
+      workspaceId: 1,
+      workspaceName: 'x',
+      callerRole: 'owner',
+    )));
+    await tester.pumpAndSettle();
+    expect(find.text('Transfer ownership', skipOffstage: false), findsOneWidget);
+  });
+
   testWidgets('renders Archived channels section with archived channels', (tester) async {
     final mock = MockClient((req) async {
       if (req.url.path == '/workspaces/1/members') {

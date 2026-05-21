@@ -155,6 +155,41 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
 
   // === Danger zone ===
 
+  Future<void> _onTransferOwnership() async {
+    final eligible = _members
+        .where((m) => m['member_kind'] == 'human' && m['role'] != 'owner')
+        .toList();
+    if (eligible.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No eligible recipients')),
+        );
+      }
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final newOwner = await showDialog<String>(
+      context: context,
+      builder: (_) => _TransferOwnershipDialog(members: eligible),
+    );
+    if (newOwner == null) return;
+    try {
+      await widget.client.transferOwnership(
+        workspaceId: widget.workspaceId,
+        newOwnerUserId: newOwner,
+      );
+      if (mounted) {
+        messenger.showSnackBar(const SnackBar(content: Text('Ownership transferred')));
+        navigator.pop();
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(content: Text('Transfer failed: $e')));
+      }
+    }
+  }
+
   // === Archived channels ===
 
   Future<void> _loadArchivedChannels() async {
@@ -337,6 +372,15 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
           ),
           const SizedBox(height: 8),
           if (widget.callerRole == 'owner')
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: ElevatedButton(
+                onPressed: _onTransferOwnership,
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.purple),
+                child: const Text('Transfer ownership'),
+              ),
+            ),
+          if (widget.callerRole == 'owner')
             ElevatedButton(
               onPressed: _onDelete,
               style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
@@ -450,6 +494,56 @@ class _InviteMemberDialogState extends State<_InviteMemberDialog> {
             Navigator.of(context).pop({'user_id': uid, 'role': _role});
           },
           child: const Text('Invite'),
+        ),
+      ],
+    );
+  }
+}
+
+class _TransferOwnershipDialog extends StatefulWidget {
+  final List<Map<String, dynamic>> members;
+  const _TransferOwnershipDialog({required this.members});
+
+  @override
+  State<_TransferOwnershipDialog> createState() => _TransferOwnershipDialogState();
+}
+
+class _TransferOwnershipDialogState extends State<_TransferOwnershipDialog> {
+  String? _selected;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Transfer ownership'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'You will be demoted to admin. This cannot be undone (the new owner can transfer back).',
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            initialValue: _selected,
+            decoration: const InputDecoration(labelText: 'New owner'),
+            items: [
+              for (final m in widget.members)
+                DropdownMenuItem(
+                  value: m['user_id'] as String,
+                  child: Text('${m['user_id']} (${m['role']})'),
+                ),
+            ],
+            onChanged: (v) => setState(() => _selected = v),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: _selected == null ? null : () => Navigator.of(context).pop(_selected),
+          child: const Text('Transfer'),
         ),
       ],
     );
