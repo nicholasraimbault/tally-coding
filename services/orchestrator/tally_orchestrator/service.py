@@ -1099,14 +1099,31 @@ class Db:
         workspace_id: int,
         limit: int = 100,
         before_id: int | None = None,
+        kind: str | None = None,
+        actor_user_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
     ) -> list[dict]:
-        """Sprint 51: list audit log entries newest-first with keyset pagination."""
+        """Sprint 51 + 52: list audit log entries newest-first with keyset
+        pagination + optional filters (kind/actor_user_id/since/until)."""
         limit = min(max(1, limit), 500)
         where = ["workspace_id=?"]
         params: list = [workspace_id]
         if before_id is not None:
             where.append("id < ?")
             params.append(before_id)
+        if kind is not None:
+            where.append("kind=?")
+            params.append(kind)
+        if actor_user_id is not None:
+            where.append("actor_user_id=?")
+            params.append(actor_user_id)
+        if since is not None:
+            where.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            where.append("created_at < ?")
+            params.append(until)
         params.append(limit)
         rows = self._conn.execute(
             f"SELECT id, workspace_id, actor_user_id, actor_kind, kind, target_kind, target_id, payload_json, created_at "
