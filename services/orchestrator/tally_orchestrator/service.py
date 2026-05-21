@@ -815,6 +815,11 @@ class Db:
             )
         except sqlite3.OperationalError:
             pass
+        # Sprint 50: soft-delete support for workspaces.
+        try:
+            self._conn.execute("ALTER TABLE workspaces ADD COLUMN deleted_at REAL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Sprint 47: backfill workspaces + channels for pre-existing data.
         # Idempotent — only creates rows when they're missing.
         self._backfill_workspaces_and_channels()
