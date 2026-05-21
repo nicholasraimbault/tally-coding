@@ -1023,5 +1023,95 @@ class TallyOrchClient {
     return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
+  // ── Sprint 49: persistent agents + DMs ──────────────────────────────────
+
+  Future<Map<String, dynamic>> createPersistentAgent({
+    required int workspaceId,
+    required String name,
+    required String roleName,
+    required Map<String, dynamic> teamSpec,
+    String? cronSchedule,
+    List<Map<String, dynamic>>? eventTriggers,
+    Map<String, dynamic>? toolAllowlist,
+    String? model,
+  }) async {
+    final body = {
+      'workspace_id': workspaceId,
+      'name': name,
+      'role_name': roleName,
+      'team_spec': teamSpec,
+      if (cronSchedule != null) 'cron_schedule': cronSchedule,
+      if (eventTriggers != null) 'event_triggers': eventTriggers,
+      if (toolAllowlist != null) 'tool_allowlist': toolAllowlist,
+      if (model != null) 'model': model,
+    };
+    final resp = await _http.post(
+      baseUrl.resolve('/persistent_agents'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /persistent_agents ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<List<Map<String, dynamic>>> listPersistentAgents({required int workspaceId}) async {
+    final resp = await _http.get(
+      baseUrl.resolve('/persistent_agents').replace(queryParameters: {'workspace_id': '$workspaceId'}),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /persistent_agents ${resp.statusCode}: ${resp.body}');
+    }
+    return List<Map<String, dynamic>>.from(jsonDecode(resp.body)['persistent_agents'] as List);
+  }
+
+  Future<Map<String, dynamic>> updatePersistentAgent({required int id, required Map<String, dynamic> patch}) async {
+    final resp = await _http.patch(
+      baseUrl.resolve('/persistent_agents/$id'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(patch),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /persistent_agents/$id ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> runPersistentAgentNow({required int id}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/persistent_agents/$id/run_now'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /persistent_agents/$id/run_now ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> deletePersistentAgent({required int id}) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/persistent_agents/$id'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('DELETE /persistent_agents/$id ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
+  Future<Map<String, dynamic>> openDmChannel({required String targetKind, String? targetId}) async {
+    final body = {'target_kind': targetKind, if (targetId != null) 'target_id': targetId};
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/dm'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /channels/dm ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
   void close() => _http.close();
 }
