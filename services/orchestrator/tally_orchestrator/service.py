@@ -913,6 +913,24 @@ class Db:
             "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
             (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
         )
+        # Sprint 47: insert the task's channel + dispatcher's channel_member
+        # immediately so the agent dispatch loop can inject user messages
+        # without waiting for the next backfill cycle.
+        owner_user_id = user_id or "admin"
+        ws_row = self._conn.execute(
+            "SELECT id FROM workspaces WHERE owner_user_id=?", (owner_user_id,)
+        ).fetchone()
+        if ws_row is not None:
+            ch_cur = self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, task_id, created_at) "
+                "VALUES (?, 'task', ?, ?, ?)",
+                (ws_row[0], f"task-{task_id[:8]}", task_id, time.time()),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_cur.lastrowid, owner_user_id, time.time()),
+            )
         return task_id
 
     def get_task(self, task_id: str, *, user_id: str | None = None) -> dict | None:

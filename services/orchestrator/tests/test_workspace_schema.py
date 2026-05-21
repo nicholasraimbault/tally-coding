@@ -96,3 +96,28 @@ def test_backfill_existing_tasks_get_channels(db: Db):
         f"expected one channel_members row per task channel; got {len(member_rows)} for {tasks_cnt} tasks"
     )
     assert all(row[0] == "admin" for row in member_rows)
+
+
+def test_new_task_creates_task_channel(db: Db):
+    """When a task is created via Db.create_task, an immediate task channel
+    is inserted (not waiting for next backfill cycle)."""
+    task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    # Channel should exist immediately
+    row = db._conn.execute(
+        "SELECT id, kind FROM channels WHERE task_id=?", (task_id,)
+    ).fetchone()
+    assert row is not None
+    assert row[1] == "task"
+
+
+def test_new_task_creates_task_channel_member(db: Db):
+    """The task owner is auto-joined to the task channel."""
+    task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    row = db._conn.execute(
+        "SELECT cm.user_id FROM channel_members cm "
+        "JOIN channels c ON cm.channel_id=c.id "
+        "WHERE c.task_id=? AND cm.member_kind='human'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "admin"
