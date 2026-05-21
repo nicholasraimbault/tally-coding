@@ -73,6 +73,17 @@ TASK_CONTEXT_ID = "task:start"
 EVENT_CONTEXT_ID = "task:event"
 FS_LIST_CONTEXT_ID = "task:fs:list"
 FS_READ_CONTEXT_ID = "task:fs:read"
+
+# Sprint 48: task lifecycle statuses
+TASK_STATUS_TERMINAL: frozenset[str] = frozenset({
+    "completed", "failed", "aborted",
+    "aborted_cost_cap", "period_cap_reached", "cancelled",
+})
+TASK_STATUS_COUNTS_AGAINST_QUOTA: frozenset[str] = frozenset({
+    "pending", "running", "completed", "failed",
+    "aborted", "aborted_cost_cap", "period_cap_reached",
+})
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id              TEXT PRIMARY KEY,
