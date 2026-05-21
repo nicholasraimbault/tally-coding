@@ -11,18 +11,37 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
-import '../agent_roles.dart';
 import '../api.dart';
+import '../services/notifications_ws.dart';
+import '../state/workspace_context.dart';
 import '../widgets/cap_abort_dialog.dart';
 import '../widgets/channel_header.dart';
+import '../widgets/message_composer.dart';
+import '../widgets/message_feed.dart';
 import '../widgets/task_cost_ticker.dart';
 import 'billing_screen.dart';
 import 'file_tree.dart';
+import 'workflow_editor.dart';
 
 class TaskChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
-  final String taskId;
-  const TaskChannelScreen({super.key, required this.client, required this.taskId});
+  final NotificationsWsClient wsClient;
+  /// Sprint 47: task-context path — resolves channel via listChannels(task_id).
+  final String? taskId;
+  /// Sprint 49 B7: direct channel path — bypasses task resolution.
+  /// Used for kind='dm' and kind='scheduled_agent' channels.
+  final int? directChannelId;
+  /// Sprint 49 B7: display title for non-task channels (DMs, scheduled agents).
+  final String? channelTitle;
+  const TaskChannelScreen({
+    super.key,
+    required this.client,
+    required this.wsClient,
+    this.taskId,
+    this.directChannelId,
+    this.channelTitle,
+  }) : assert(taskId != null || directChannelId != null,
+            'Either taskId or directChannelId must be provided');
 
   @override
   State<TaskChannelScreen> createState() => _TaskChannelScreenState();
@@ -30,22 +49,31 @@ class TaskChannelScreen extends StatefulWidget {
 
 class _TaskChannelScreenState extends State<TaskChannelScreen> {
   Task? _task;
-  final List<Map<String, dynamic>> _events = [];
-  int _lastSeq = -1;
-  String? _error;
+  // SSE-based event state: kept only to drive the cost ticker + cap-abort
+  // dialog via status_change frames. The event list rendering is gone.
   StreamSubscription? _framesSub;
+  String? _error;
   List<Map<String, dynamic>>? _files;
   String? _filesError;
   bool _filesLoading = false;
-  final _scrollCtrl = ScrollController();
   int _perTaskCap = 100; // default until getCaps() resolves
+
+  // Sprint 47 B7: chat message state (REST + WS)
+  List<Map<String, dynamic>> _messages = [];
+  int _lastMessageId = 0;
+  int? _channelId;
 
   @override
   void initState() {
     super.initState();
-    _fetchInitial();
-    _connectStream();
-    _fetchCaps();
+    // Sprint 49 B7: for direct-channel mode (DM / scheduled_agent) skip the
+    // task-fetch, SSE stream, and cap lookup — none make sense without a taskId.
+    if (widget.taskId != null) {
+      _fetchInitial();
+      _connectStream();
+      _fetchCaps();
+    }
+    _resolveChannelAndLoad();
   }
 
   Future<void> _fetchCaps() async {
@@ -61,13 +89,16 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   @override
   void dispose() {
     _framesSub?.cancel();
-    _scrollCtrl.dispose();
+    // Clear the WS callback so the channel doesn't leak across route transitions.
+    widget.wsClient.onNewMessage = null;
     super.dispose();
   }
 
   Future<void> _fetchInitial() async {
+    final tid = widget.taskId;
+    if (tid == null) return;
     try {
-      final t = await widget.client.getTask(widget.taskId);
+      final t = await widget.client.getTask(tid);
       if (!mounted) return;
       setState(() => _task = t);
       if (t.isTerminal && _files == null && !_filesLoading) _fetchFiles();
@@ -78,10 +109,11 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   }
 
   Future<void> _fetchFiles() async {
-    if (_filesLoading) return;
+    final tid = widget.taskId;
+    if (tid == null || _filesLoading) return;
     setState(() => _filesLoading = true);
     try {
-      final entries = await widget.client.listFiles(widget.taskId);
+      final entries = await widget.client.listFiles(tid);
       if (!mounted) return;
       setState(() {
         _files = entries;
@@ -97,26 +129,19 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     }
   }
 
+  // Sprint 47 B7: The SSE stream is kept ONLY to drive status_change events
+  // (cost ticker chip, cap-abort dialog, task status header). The per-event
+  // agent-timeline rendering has been replaced by MessageFeed + WS.
+  // Sprint 49 B7: only called when widget.taskId is set.
   void _connectStream() {
+    final tid = widget.taskId;
+    if (tid == null) return;
     _framesSub?.cancel();
-    _framesSub = widget.client.streamFrames(widget.taskId, sinceSeq: _lastSeq).listen(
+    _framesSub = widget.client.streamFrames(tid, sinceSeq: -1).listen(
       (frame) {
         if (!mounted) return;
         setState(() {
-          if (frame.name == 'task_event') {
-            _events.add(frame.data);
-            _lastSeq = frame.data['seq'] as int;
-            // Auto-scroll to bottom when new event arrives (Discord shape).
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (_scrollCtrl.hasClients) {
-                _scrollCtrl.animateTo(
-                  _scrollCtrl.position.maxScrollExtent,
-                  duration: const Duration(milliseconds: 200),
-                  curve: Curves.easeOut,
-                );
-              }
-            });
-          } else if (frame.name == 'status_change') {
+          if (frame.name == 'status_change') {
             final t = _task;
             final newStatus = frame.data['status'] as String;
             final ts = (frame.data['ts'] as num?)?.toDouble() ??
@@ -177,6 +202,71 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     );
   }
 
+  // ─── Sprint 47 B7: channel resolution + message loading + WS subscription ───
+
+  Future<void> _resolveChannelAndLoad() async {
+    try {
+      // Sprint 49 B7: direct-channel path — no task lookup needed.
+      if (widget.directChannelId != null) {
+        _channelId = widget.directChannelId;
+        await _loadMessages();
+        _subscribeToWs();
+        return;
+      }
+      // Sprint 47: task-channel path — resolve channel from task_id.
+      final channels = await widget.client.listChannels(
+        workspaceId: WorkspaceContext.activeIdOrDefault(context),
+      );
+      final mine = channels.firstWhere(
+        (c) => c['task_id'] == widget.taskId,
+        orElse: () => const {},
+      );
+      if (mine.isNotEmpty) {
+        _channelId = mine['id'] as int;
+        await _loadMessages();
+        _subscribeToWs();
+      }
+    } catch (e) {
+      debugPrint('task_channel: failed to resolve channel: $e');
+    }
+  }
+
+  Future<void> _loadMessages() async {
+    if (_channelId == null) return;
+    final msgs = await widget.client.getMessages(channelId: _channelId!);
+    if (!mounted) return;
+    setState(() {
+      _messages = msgs;
+      _lastMessageId = msgs.isNotEmpty ? (msgs.first['id'] as int) : 0;
+    });
+  }
+
+  void _subscribeToWs() {
+    widget.wsClient.onNewMessage = (channelId, messageId) async {
+      if (channelId != _channelId) return;
+      try {
+        final newMsgs = await widget.client.getMessages(
+          channelId: _channelId!,
+          sinceId: _lastMessageId,
+        );
+        if (!mounted) return;
+        setState(() {
+          _messages = [...newMsgs, ..._messages];
+          if (newMsgs.isNotEmpty) _lastMessageId = newMsgs.first['id'] as int;
+        });
+      } catch (e) {
+        debugPrint('task_channel: ws refresh failed: $e');
+      }
+    };
+  }
+
+  Future<void> _send(String text) async {
+    if (_channelId == null) return;
+    await widget.client.postMessage(channelId: _channelId!, text: text);
+    // Optimistic refresh — WS will deliver but eagerly refresh in case WS is slow.
+    await _loadMessages();
+  }
+
   Future<void> _openFileViewer(String path) async {
     showDialog(
       context: context,
@@ -187,7 +277,9 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
           constraints: const BoxConstraints(maxWidth: 800, maxHeight: 600),
           child: _FileViewerDialog(
             client: widget.client,
-            taskId: widget.taskId,
+            // _openFileViewer is only reachable in task-context mode,
+            // so widget.taskId is guaranteed non-null here.
+            taskId: widget.taskId!,
             path: path,
           ),
         ),
@@ -198,20 +290,38 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   @override
   Widget build(BuildContext context) {
     final t = _task;
+    // Sprint 49 B7: direct-channel mode (DM / scheduled_agent) — no task
+    // context, so skip the task header widgets and go straight to the feed.
+    if (widget.directChannelId != null) {
+      return Container(
+        color: const Color(0xFF313338),
+        child: Column(
+          children: [
+            ChannelHeader(
+              glyph: '#',
+              name: widget.channelTitle ?? 'channel',
+              description: '',
+            ),
+            Expanded(child: _directBody()),
+          ],
+        ),
+      );
+    }
+    final tid = widget.taskId!;
     return Container(
       color: const Color(0xFF313338),
       child: Column(
         children: [
           ChannelHeader(
             glyph: '#',
-            name: t?.id.substring(0, 8) ?? widget.taskId.substring(0, 8),
+            name: t?.id.substring(0, 8) ?? tid.substring(0, 8),
             description: t?.description ?? 'Loading…',
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 TaskCostTicker(
                   client: widget.client,
-                  taskId: widget.taskId,
+                  taskId: tid,
                   perTaskCapCredits: _perTaskCap,
                   taskStatus: t?.status ?? 'pending',
                 ),
@@ -231,8 +341,48 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     );
   }
 
+  /// Sprint 49 B7: body for direct-channel mode — MessageFeed + Composer,
+  /// no task status, result card, workspace, or error container.
+  Widget _directBody() {
+    return Column(
+      children: [
+        Expanded(
+          child: MessageFeed(
+            messages: _messages,
+            onAnswerPrompt: (messageId, value) async {
+              if (_channelId == null) return;
+              try {
+                await widget.client.postMessage(
+                  channelId: _channelId!,
+                  kind: 'interactive_prompt_response',
+                  payload: {'value': value},
+                  replyToId: messageId,
+                );
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Answer failed: $e')),
+                  );
+                }
+              }
+            },
+            onTeamProposalAction: (taskId, action) async {
+              // Team proposals are unlikely in DM/scheduled channels,
+              // but wire up a no-op so MessageFeed compiles cleanly.
+            },
+          ),
+        ),
+        MessageComposer(
+          onSend: _send,
+          placeholder: 'Message…',
+        ),
+      ],
+    );
+  }
+
   /// Sprint 41: branch off a completed task — submit a new task whose
   /// first agent inherits the parent's artifacts as seed_files.
+  /// Only called when widget.taskId is non-null (task-context mode).
   Future<void> _promptBranch(Task parent) async {
     final desc = await showDialog<String>(
       context: context,
@@ -299,6 +449,23 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     }
   }
 
+  // Sprint 48 B7: look up the team_proposal payload for a given taskId so the
+  // editor can be pre-populated with the current team_spec from the message.
+  Map<String, dynamic>? _findTeamProposalPayload(String taskId) {
+    for (final m in _messages) {
+      if (m['kind'] != 'team_proposal') continue;
+      try {
+        final p = jsonDecode(m['payload_json'] as String) as Map<String, dynamic>;
+        if (p['task_id'] == taskId) return p;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // Sprint 47 B7: body is now MessageFeed (REST + WS messages) + MessageComposer.
+  // The old SSE agent-timeline (_events, _renderTimeline) is fully replaced.
+  // Result card, workspace card, and error container still render below the
+  // feed so completed/failed task artifacts remain accessible.
   Widget _body(Task? t) {
     if (t == null) {
       return Center(
@@ -307,52 +474,92 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
             : const CircularProgressIndicator(),
       );
     }
-    return SingleChildScrollView(
-      controller: _scrollCtrl,
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _SystemMessage(
-            icon: Icons.task_alt,
-            text: t.description,
-            timestamp: t.createdAt,
+    return Column(
+      children: [
+        Expanded(
+          child: MessageFeed(
+            messages: _messages,
+            onAnswerPrompt: (messageId, value) async {
+              if (_channelId == null) return;
+              try {
+                await widget.client.postMessage(
+                  channelId: _channelId!,
+                  kind: 'interactive_prompt_response',
+                  payload: {'value': value},
+                  replyToId: messageId,
+                );
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Answer failed: $e')),
+                  );
+                }
+              }
+            },
+            // Sprint 48 B7: wire team_proposal card actions to API + editor.
+            onTeamProposalAction: (taskId, action) async {
+              switch (action) {
+                case 'approve':
+                  try {
+                    await widget.client.approveTask(taskId: taskId);
+                    if (mounted) await _loadMessages();
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Approve failed: $e')),
+                      );
+                    }
+                  }
+                case 'edit':
+                  final payload = _findTeamProposalPayload(taskId);
+                  if (payload == null) return;
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => WorkflowEditorScreen(
+                        client: widget.client,
+                        taskId: taskId,
+                        initialTeamSpec:
+                            Map<String, dynamic>.from(payload['team_spec'] as Map),
+                      ),
+                    ),
+                  );
+                  if (mounted) await _loadMessages();
+                case 'cancel':
+                  try {
+                    await widget.client.cancelTask(taskId: taskId);
+                    if (mounted) await _loadMessages();
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Cancel failed: $e')),
+                      );
+                    }
+                  }
+              }
+            },
           ),
-          const SizedBox(height: 16),
-          if (t.teamSpec != null) ...[
-            _SystemMessage(
-              icon: Icons.auto_awesome,
-              text: () {
-                final agents = (t.teamSpec!['agents'] as List).length;
-                final flow = (t.teamSpec!['workflow'] as String?) ?? '(no workflow)';
-                final template = t.teamSpec!['template_used'] as String?;
-                final base = 'Tally picked $agents agent(s): $flow';
-                return template != null && template.isNotEmpty
-                    ? '$base · via template `$template`'
-                    : base;
-              }(),
-              timestamp: t.createdAt,
-            ),
-            const SizedBox(height: 16),
-          ],
-          if (_events.isNotEmpty) ..._renderTimeline(t.status == 'running' || t.status == 'pending'),
-          if (t.isTerminal && t.result != null) ...[
-            const SizedBox(height: 16),
-            _ResultCard(result: t.result!),
-          ],
-          if (t.isTerminal) ...[
-            const SizedBox(height: 16),
-            _WorkspaceCard(
+        ),
+        // Result card + workspace card below the feed for terminal tasks.
+        if (t.isTerminal && t.result != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: _ResultCard(result: t.result!),
+          ),
+        if (t.isTerminal)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: _WorkspaceCard(
               files: _files,
               filesError: _filesError,
               loading: _filesLoading,
               onRefresh: _fetchFiles,
               onFileTap: _openFileViewer,
             ),
-          ],
-          if (t.status == 'failed' && t.error != null) ...[
-            const SizedBox(height: 16),
-            Container(
+          ),
+        if (t.status == 'failed' && t.error != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: const Color(0xFFED4245).withValues(alpha: 0.12),
@@ -361,520 +568,21 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
               ),
               child: SelectableText(
                 t.error!,
-                style: const TextStyle(color: Color(0xFFFFAAAA),
-                    fontFamily: 'monospace', fontSize: 12),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  /// Group events by agent_idx (Sprint 22+ added this field to every event)
-  /// and render each group with a colored band so multi-agent runs are
-  /// readable. Events without agent_idx (Sprint 13 legacy) get a single
-  /// unattributed band.
-  ///
-  /// Sprint 27.5 (open-items round): when team_spec.stages is set, insert
-  /// a "Stage N" divider before the first agent of each stage so a
-  /// reader of the chat scrollback can tell parallel stages apart from
-  /// sequential ones.
-  List<Widget> _renderTimeline(bool taskRunning) {
-    final groups = <int?, List<Map<String, dynamic>>>{};
-    for (final ev in _events) {
-      final idx = ev['agent_idx'] as int?;
-      groups.putIfAbsent(idx, () => []).add(ev);
-    }
-    final keys = groups.keys.toList()
-      ..sort((a, b) => (a ?? -1).compareTo(b ?? -1));
-    // Build a {agent_idx → stage_idx} lookup from team_spec.stages.
-    final teamSpec = _task?.teamSpec;
-    final stages = (teamSpec?['stages'] as List<dynamic>?) ?? const [];
-    final stageByAgent = <int, int>{};
-    for (var s = 0; s < stages.length; s++) {
-      for (final i in (stages[s] as List<dynamic>)) {
-        if (i is int) stageByAgent[i] = s;
-      }
-    }
-    // Per-agent file list from result.agents[i].result.files_created.
-    // Available the moment the agent finishes; missing for in-flight
-    // agents and for legacy single-agent tasks.
-    final filesByAgent = <int, List<String>>{};
-    final resultAgents = (_task?.result?['agents'] as List<dynamic>?) ?? const [];
-    for (final a in resultAgents) {
-      if (a is! Map<String, dynamic>) continue;
-      final idx = a['agent_idx'];
-      final r = a['result'];
-      if (idx is! int || r is! Map<String, dynamic>) continue;
-      final fc = r['files_created'];
-      if (fc is List) {
-        filesByAgent[idx] = fc.whereType<String>().toList();
-      }
-    }
-    final widgets = <Widget>[];
-    int? prevStage;
-    final seenPaths = <String>{};
-    for (final k in keys) {
-      final events = groups[k]!;
-      final role = events.first['agent_role'] as String? ?? '?';
-      final model = events.first['agent_model'] as String? ?? '';
-      final isLastAgent = k == keys.last;
-      final stageIdx = (k != null) ? stageByAgent[k] : null;
-      // Emit a stage divider when we cross a stage boundary AND the
-      // team actually has a multi-stage shape (stages.length > 1).
-      if (stages.length > 1 && stageIdx != null && stageIdx != prevStage) {
-        final agentsInStage = (stages[stageIdx] as List).length;
-        widgets.add(_StageDivider(
-          stageIdx: stageIdx,
-          agentsInStage: agentsInStage,
-        ));
-        prevStage = stageIdx;
-      }
-      // Sprint 25.5 (open-items round): split the agent's file list
-      // into "new" (paths not seen in a prior agent) and "touched"
-      // (rewrote a prior file) so the user can tell where work was
-      // *added* vs where it was *iterated on*.
-      final allFiles = (k != null ? filesByAgent[k] : null) ?? const [];
-      final newFiles = <String>[];
-      final touchedFiles = <String>[];
-      for (final p in allFiles) {
-        if (seenPaths.contains(p)) {
-          touchedFiles.add(p);
-        } else {
-          newFiles.add(p);
-          seenPaths.add(p);
-        }
-      }
-      widgets.add(_AgentBand(
-        role: role,
-        model: model,
-        events: events,
-        isLive: isLastAgent && taskRunning,
-        newFiles: newFiles,
-        touchedFiles: touchedFiles,
-        onFileTap: _openFileViewer,
-      ));
-      widgets.add(const SizedBox(height: 12));
-    }
-    return widgets;
-  }
-}
-
-class _StageDivider extends StatelessWidget {
-  final int stageIdx;
-  final int agentsInStage;
-  const _StageDivider({required this.stageIdx, required this.agentsInStage});
-
-  @override
-  Widget build(BuildContext context) {
-    final label = agentsInStage > 1
-        ? 'Stage ${stageIdx + 1} · $agentsInStage agents in parallel'
-        : 'Stage ${stageIdx + 1}';
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(0, 8, 0, 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: Container(height: 1, color: const Color(0xFF1E1F22)),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: const Color(0xFF2B2D31),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF404249)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    agentsInStage > 1 ? Icons.call_split : Icons.linear_scale,
-                    size: 12,
-                    color: const Color(0xFF8E9297),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    label,
-                    style: const TextStyle(
-                      color: Color(0xFFB9BBBE),
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ],
+                style: const TextStyle(
+                  color: Color(0xFFFFAAAA),
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                ),
               ),
             ),
           ),
-          Expanded(
-            child: Container(height: 1, color: const Color(0xFF1E1F22)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _SystemMessage extends StatelessWidget {
-  final IconData icon;
-  final String text;
-  final double timestamp;
-  const _SystemMessage({required this.icon, required this.text, required this.timestamp});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, size: 18, color: const Color(0xFF8E9297)),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            text,
-            style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 13, height: 1.5),
-          ),
+        MessageComposer(
+          onSend: _send,
+          placeholder: 'Message…',
         ),
       ],
     );
   }
-}
-
-class _AgentBand extends StatelessWidget {
-  final String role;
-  final String model;
-  final List<Map<String, dynamic>> events;
-  final bool isLive;
-  final List<String> newFiles;
-  final List<String> touchedFiles;
-  final ValueChanged<String>? onFileTap;
-  const _AgentBand({
-    required this.role,
-    required this.model,
-    required this.events,
-    required this.isLive,
-    this.newFiles = const [],
-    this.touchedFiles = const [],
-    this.onFileTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final r = agentRoleOf(role);
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF2B2D31),
-        borderRadius: BorderRadius.circular(6),
-        border: Border(
-          left: BorderSide(color: r.tint, width: 4),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Header
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-            child: Row(
-              children: [
-                Container(
-                  width: 28,
-                  height: 28,
-                  decoration: BoxDecoration(
-                    color: r.tint.withValues(alpha: 0.2),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  alignment: Alignment.center,
-                  child: Text(r.glyph, style: const TextStyle(fontSize: 14)),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  r.name,
-                  style: TextStyle(
-                    color: r.tint,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 14,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                if (model.isNotEmpty)
-                  Text(
-                    model.split('/').last,
-                    style: const TextStyle(color: Color(0xFF8E9297), fontSize: 11),
-                  ),
-                const Spacer(),
-                if (isLive)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF5865F2).withValues(alpha: 0.18),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text(
-                      'working…',
-                      style: TextStyle(color: Color(0xFF5865F2), fontSize: 10, fontWeight: FontWeight.w600),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          ...[
-            for (final w in _renderEvents(context, events, isLive)) w,
-          ],
-          if (newFiles.isNotEmpty || touchedFiles.isNotEmpty)
-            _AgentFilesPanel(
-              tint: agentRoleOf(role).tint,
-              newFiles: newFiles,
-              touchedFiles: touchedFiles,
-              onTap: onFileTap,
-            ),
-          const SizedBox(height: 8),
-        ],
-      ),
-    );
-  }
-
-  List<Widget> _renderEvents(BuildContext context, List<Map<String, dynamic>> events, bool isLive) {
-    final widgets = <Widget>[];
-    var i = 0;
-    while (i < events.length) {
-      final ev = events[i];
-      if (ev['type'] == 'TokenBatch') {
-        final run = <Map<String, dynamic>>[];
-        while (i < events.length && events[i]['type'] == 'TokenBatch') {
-          run.add(events[i]);
-          i++;
-        }
-        final isLastInBand = i == events.length;
-        widgets.add(_tokenBubble(context, run, isLive: isLive && isLastInBand));
-      } else {
-        widgets.add(_eventTile(context, ev));
-        i++;
-      }
-    }
-    return widgets;
-  }
-
-  Widget _eventTile(BuildContext context, Map<String, dynamic> ev) {
-    final type = ev['type'] as String? ?? '?';
-    final actionType = ev['action_type'] as String?;
-    final obsType = ev['observation_type'] as String?;
-    final body = ev['command'] ?? ev['path'] ?? ev['content'] ?? ev['output'] ?? ev['message'];
-    String? bodyStr = body is String ? body : null;
-    if (bodyStr != null && bodyStr.length > 200) bodyStr = '${bodyStr.substring(0, 200)}…';
-
-    String label = type;
-    if (actionType != null) label = '$type · $actionType';
-    if (obsType != null) label = '$type · $obsType';
-
-    final (icon, color) = switch (type) {
-      'ActionEvent' => (Icons.play_arrow, Color(0xFF5865F2)),
-      'ObservationEvent' => (Icons.visibility, Color(0xFFFEE75C)),
-      'MessageEvent' => (Icons.message, Color(0xFFEB459E)),
-      'AgentErrorEvent' => (Icons.error, Color(0xFFED4245)),
-      _ => (Icons.circle_outlined, Color(0xFF8E9297)),
-    };
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: color, size: 14),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  label,
-                  style: const TextStyle(color: Color(0xFFB9BBBE), fontSize: 11, fontWeight: FontWeight.w600),
-                ),
-                if (bodyStr != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      bodyStr,
-                      maxLines: 4,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Color(0xFFDCDDDE),
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Text(
-            '#${ev['seq']}',
-            style: const TextStyle(color: Color(0xFF8E9297), fontSize: 10),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _tokenBubble(BuildContext context, List<Map<String, dynamic>> batches, {required bool isLive}) {
-    final text = batches.map((b) => b['content'] as String? ?? '').join();
-    final r = agentRoleOf(role);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
-      child: Container(
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: r.tint.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: RichText(
-          text: TextSpan(
-            style: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 11,
-              height: 1.4,
-              color: Color(0xFFDCDDDE),
-            ),
-            children: [
-              TextSpan(text: text),
-              if (isLive)
-                WidgetSpan(
-                  alignment: PlaceholderAlignment.middle,
-                  child: _BlinkingCursor(color: r.tint),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _AgentFilesPanel extends StatelessWidget {
-  final Color tint;
-  final List<String> newFiles;
-  final List<String> touchedFiles;
-  final ValueChanged<String>? onTap;
-  const _AgentFilesPanel({
-    required this.tint,
-    required this.newFiles,
-    required this.touchedFiles,
-    this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1E1F22).withValues(alpha: 0.5),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.folder_open, size: 12, color: tint),
-                const SizedBox(width: 6),
-                Text(
-                  'files',
-                  style: TextStyle(
-                    color: tint,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.0,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                if (newFiles.isNotEmpty)
-                  Text(
-                    '+${newFiles.length} new',
-                    style: const TextStyle(color: Color(0xFF57F287), fontSize: 10),
-                  ),
-                if (newFiles.isNotEmpty && touchedFiles.isNotEmpty)
-                  const Text(' · ', style: TextStyle(color: Color(0xFF8E9297), fontSize: 10)),
-                if (touchedFiles.isNotEmpty)
-                  Text(
-                    '~${touchedFiles.length} touched',
-                    style: const TextStyle(color: Color(0xFFFEE75C), fontSize: 10),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            Wrap(
-              spacing: 6,
-              runSpacing: 4,
-              children: [
-                for (final p in newFiles)
-                  _FileChip(path: p, color: const Color(0xFF57F287), onTap: onTap),
-                for (final p in touchedFiles)
-                  _FileChip(path: p, color: const Color(0xFFFEE75C), onTap: onTap),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _FileChip extends StatelessWidget {
-  final String path;
-  final Color color;
-  final ValueChanged<String>? onTap;
-  const _FileChip({required this.path, required this.color, this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap == null ? null : () => onTap!(path),
-      borderRadius: BorderRadius.circular(3),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(3),
-        ),
-        child: Text(
-          path,
-          style: TextStyle(
-            color: color,
-            fontFamily: 'monospace',
-            fontSize: 10.5,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-
-class _BlinkingCursor extends StatefulWidget {
-  final Color color;
-  const _BlinkingCursor({required this.color});
-  @override
-  State<_BlinkingCursor> createState() => _BlinkingCursorState();
-}
-
-class _BlinkingCursorState extends State<_BlinkingCursor> with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))..repeat(reverse: true);
-  }
-  @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
-  @override
-  Widget build(BuildContext context) => FadeTransition(
-        opacity: _ctrl,
-        child: Text('▌', style: TextStyle(color: widget.color, fontSize: 11)),
-      );
 }
 
 /// Sprint 29/41: header trailing controls — branch-this-task button

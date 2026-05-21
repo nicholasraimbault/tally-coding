@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -36,7 +38,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -62,6 +64,7 @@ from .github_push import (
     push_project,
     validate_repo,
 )
+import httpx
 import jwt
 from .worker_pool import WorkerPool
 
@@ -73,6 +76,25 @@ TASK_CONTEXT_ID = "task:start"
 EVENT_CONTEXT_ID = "task:event"
 FS_LIST_CONTEXT_ID = "task:fs:list"
 FS_READ_CONTEXT_ID = "task:fs:read"
+
+# Sprint 52: Clerk user validation
+CLERK_API_BASE = "https://api.clerk.com/v1"
+_CLERK_VALIDATE_TIMEOUT = httpx.Timeout(5.0)
+# Sprint 52 hardening: only allow well-formed Clerk user IDs to prevent
+# path-traversal / SSRF via values like `user_x/../organizations`.
+# fullmatch anchors both ends — match() alone would pass `user_x/../foo`.
+_CLERK_USER_ID_PATTERN = re.compile(r"user_[A-Za-z0-9]+")
+
+# Sprint 48: task lifecycle statuses
+TASK_STATUS_TERMINAL: frozenset[str] = frozenset({
+    "completed", "failed", "aborted",
+    "aborted_cost_cap", "period_cap_reached", "cancelled",
+})
+TASK_STATUS_COUNTS_AGAINST_QUOTA: frozenset[str] = frozenset({
+    "pending", "running", "completed", "failed",
+    "aborted", "aborted_cost_cap", "period_cap_reached",
+})
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id              TEXT PRIMARY KEY,
@@ -340,6 +362,121 @@ CREATE TABLE IF NOT EXISTS push_devices (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, enabled);
+
+-- Sprint 47: chat-foundation tables (workspaces, members, channels, messages).
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    plan_slug TEXT NOT NULL DEFAULT 'free',
+    stripe_customer_id TEXT,
+    created_at REAL NOT NULL,
+    settings_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    member_kind TEXT NOT NULL,
+    user_id TEXT,
+    persistent_agent_id INTEGER,
+    role TEXT NOT NULL,
+    joined_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_members ON workspace_members(workspace_id, role);
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id, workspace_id);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    task_id TEXT,
+    persistent_agent_id INTEGER,
+    auto_jump_in_for_tally INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    archived_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_channels_ws ON channels(workspace_id, kind, archived_at);
+CREATE INDEX IF NOT EXISTS idx_channels_task ON channels(task_id) WHERE task_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS channel_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    member_kind TEXT NOT NULL,
+    user_id TEXT,
+    persistent_agent_id INTEGER,
+    task_agent_id INTEGER,
+    role_override TEXT,
+    joined_at REAL NOT NULL,
+    last_read_message_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_channel_members ON channel_members(channel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id, channel_id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    author_kind TEXT NOT NULL,
+    author_user_id TEXT,
+    author_agent_id INTEGER,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    reply_to_id INTEGER,
+    created_at REAL NOT NULL,
+    edited_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_id_desc ON messages(channel_id, id DESC);
+
+-- Sprint 49: persistent agents — long-lived agent identities that live
+-- inside a workspace and can be triggered by cron schedule or events.
+-- Mirrors the workspace_members.persistent_agent_id FK; this is the
+-- authoritative record.  deleted_at uses soft-delete so history and
+-- channel membership rows can still resolve the agent name after
+-- removal.
+CREATE TABLE IF NOT EXISTS persistent_agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+    name TEXT NOT NULL,
+    role_name TEXT NOT NULL,
+    team_spec_json TEXT NOT NULL,
+    tool_allowlist_json TEXT,
+    model TEXT,
+    cron_schedule TEXT,
+    event_triggers_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at REAL,
+    next_scheduled_run_at REAL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    deleted_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_persistent_agents
+    ON persistent_agents(workspace_id, enabled, next_scheduled_run_at);
+
+-- Sprint 51: workspace-scoped audit log.  Records every privileged
+-- action taken inside a workspace (member invite/kick, channel create/
+-- archive, agent enable/disable, settings change, etc.) so workspace
+-- owners and compliance exports have a tamper-evident history.
+-- actor_kind: 'user' | 'persistent_agent' | 'system'
+-- kind: free-text action verb (e.g. 'member.invite', 'channel.archive')
+-- target_kind / target_id: the entity acted upon (optional)
+-- payload_json: action-specific structured detail
+CREATE TABLE IF NOT EXISTS workspace_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+    actor_user_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target_kind TEXT,
+    target_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_workspace ON workspace_audit_log(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON workspace_audit_log(actor_user_id);
 """
 
 # Sprint 46: credit-based plan config.  Replaces Sprint 33's
@@ -537,6 +674,100 @@ class PushDeviceRequest(BaseModel):
     platform: str | None = None
 
 
+# Sprint 47: channel + message request models.
+
+class ChannelMemberRoleOverrideRequest(BaseModel):
+    role_override: str | None = None  # None to clear, or one of: channel_admin, read_only
+
+
+class ChannelReadRequest(BaseModel):
+    last_read_message_id: int
+
+
+class MessageCreateRequest(BaseModel):
+    text: str | None = None
+    kind: str = "text"  # text | interactive_prompt_response
+    payload: dict | None = None
+    reply_to_id: int | None = None
+
+
+class MessagePatchRequest(BaseModel):
+    text: str | None = None
+    payload: dict | None = None
+
+
+class TaskTeamSpecPatchRequest(BaseModel):
+    team_spec: dict
+
+
+# Sprint 49: persistent_agents request model.
+
+class PersistentAgentCreateRequest(BaseModel):
+    workspace_id: int
+    name: str
+    role_name: str
+    team_spec: dict
+    tool_allowlist: dict | None = None
+    model: str | None = None
+    cron_schedule: str | None = None
+    event_triggers: list[dict] | None = None
+
+
+class PersistentAgentPatchRequest(BaseModel):
+    name: str | None = None
+    team_spec: dict | None = None
+    tool_allowlist: dict | None = None
+    model: str | None = None
+    cron_schedule: str | None = None
+    event_triggers: list[dict] | None = None
+    enabled: bool | None = None
+
+
+class DmCreateRequest(BaseModel):
+    target_kind: str
+    target_id: str | None = None
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+
+
+_VALID_WORKSPACE_ROLES = {"owner", "admin", "manager", "member"}
+
+
+class WorkspaceMemberInviteRequest(BaseModel):
+    user_id: str
+    role: str
+
+
+class WorkspaceMemberRolePatchRequest(BaseModel):
+    role: str
+
+
+class WorkspaceOwnershipTransferRequest(BaseModel):
+    new_owner_user_id: str
+
+
+# Sprint 50: custom channel creation + channel_member CRUD models.
+
+class ChannelMemberSpec(BaseModel):
+    kind: str  # 'human' | 'tally' | 'persistent_agent'
+    id: str | None = None  # user_id or persistent_agent_id; null for tally
+
+
+class CustomChannelCreateRequest(BaseModel):
+    workspace_id: int
+    kind: str  # must be 'custom' in Sprint 50
+    name: str
+    members: list[ChannelMemberSpec]
+
+
+class ChannelMemberAddRequest(BaseModel):
+    member_kind: str
+    user_id: str | None = None
+    persistent_agent_id: int | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -627,7 +858,329 @@ class Db:
                 self._conn.execute(f"ALTER TABLE quotas ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+        # Sprint 47: track which user messages each agent has already seen
+        # so the dispatch path can inject only the new ones.
+        try:
+            self._conn.execute(
+                "ALTER TABLE agents ADD COLUMN last_user_msg_ts REAL NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Sprint 48: track which iteration of a back-edge cycle each agent is on.
+        try:
+            self._conn.execute(
+                "ALTER TABLE agents ADD COLUMN iteration_idx INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Sprint 49: link tasks to the persistent agent that triggered them.
+        # Nullable FK — ad-hoc tasks (no persistent agent) leave this NULL.
+        try:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN persistent_agent_id INTEGER REFERENCES persistent_agents(id)"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_persistent_agent ON tasks(persistent_agent_id)"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # Sprint 50: soft-delete support for workspaces.
+        try:
+            self._conn.execute("ALTER TABLE workspaces ADD COLUMN deleted_at REAL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Sprint 47: backfill workspaces + channels for pre-existing data.
+        # Idempotent — only creates rows when they're missing.
+        self._backfill_workspaces_and_channels()
         self._seed_agent_roles()
+
+    def _backfill_workspaces_and_channels(self) -> None:
+        """Sprint 47: ensure every distinct user_id in tasks/quotas has a
+        workspace + owner membership + a #general channel + a #backlog
+        channel.  Then ensure every existing task has a `task` channel.
+        Idempotent: safe to run on every Db open."""
+        now = time.time()
+        # 1. Discover distinct user_ids that need a workspace.  Sources:
+        #    - tasks.user_id (Sprint 32+)
+        #    - quotas.user_id (Sprint 33+)
+        #    Default user_id 'admin' always gets one (so admin smoke tests
+        #    work on a fresh empty DB).
+        users = {row[0] for row in self._conn.execute(
+            "SELECT DISTINCT user_id FROM tasks WHERE user_id IS NOT NULL"
+        )}
+        users.update(row[0] for row in self._conn.execute(
+            "SELECT DISTINCT user_id FROM quotas WHERE user_id IS NOT NULL"
+        ))
+        users.add("admin")
+        # 2. For each user_id without a workspace, create one + owner membership + general/backlog channels.
+        for user_id in users:
+            existing = self._conn.execute(
+                "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
+            ).fetchone()
+            if existing:
+                continue
+            cur = self._conn.execute(
+                "INSERT INTO workspaces (name, owner_user_id, plan_slug, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (f"{user_id}'s workspace", user_id, "unlimited" if user_id == "admin" else "free", now),
+            )
+            ws_id = cur.lastrowid
+            self._conn.execute(
+                "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+                "VALUES (?, 'human', ?, 'owner', ?)",
+                (ws_id, user_id, now),
+            )
+            for kind, name in (("general", "general"), ("backlog", "backlog")):
+                ch_cur = self._conn.execute(
+                    "INSERT INTO channels (workspace_id, kind, name, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ws_id, kind, name, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                    "VALUES (?, 'human', ?, ?)",
+                    (ch_cur.lastrowid, user_id, now),
+                )
+        # 3. For each existing task row without a task channel, create one.
+        task_rows = self._conn.execute(
+            "SELECT t.id, t.user_id, t.status, t.created_at, t.updated_at "
+            "FROM tasks t LEFT JOIN channels c ON c.task_id=t.id "
+            "WHERE c.id IS NULL AND t.status NOT IN ('proposed', 'cancelled')"
+        ).fetchall()
+        for task_id, user_id, status, created_at, updated_at in task_rows:
+            user_id = user_id or "admin"
+            ws_row = self._conn.execute(
+                "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
+            ).fetchone()
+            if ws_row is None:
+                continue  # shouldn't happen given step 2 ran first
+            archived_at = updated_at if status in ("completed", "failed") else None
+            ch_cur = self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, task_id, created_at, archived_at) "
+                "VALUES (?, 'task', ?, ?, ?, ?)",
+                (ws_row[0], f"task-{task_id[:8]}", task_id, created_at, archived_at),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_cur.lastrowid, user_id, created_at),
+            )
+        # Sprint 49: ensure every workspace has a Tally workspace_member.
+        all_workspace_ids = [r[0] for r in self._conn.execute("SELECT id FROM workspaces").fetchall()]
+        for ws_id in all_workspace_ids:
+            existing = self._conn.execute(
+                "SELECT 1 FROM workspace_members WHERE workspace_id=? AND member_kind='tally'",
+                (ws_id,),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+                    "VALUES (?, 'tally', NULL, 'tally', ?)",
+                    (ws_id, now),
+                )
+        # Sprint 49: add Tally as channel_member of every existing #general / #backlog channel.
+        for ws_id in all_workspace_ids:
+            for kind in ("general", "backlog"):
+                ch_row = self._conn.execute(
+                    "SELECT id FROM channels WHERE workspace_id=? AND kind=?",
+                    (ws_id, kind),
+                ).fetchone()
+                if ch_row is None:
+                    continue
+                channel_id = ch_row[0]
+                existing = self._conn.execute(
+                    "SELECT 1 FROM channel_members WHERE channel_id=? AND member_kind='tally'",
+                    (channel_id,),
+                ).fetchone()
+                if existing is None:
+                    self._conn.execute(
+                        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                        "VALUES (?, 'tally', NULL, ?)",
+                        (channel_id, now),
+                    )
+
+    def create_workspace(self, *, name: str, owner_user_id: str, plan_slug: str = "free") -> int:
+        """Sprint 50: create a workspace + owner + Tally workspace_members
+        + #general / #backlog channels + Tally as channel_member of each.
+        Mirrors what the Sprint 47 backfill does for a single user."""
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO workspaces (name, owner_user_id, plan_slug, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, owner_user_id, plan_slug, now),
+        )
+        ws_id = int(cur.lastrowid or 0)
+        # Owner workspace_member
+        self._conn.execute(
+            "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'human', ?, 'owner', ?)",
+            (ws_id, owner_user_id, now),
+        )
+        # Tally workspace_member
+        self._conn.execute(
+            "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'tally', NULL, 'tally', ?)",
+            (ws_id, now),
+        )
+        # general + backlog channels with owner + Tally as members
+        for kind in ("general", "backlog"):
+            ch_cur = self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (ws_id, kind, kind, now),
+            )
+            ch_id = int(ch_cur.lastrowid or 0)
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_id, owner_user_id, now),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'tally', NULL, ?)",
+                (ch_id, now),
+            )
+        return ws_id
+
+    def list_workspace_members(self, *, workspace_id: int) -> list[dict]:
+        """Sprint 50: list all members of a workspace."""
+        rows = self._conn.execute(
+            "SELECT id, member_kind, user_id, persistent_agent_id, role, joined_at "
+            "FROM workspace_members WHERE workspace_id=? ORDER BY joined_at ASC",
+            (workspace_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "member_kind": r[1],
+                "user_id": r[2],
+                "persistent_agent_id": r[3],
+                "role": r[4],
+                "joined_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def audit_log(
+        self,
+        *,
+        workspace_id: int,
+        actor_user_id: str | None,
+        actor_kind: str = "human",
+        kind: str,
+        target_kind: str | None = None,
+        target_id: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        """Sprint 51: append to workspace_audit_log.  Best-effort —
+        callers wrap in try/except so logging failure doesn't break the request."""
+        self._conn.execute(
+            "INSERT INTO workspace_audit_log "
+            "(workspace_id, actor_user_id, actor_kind, kind, target_kind, target_id, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace_id,
+                actor_user_id or "system",
+                actor_kind,
+                kind,
+                target_kind,
+                target_id,
+                json.dumps(payload or {}),
+                time.time(),
+            ),
+        )
+
+    def list_audit_log(
+        self,
+        *,
+        workspace_id: int,
+        limit: int = 100,
+        before_id: int | None = None,
+        kind: str | None = None,
+        actor_user_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> list[dict]:
+        """Sprint 51 + 52: list audit log entries newest-first with keyset
+        pagination + optional filters (kind/actor_user_id/since/until)."""
+        limit = min(max(1, limit), 500)
+        where = ["workspace_id=?"]
+        params: list = [workspace_id]
+        if before_id is not None:
+            where.append("id < ?")
+            params.append(before_id)
+        if kind is not None:
+            where.append("kind=?")
+            params.append(kind)
+        if actor_user_id is not None:
+            where.append("actor_user_id=?")
+            params.append(actor_user_id)
+        if since is not None:
+            where.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            where.append("created_at < ?")
+            params.append(until)
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT id, workspace_id, actor_user_id, actor_kind, kind, target_kind, target_id, payload_json, created_at "
+            f"FROM workspace_audit_log WHERE {' AND '.join(where)} "
+            f"ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "workspace_id": r[1], "actor_user_id": r[2],
+                "actor_kind": r[3], "kind": r[4],
+                "target_kind": r[5], "target_id": r[6],
+                "payload": json.loads(r[7]) if r[7] else {},
+                "created_at": r[8],
+            }
+            for r in rows
+        ]
+
+    def add_workspace_member(
+        self, *, workspace_id: int, user_id: str, role: str
+    ) -> None:
+        """Sprint 50: add a human user as a workspace_member.
+        Idempotent: silent if (workspace_id, user_id) already exists."""
+        existing = self._conn.execute(
+            "SELECT 1 FROM workspace_members "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, user_id),
+        ).fetchone()
+        if existing:
+            return
+        self._conn.execute(
+            "INSERT INTO workspace_members "
+            "(workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'human', ?, ?, ?)",
+            (workspace_id, user_id, role, time.time()),
+        )
+
+    def update_workspace_member_role(
+        self, *, workspace_id: int, user_id: str, role: str
+    ) -> bool:
+        """Sprint 50: change a human member's role.  Returns True if a
+        row was updated."""
+        cur = self._conn.execute(
+            "UPDATE workspace_members SET role=? "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (role, workspace_id, user_id),
+        )
+        return cur.rowcount > 0
+
+    def remove_workspace_member(self, *, workspace_id: int, user_id: str) -> bool:
+        """Sprint 50: remove a human member.  Returns True if a row was deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM workspace_members "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, user_id),
+        )
+        return cur.rowcount > 0
 
     def _seed_agent_roles(self) -> None:
         """Idempotent seed of the 7-role palette. INSERT OR IGNORE so
@@ -722,6 +1275,7 @@ class Db:
         *,
         user_id: str = "legacy-admin",
         project_id: str | None = None,
+        status: str = "proposed",
     ) -> str:
         """Sprint 23: team_spec can be set atomically with task creation so
         the processor loop never sees a `pending` row without its
@@ -733,15 +1287,51 @@ class Db:
         persistent workspace.  The orchestrator hydrates the first
         agent's seed_files from the project's HEAD artifact set, and
         merges the task's final artifacts back into HEAD on success.
+
+        Sprint 48: tasks default to status='proposed' (no channel).
+        Call approve_task(task_id) to transition to 'pending' and
+        create the task channel + owner channel_member.
         """
         task_id = uuid.uuid4().hex
         now = time.time()
         self._conn.execute(
             "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at, user_id, project_id) "
-            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
-            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, description, status, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
         )
         return task_id
+
+    def approve_task(self, task_id: str) -> None:
+        """Sprint 48: transition a proposed task to pending + create its
+        channel + owner channel_member.  Idempotent: returns silently
+        if the task isn't in 'proposed' state.
+        """
+        row = self._conn.execute(
+            "SELECT status, user_id, created_at FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row[0] != "proposed":
+            return
+        _, user_id, _ = row
+        user_id = user_id or "admin"
+        self._conn.execute(
+            "UPDATE tasks SET status='pending', updated_at=? WHERE id=?",
+            (time.time(), task_id),
+        )
+        ws_row = self._conn.execute(
+            "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
+        ).fetchone()
+        if ws_row is not None:
+            ch_cur = self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, task_id, created_at) "
+                "VALUES (?, 'task', ?, ?, ?)",
+                (ws_row[0], f"task-{task_id[:8]}", task_id, time.time()),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_cur.lastrowid, user_id, time.time()),
+            )
 
     def get_task(self, task_id: str, *, user_id: str | None = None) -> dict | None:
         """Sprint 32: when user_id is given (non-admin path), the task
@@ -800,12 +1390,24 @@ class Db:
             "UPDATE tasks SET status='completed', result_json=?, updated_at=? WHERE id=?",
             (json.dumps(result), time.time(), task_id),
         )
+        # Sprint 49 A13: reset persistent agent failure counter on success.
+        pa_row = self._conn.execute(
+            "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if pa_row and pa_row[0]:
+            self.reset_persistent_agent_failures(pa_row[0])
 
     def mark_failed(self, task_id: str, error: str) -> None:
         self._conn.execute(
             "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=?",
             (error, time.time(), task_id),
         )
+        # Sprint 49 A13: bump persistent agent failure counter on failure.
+        pa_row = self._conn.execute(
+            "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if pa_row and pa_row[0]:
+            self.bump_persistent_agent_failure(pa_row[0])
 
     def recover_stuck_running(self, _error_unused: str = "") -> int:
         """Move every status='running' row to status='recovering' so the
@@ -843,7 +1445,15 @@ class Db:
             "WHERE id=? AND status IN ('recovering','running')",
             (json.dumps(result), time.time(), task_id),
         )
-        return (cursor.rowcount or 0) > 0
+        updated = (cursor.rowcount or 0) > 0
+        # Sprint 49 A13: reset persistent agent failure counter on recovery→completed.
+        if updated:
+            pa_row = self._conn.execute(
+                "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if pa_row and pa_row[0]:
+                self.reset_persistent_agent_failures(pa_row[0])
+        return updated
 
     def sweep_recovering(self, older_than_seconds: float, error: str) -> list[str]:
         """Demote any `recovering` row older than `older_than_seconds`
@@ -856,7 +1466,7 @@ class Db:
         in flight; a typical OpenHands task is ~30s so 5min is plenty."""
         cutoff = time.time() - older_than_seconds
         rows = self._conn.execute(
-            "SELECT id FROM tasks WHERE status='recovering' AND updated_at < ?",
+            "SELECT id, persistent_agent_id FROM tasks WHERE status='recovering' AND updated_at < ?",
             (cutoff,),
         ).fetchall()
         demoted_ids = [r[0] for r in rows]
@@ -867,6 +1477,10 @@ class Db:
                 f"WHERE id IN ({placeholders})",
                 [error, time.time(), *demoted_ids],
             )
+            # Sprint 49 A13: bump failure counter for each persistent-agent-owned task.
+            for task_id, pa_id in rows:
+                if pa_id:
+                    self.bump_persistent_agent_failure(pa_id)
         return demoted_ids
 
     # ── Sprint 22: agent palette + per-task agent instances ──────────────
@@ -1057,7 +1671,7 @@ class Db:
     def list_agents(self, task_id: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT id, task_id, agent_idx, role, model, spec, status, "
-            "result_json, worker_identity, started_at, finished_at "
+            "result_json, worker_identity, started_at, finished_at, last_user_msg_ts "
             "FROM agents WHERE task_id=? ORDER BY agent_idx",
             (task_id,),
         ).fetchall()
@@ -1068,6 +1682,7 @@ class Db:
                 "result": json.loads(r[7]) if r[7] else None,
                 "worker_identity": r[8],
                 "started_at": r[9], "finished_at": r[10],
+                "last_user_msg_ts": r[11] if r[11] is not None else 0.0,
             }
             for r in rows
         ]
@@ -1479,6 +2094,245 @@ class Db:
             (project_id,),
         ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ── Sprint 49: persistent agents ────────────────────────────────────────
+
+    def create_persistent_agent(
+        self,
+        *,
+        workspace_id: int,
+        name: str,
+        role_name: str,
+        team_spec: dict,
+        tool_allowlist: dict | None = None,
+        model: str | None = None,
+        cron_schedule: str | None = None,
+        event_triggers: list[dict] | None = None,
+    ) -> int:
+        """Sprint 49: create a persistent agent + its scheduled_agent channel
+        + owner & Tally channel_members.  Computes next_scheduled_run_at
+        from `cron_schedule` if provided."""
+        now = time.time()
+        next_run: float | None = None
+        if cron_schedule:
+            from croniter import croniter
+            next_run = float(croniter(cron_schedule, now).get_next(float))
+        cur = self._conn.execute(
+            "INSERT INTO persistent_agents "
+            "(workspace_id, name, role_name, team_spec_json, tool_allowlist_json, "
+            " model, cron_schedule, event_triggers_json, next_scheduled_run_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace_id, name, role_name,
+                json.dumps(team_spec),
+                json.dumps(tool_allowlist) if tool_allowlist else None,
+                model,
+                cron_schedule,
+                json.dumps(event_triggers or []),
+                next_run,
+                now,
+            ),
+        )
+        pid = int(cur.lastrowid or 0)
+        ch_cur = self._conn.execute(
+            "INSERT INTO channels (workspace_id, kind, name, persistent_agent_id, created_at) "
+            "VALUES (?, 'scheduled_agent', ?, ?, ?)",
+            (workspace_id, name, pid, now),
+        )
+        channel_id = ch_cur.lastrowid
+        owner_row = self._conn.execute(
+            "SELECT owner_user_id FROM workspaces WHERE id=?", (workspace_id,)
+        ).fetchone()
+        if owner_row:
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (channel_id, owner_row[0], now),
+            )
+        self._conn.execute(
+            "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+            "VALUES (?, 'tally', NULL, ?)",
+            (channel_id, now),
+        )
+        return pid
+
+    def list_persistent_agents(self, *, workspace_id: int) -> list[dict]:
+        """Sprint 49: list active (non-deleted) persistent agents."""
+        rows = self._conn.execute(
+            "SELECT id, workspace_id, name, role_name, team_spec_json, "
+            "tool_allowlist_json, model, cron_schedule, event_triggers_json, "
+            "enabled, last_run_at, next_scheduled_run_at, consecutive_failures, "
+            "created_at "
+            "FROM persistent_agents "
+            "WHERE workspace_id=? AND deleted_at IS NULL "
+            "ORDER BY created_at DESC",
+            (workspace_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "workspace_id": r[1], "name": r[2], "role_name": r[3],
+                "team_spec": json.loads(r[4]) if r[4] else {},
+                "tool_allowlist": json.loads(r[5]) if r[5] else None,
+                "model": r[6], "cron_schedule": r[7],
+                "event_triggers": json.loads(r[8]) if r[8] else [],
+                "enabled": bool(r[9]),
+                "last_run_at": r[10], "next_scheduled_run_at": r[11],
+                "consecutive_failures": r[12], "created_at": r[13],
+            })
+        return out
+
+    def get_persistent_agent(self, pid: int) -> dict | None:
+        """Sprint 49: fetch a single persistent agent by id (including deleted)."""
+        r = self._conn.execute(
+            "SELECT id, workspace_id, name, role_name, team_spec_json, "
+            "tool_allowlist_json, model, cron_schedule, event_triggers_json, "
+            "enabled, last_run_at, next_scheduled_run_at, consecutive_failures, "
+            "created_at, deleted_at "
+            "FROM persistent_agents WHERE id=?",
+            (pid,),
+        ).fetchone()
+        if r is None:
+            return None
+        return {
+            "id": r[0], "workspace_id": r[1], "name": r[2], "role_name": r[3],
+            "team_spec": json.loads(r[4]) if r[4] else {},
+            "tool_allowlist": json.loads(r[5]) if r[5] else None,
+            "model": r[6], "cron_schedule": r[7],
+            "event_triggers": json.loads(r[8]) if r[8] else [],
+            "enabled": bool(r[9]),
+            "last_run_at": r[10], "next_scheduled_run_at": r[11],
+            "consecutive_failures": r[12], "created_at": r[13],
+            "deleted_at": r[14],
+        }
+
+    def update_persistent_agent(self, pid: int, *, patch: dict) -> None:
+        """Sprint 49: partial update.  Recomputes next_scheduled_run_at if
+        cron_schedule changed.  Acceptable fields: name, team_spec,
+        tool_allowlist, model, cron_schedule, event_triggers, enabled."""
+        allowed = {
+            "name", "team_spec", "tool_allowlist", "model",
+            "cron_schedule", "event_triggers", "enabled",
+        }
+        sets: list[str] = []
+        params: list = []
+        for key, val in patch.items():
+            if key not in allowed:
+                continue
+            if key == "team_spec":
+                sets.append("team_spec_json=?")
+                params.append(json.dumps(val))
+            elif key == "tool_allowlist":
+                sets.append("tool_allowlist_json=?")
+                params.append(json.dumps(val) if val else None)
+            elif key == "event_triggers":
+                sets.append("event_triggers_json=?")
+                params.append(json.dumps(val or []))
+            else:
+                sets.append(f"{key}=?")
+                params.append(val)
+        if "cron_schedule" in patch and patch["cron_schedule"]:
+            from croniter import croniter
+            next_run = float(croniter(patch["cron_schedule"], time.time()).get_next(float))
+            sets.append("next_scheduled_run_at=?")
+            params.append(next_run)
+        if not sets:
+            return
+        params.append(pid)
+        self._conn.execute(
+            f"UPDATE persistent_agents SET {', '.join(sets)} WHERE id=?",
+            tuple(params),
+        )
+
+    def delete_persistent_agent(self, pid: int) -> None:
+        """Sprint 49: soft delete the persistent agent.
+        Sprint 51: also archive its scheduled_agent channel."""
+        now = time.time()
+        self._conn.execute(
+            "UPDATE persistent_agents SET deleted_at=?, enabled=0 WHERE id=?",
+            (now, pid),
+        )
+        # Sprint 51: archive the scheduled_agent channel (idempotent: only updates active channels)
+        self._conn.execute(
+            "UPDATE channels SET archived_at=? "
+            "WHERE persistent_agent_id=? AND archived_at IS NULL",
+            (now, pid),
+        )
+
+    # ── Sprint 49 A13: auto-pause on consecutive failures ──────────────────
+
+    PERMANENT_FAILURE_DM_TEMPLATE = (
+        "@{owner} — {agent_name} has failed 3 times in a row. I've paused it. "
+        "See #{channel_name} for the failures. Enable again from settings."
+    )
+
+    def bump_persistent_agent_failure(self, pid: int) -> None:
+        """Sprint 49 A13: increment consecutive_failures; at 3, disable the
+        agent + emit the permanent-failure Tally DM.
+
+        Example::
+
+            db.bump_persistent_agent_failure(pid)
+        """
+        row = self._conn.execute(
+            "SELECT consecutive_failures, workspace_id, name FROM persistent_agents WHERE id=?",
+            (pid,),
+        ).fetchone()
+        if row is None:
+            return
+        new_count = (row[0] or 0) + 1
+        workspace_id, name = row[1], row[2]
+        if new_count >= 3:
+            self._conn.execute(
+                "UPDATE persistent_agents SET consecutive_failures=?, enabled=0 WHERE id=?",
+                (new_count, pid),
+            )
+            owner_row = self._conn.execute(
+                "SELECT owner_user_id FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone()
+            sa_ch_row = self._conn.execute(
+                "SELECT name FROM channels WHERE persistent_agent_id=? AND kind='scheduled_agent'",
+                (pid,),
+            ).fetchone()
+            if owner_row and sa_ch_row:
+                from .channels import ensure_dm_channel, insert_message
+                dm_ch = ensure_dm_channel(
+                    self, workspace_id=workspace_id,
+                    kind_a="human", id_a=owner_row[0],
+                    kind_b="tally", id_b=None,
+                )
+                text = self.PERMANENT_FAILURE_DM_TEMPLATE.format(
+                    owner=owner_row[0], agent_name=name, channel_name=sa_ch_row[0],
+                )
+                insert_message(
+                    self, channel_id=dm_ch, author_kind="tally", kind="text",
+                    payload={"text": text},
+                )
+            try:
+                self.audit_log(
+                    workspace_id=workspace_id, actor_user_id=None, actor_kind="system",
+                    kind="persistent_agent_auto_paused",
+                    target_kind="persistent_agent", target_id=str(pid),
+                    payload={"name": name, "consecutive_failures": new_count},
+                )
+            except Exception:
+                pass  # best-effort; never break the bump
+        else:
+            self._conn.execute(
+                "UPDATE persistent_agents SET consecutive_failures=? WHERE id=?",
+                (new_count, pid),
+            )
+
+    def reset_persistent_agent_failures(self, pid: int) -> None:
+        """Sprint 49 A13: reset consecutive_failures to 0 on task success.
+
+        Example::
+
+            db.reset_persistent_agent_failures(pid)
+        """
+        self._conn.execute(
+            "UPDATE persistent_agents SET consecutive_failures=0 WHERE id=?", (pid,)
+        )
 
     # ── Sprint 39: LLM cost accounting ─────────────────────────────────────
 
@@ -2045,6 +2899,80 @@ def _resolve_stages(raw: Any, n_agents: int) -> list[list[int]]:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Sprint 50: per-node tool allowlist helper
+# ---------------------------------------------------------------------------
+
+def _effective_tools_for_node(role_tools: list[str], node_allowlist: list[str] | None) -> list[str]:
+    """Sprint 50: intersect a role's allowed tools with a node's optional
+    allowlist.  None allowlist = use all role tools; [] allowlist =
+    deliberately no tools.  Output preserves role_tools order."""
+    if node_allowlist is None:
+        return list(role_tools)
+    allowed_set = set(node_allowlist)
+    return [t for t in role_tools if t in allowed_set]
+
+
+# ---------------------------------------------------------------------------
+# Sprint 48: nodes_v1 graph-traversal helpers
+# ---------------------------------------------------------------------------
+
+def _nodes_v1_entry_nodes(spec: dict) -> set[str]:
+    """Sprint 48: return the set of node ids with no incoming edge
+    (entry points dispatched first in nodes_v1 mode)."""
+    all_ids = {n["id"] for n in spec.get("nodes", [])}
+    targets = {e["to"] for e in spec.get("edges", [])}
+    return all_ids - targets
+
+
+def _nodes_v1_next_ready(spec: dict, completed: dict[str, str]) -> set[str]:
+    """Sprint 48: return node ids that are NOT yet completed but whose
+    incoming edges have all fired given the ``completed`` map
+    ``{node_id: 'succeeded'|'failed'}``.
+
+    Edge firing rules:
+      - ``'always'`` (default): fires when source completes regardless of status
+      - ``'if_succeeded'``: fires only if source status == ``'succeeded'``
+      - ``'if_failed'``: fires only if source status == ``'failed'``
+      - ``'if_returned'``: Sprint 48 parses but doesn't evaluate (deferred)
+
+    A node becomes ready when ALL its incoming edges have fired
+    (AND semantics across incoming edges).
+    """
+    ready: set[str] = set()
+    completed_ids = set(completed.keys())
+    for node in spec.get("nodes", []):
+        nid = node["id"]
+        if nid in completed_ids:
+            continue
+        incoming = [e for e in spec.get("edges", []) if e["to"] == nid]
+        if not incoming:
+            continue  # entry node — caller dispatches separately
+        all_fired = True
+        for edge in incoming:
+            src = edge["from"]
+            if src not in completed:
+                all_fired = False
+                break
+            condition = edge.get("condition", "always")
+            src_status = completed[src]
+            if condition == "always":
+                pass
+            elif condition == "if_succeeded" and src_status != "succeeded":
+                all_fired = False
+                break
+            elif condition == "if_failed" and src_status != "failed":
+                all_fired = False
+                break
+            elif condition == "if_returned":
+                # Sprint 48 parses but doesn't evaluate — deferred to Sprint 48.5
+                all_fired = False
+                break
+        if all_fired:
+            ready.add(nid)
+    return ready
+
+
 class EventBus:
     """In-memory per-task subscriber lists, used to push events to SSE clients
     the moment they're persisted (instead of forcing the client to poll the DB).
@@ -2398,7 +3326,71 @@ class Orchestrator:
         stages: `team_spec["stages"]` is `list[list[int]]`; every agent
         in stage N runs concurrently, the next stage starts when stage N
         is fully complete.
+
+        Sprint 48: when ``team_spec`` is nodes_v1 format (``"nodes"`` +
+        ``"edges"`` keys), use graph-traversal helpers to identify entry
+        nodes and dispatch them.  The advancement logic lives in
+        ``_handle_result_event``'s nodes_v1 branch.
         """
+        from .team_spec_compat import is_nodes_v1
+
+        # ---------------------------------------------------------------
+        # Sprint 48: nodes_v1 dispatch path
+        # ---------------------------------------------------------------
+        if is_nodes_v1(team_spec):
+            nodes = team_spec.get("nodes", [])
+            # Filter to dispatchable (agent-kind) nodes only.
+            agent_nodes = [n for n in nodes if n.get("kind", "agent") == "agent"]
+            if not agent_nodes:
+                self.db.mark_failed(task["id"], "nodes_v1 team_spec has no agent nodes")
+                await self._publish_status(task["id"], "failed",
+                                           {"error": "nodes_v1 team_spec has no agent nodes"})
+                return
+            owner_id = task.get("user_id")
+            role_scope = owner_id if owner_id and owner_id not in ("admin", "legacy-admin") else None
+            # Insert ALL agent nodes up-front so the team shape is visible
+            # in /admin/status.  Each node's list-index becomes agent_idx.
+            for idx, node in enumerate(nodes):
+                if node.get("kind", "agent") != "agent":
+                    continue  # skip output / terminal marker nodes
+                role_name = node.get("role")
+                role = self.db.get_agent_role(role_name, user_id=role_scope)
+                if not role:
+                    self.db.mark_failed(task["id"], f"unknown role: {role_name}")
+                    await self._publish_status(task["id"], "failed",
+                                               {"error": f"unknown role: {role_name}"})
+                    return
+                self.db.insert_agent(
+                    task_id=task["id"],
+                    agent_idx=idx,
+                    role=role_name,
+                    model=node.get("model") or role["default_model"],
+                    spec=node.get("spec", ""),
+                )
+            self.db.mark_running(task["id"])
+            await self._publish_status(task["id"], "running", {"team_size": len(agent_nodes)})
+            # Determine entry nodes (those with no incoming edge).
+            entry_ids = _nodes_v1_entry_nodes(team_spec)
+            all_agents = self.db.list_agents(task["id"])
+            by_idx = {a["agent_idx"]: a for a in all_agents}
+            # Map node_id → agent_idx for dispatch.
+            node_id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
+            entry_agents = [
+                by_idx[node_id_to_idx[nid]]
+                for nid in entry_ids
+                if nid in node_id_to_idx and node_id_to_idx[nid] in by_idx
+            ]
+            logger.info(
+                "starting nodes_v1 team for task %s: %d agent nodes, entries = [%s]",
+                task["id"][:8], len(agent_nodes),
+                ", ".join(a["role"] for a in entry_agents),
+            )
+            for agent in entry_agents:
+                asyncio.create_task(self._dispatch_agent(task, agent))
+            return
+        # ---------------------------------------------------------------
+        # Flat (Sprint 22-27) dispatch path
+        # ---------------------------------------------------------------
         agents_spec = team_spec.get("agents", []) or []
         if not agents_spec:
             self.db.mark_failed(task["id"], "team_spec has no agents")
@@ -2512,6 +3504,48 @@ class Orchestrator:
                         task["id"][:8], agent["agent_idx"], agent["role"],
                         agent["model"], handle.identity[:8])
             try:
+                # Sprint 47: pull any user messages posted in the task channel
+                # since the last agent step; prepend to this agent's spec so the
+                # LLM sees them as teammate input.  Persists the new
+                # last_user_msg_ts so subsequent steps don't re-include them.
+                from .channels import resolve_task_channel_id, fetch_user_messages_since
+                agent_spec_text = agent["spec"] or ""
+                ch_id = resolve_task_channel_id(self.db, task["id"])
+                if ch_id is not None:
+                    since_ts = float(agent.get("last_user_msg_ts") or 0)
+                    user_msgs = fetch_user_messages_since(
+                        self.db, channel_id=ch_id, since_ts=since_ts,
+                    )
+                    if user_msgs:
+                        intervention_block = "\n\n## User intervention (since last step)\n" + "\n".join(
+                            f"- @{m['author_user_id']}: {m['text']}" for m in user_msgs
+                        )
+                        agent_spec_text = agent_spec_text + intervention_block
+                        self.db._conn.execute(
+                            "UPDATE agents SET last_user_msg_ts=? WHERE id=?",
+                            (user_msgs[-1]["created_at"], agent["id"]),
+                        )
+                # Sprint 50: per-node tool_allowlist intersects with role tools.
+                # nodes_v1: look up the nth agent-kind node; flat: look up
+                # agents[agent_idx].  None allowlist = full role tools.
+                node_allowlist: list[str] | None = None
+                try:
+                    from .team_spec_compat import is_nodes_v1
+                    if is_nodes_v1(team_spec):
+                        agent_nodes = [n for n in team_spec.get("nodes", []) if n.get("kind") == "agent"]
+                        if 0 <= agent_idx < len(agent_nodes):
+                            raw = agent_nodes[agent_idx].get("tool_allowlist")
+                            if isinstance(raw, list):
+                                node_allowlist = [str(t) for t in raw]
+                    else:
+                        agents_flat = team_spec.get("agents") or []
+                        if 0 <= agent_idx < len(agents_flat):
+                            raw = agents_flat[agent_idx].get("tool_allowlist")
+                            if isinstance(raw, list):
+                                node_allowlist = [str(t) for t in raw]
+                except Exception:
+                    node_allowlist = None
+                effective_tools = _effective_tools_for_node(role.get("tools", []), node_allowlist)
                 payload_obj = {
                     "task": task["description"],
                     "task_id": task["id"],
@@ -2520,9 +3554,9 @@ class Orchestrator:
                     "agent_spec": {
                         "role": agent["role"],
                         "model": agent["model"],
-                        "spec": agent["spec"],
+                        "spec": agent_spec_text,
                         "system_prompt": role.get("system_prompt", ""),
-                        "tools": role.get("tools", []),
+                        "tools": effective_tools,
                     },
                     # Sprint 26: hand the agent its predecessors' files.
                     # Empty on the first agent in a team.
@@ -3051,48 +4085,136 @@ class Orchestrator:
             # Cost cap is safety, not feature — never crash the
             # orchestrator if accounting fails.
             logger.warning("cost cap check failed for task %s: %s", task_id[:8], exc)
-        # Sprint 27: stage-aware advancement. The agent we just finished
-        # is in some stage; only advance to the *next* stage when EVERY
-        # agent in this stage has reached a terminal status. Sequential
-        # workflows collapse to one-agent-per-stage and behave identically
-        # to Sprint 22.
+        # Sprint 27 / 48: stage-aware (flat) or graph-aware (nodes_v1) advancement.
         task = self.db.get_task(task_id)
         if task is None:
             logger.error("task %s gone before stage advance", task_id[:8])
             return
         team_spec = task.get("team_spec") or {}
-        stages = _resolve_stages(team_spec.get("stages"), len(agents))
-        cur_stage_idx = next(
-            (i for i, stage in enumerate(stages) if agent_idx in stage),
-            None,
-        )
-        if cur_stage_idx is None:
-            logger.warning("task %s agent %d not in any stage; assuming sequential tail",
-                           task_id[:8], agent_idx)
-            cur_stage_idx = len(stages) - 1
-        # Refresh agents — this agent's status changed inside this handler.
-        fresh = self.db.list_agents(task_id)
-        by_idx = {a["agent_idx"]: a for a in fresh}
-        cur_stage = stages[cur_stage_idx]
-        stage_pending = [
-            i for i in cur_stage
-            if by_idx.get(i, {}).get("status") not in ("completed", "failed")
-        ]
-        if stage_pending:
-            logger.debug("task %s stage %d still has pending: %s",
-                         task_id[:8], cur_stage_idx, stage_pending)
-            return  # other agents in this stage still running
-        # Stage complete; dispatch the next one if any.
-        next_stage_idx = cur_stage_idx + 1
-        if next_stage_idx < len(stages):
-            next_stage_indices = stages[next_stage_idx]
-            next_agents = [by_idx[i] for i in next_stage_indices if by_idx.get(i)]
-            logger.info("task %s stage %d → %d: dispatching [%s]",
-                        task_id[:8], cur_stage_idx, next_stage_idx,
-                        ", ".join(a["role"] for a in next_agents))
-            for a in next_agents:
-                asyncio.create_task(self._dispatch_agent(task, a))
-            return
+
+        # -------------------------------------------------------------------
+        # Sprint 48: nodes_v1 advancement path
+        # -------------------------------------------------------------------
+        from .team_spec_compat import is_nodes_v1
+        if is_nodes_v1(team_spec):
+            fresh = self.db.list_agents(task_id)
+            by_idx = {a["agent_idx"]: a for a in fresh}
+            nodes = team_spec.get("nodes", [])
+            # Build completed map: {node_id -> 'succeeded'|'failed'}.
+            # agent_idx == the node's index in the nodes list.
+            completed_map: dict[str, str] = {}
+            for a in fresh:
+                idx = a["agent_idx"]
+                if 0 <= idx < len(nodes) and a["status"] in ("completed", "failed"):
+                    node_id = nodes[idx]["id"]
+                    completed_map[node_id] = (
+                        "succeeded" if a["status"] == "completed" else "failed"
+                    )
+            # Find newly-ready nodes (all completed agent nodes whose
+            # edges have fired, excluding output/terminal nodes).
+            ready_ids = _nodes_v1_next_ready(team_spec, completed_map)
+            # Also exclude already-dispatched nodes (pending/running/done).
+            dispatched_idxs = {a["agent_idx"] for a in fresh}
+            node_id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
+            to_dispatch = [
+                nid for nid in ready_ids
+                if (
+                    nid in node_id_to_idx
+                    and nodes[node_id_to_idx[nid]].get("kind", "agent") == "agent"
+                    and node_id_to_idx[nid] not in dispatched_idxs
+                )
+            ]
+            if to_dispatch:
+                for nid in to_dispatch:
+                    a_idx = node_id_to_idx[nid]
+                    agent_row = by_idx.get(a_idx)
+                    if agent_row is None:
+                        # Insert the agent row on first dispatch (lazy init).
+                        node = nodes[a_idx]
+                        role_name = node.get("role")
+                        owner_id = task.get("user_id")
+                        role_scope = (
+                            owner_id
+                            if owner_id and owner_id not in ("admin", "legacy-admin")
+                            else None
+                        )
+                        role = self.db.get_agent_role(role_name, user_id=role_scope) or {}
+                        self.db.insert_agent(
+                            task_id=task_id,
+                            agent_idx=a_idx,
+                            role=role_name or "unknown",
+                            model=node.get("model") or role.get("default_model", "unknown"),
+                            spec=node.get("spec", ""),
+                        )
+                        fresh2 = self.db.list_agents(task_id)
+                        by_idx = {a["agent_idx"]: a for a in fresh2}
+                        agent_row = by_idx.get(a_idx)
+                    if agent_row:
+                        logger.info(
+                            "task %s nodes_v1: dispatching next node %s (%s)",
+                            task_id[:8], nid, agent_row["role"],
+                        )
+                        asyncio.create_task(self._dispatch_agent(task, agent_row))
+                return
+            # No new nodes to dispatch.  Check if all agent nodes are terminal.
+            agent_node_idxs = [
+                i for i, n in enumerate(nodes)
+                if n.get("kind", "agent") == "agent"
+            ]
+            all_terminal = all(
+                by_idx.get(i, {}).get("status") in ("completed", "failed")
+                for i in agent_node_idxs
+            )
+            if not all_terminal:
+                # Some agent nodes are still running / pending — wait.
+                logger.debug(
+                    "task %s nodes_v1: waiting on %d more agent node(s)",
+                    task_id[:8],
+                    sum(
+                        1 for i in agent_node_idxs
+                        if by_idx.get(i, {}).get("status") not in ("completed", "failed")
+                    ),
+                )
+                return
+            # Fall through to task-completion aggregation below.
+
+        else:
+            # ---------------------------------------------------------------
+            # Sprint 27: flat stage-aware advancement (unchanged)
+            # ---------------------------------------------------------------
+            stages = _resolve_stages(team_spec.get("stages"), len(agents))
+            cur_stage_idx = next(
+                (i for i, stage in enumerate(stages) if agent_idx in stage),
+                None,
+            )
+            if cur_stage_idx is None:
+                logger.warning("task %s agent %d not in any stage; assuming sequential tail",
+                               task_id[:8], agent_idx)
+                cur_stage_idx = len(stages) - 1
+            # Refresh agents — this agent's status changed inside this handler.
+            fresh = self.db.list_agents(task_id)
+            by_idx = {a["agent_idx"]: a for a in fresh}
+            cur_stage = stages[cur_stage_idx]
+            stage_pending = [
+                i for i in cur_stage
+                if by_idx.get(i, {}).get("status") not in ("completed", "failed")
+            ]
+            if stage_pending:
+                logger.debug("task %s stage %d still has pending: %s",
+                             task_id[:8], cur_stage_idx, stage_pending)
+                return  # other agents in this stage still running
+            # Stage complete; dispatch the next one if any.
+            next_stage_idx = cur_stage_idx + 1
+            if next_stage_idx < len(stages):
+                next_stage_indices = stages[next_stage_idx]
+                next_agents = [by_idx[i] for i in next_stage_indices if by_idx.get(i)]
+                logger.info("task %s stage %d → %d: dispatching [%s]",
+                            task_id[:8], cur_stage_idx, next_stage_idx,
+                            ", ".join(a["role"] for a in next_agents))
+                for a in next_agents:
+                    asyncio.create_task(self._dispatch_agent(task, a))
+                return
+
         # All agents done — task is complete. Aggregate results.
         final_agents = self.db.list_agents(task_id)
         aggregate = {
@@ -3310,6 +4432,90 @@ class Orchestrator:
         task = self.pollers.pop(team_id, None)
         if task is not None:
             task.cancel()
+
+    async def _fire_persistent_agent(self, pid: int, *, trigger: str) -> str | None:
+        """Sprint 49: create a tasks row + dispatch.  Returns task_id or
+        None if the agent is disabled / deleted / missing.  trigger is
+        one of 'cron', 'webhook', 'manual'."""
+        agent = self.db.get_persistent_agent(pid)
+        if agent is None or agent.get("deleted_at") or not agent.get("enabled"):
+            return None
+        task_id = uuid.uuid4().hex
+        now = time.time()
+        # Get the workspace owner as the task's user_id
+        owner_row = self.db._conn.execute(
+            "SELECT owner_user_id FROM workspaces WHERE id=?", (agent["workspace_id"],)
+        ).fetchone()
+        owner = owner_row[0] if owner_row else "admin"
+        self.db._conn.execute(
+            "INSERT INTO tasks (id, description, team_spec, status, "
+            "persistent_agent_id, user_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (
+                task_id,
+                f"[persistent: {agent['name']}] {trigger} fire",
+                json.dumps(agent["team_spec"]),
+                pid,
+                owner,
+                now,
+                now,
+            ),
+        )
+        logger.info(
+            "persistent agent %s (%s) fired via %s -> task %s",
+            pid, agent["name"], trigger, task_id[:8],
+        )
+        # Worker poller picks up status='pending' on its next tick.  Kick if available.
+        if hasattr(self, "_kick_poller"):
+            try:
+                asyncio.create_task(self._kick_poller())
+            except Exception:
+                pass
+        return task_id
+
+    async def _persistent_agents_tick(self) -> None:
+        """Sprint 49: one iteration of the persistent-agents cron poll.
+        Factored out so tests can call a single tick without the loop."""
+        now = time.time()
+        rows = self.db._conn.execute(
+            "SELECT id, cron_schedule FROM persistent_agents "
+            "WHERE enabled=1 AND deleted_at IS NULL "
+            "AND cron_schedule IS NOT NULL "
+            "AND next_scheduled_run_at IS NOT NULL "
+            "AND next_scheduled_run_at <= ?",
+            (now,),
+        ).fetchall()
+        from croniter import croniter
+        for agent_id, cron in rows:
+            try:
+                await self._fire_persistent_agent(agent_id, trigger="cron")
+            except Exception as exc:
+                logger.exception("persistent agent %s fire failed: %s", agent_id, exc)
+            try:
+                next_fire = float(croniter(cron, now).get_next(float))
+            except Exception as exc:
+                logger.error(
+                    "invalid cron %r for agent %s: %s; disabling", cron, agent_id, exc
+                )
+                self.db._conn.execute(
+                    "UPDATE persistent_agents SET enabled=0 WHERE id=?",
+                    (agent_id,),
+                )
+                continue
+            self.db._conn.execute(
+                "UPDATE persistent_agents SET last_run_at=?, next_scheduled_run_at=? WHERE id=?",
+                (now, next_fire, agent_id),
+            )
+
+    async def _persistent_agents_loop(self) -> None:
+        """Sprint 49: cron poller for persistent agents.  Runs every 30s
+        until self._stopping is True."""
+        while not self._stopping:
+            try:
+                await self._persistent_agents_tick()
+            except Exception as exc:
+                logger.exception("persistent_agents_loop iteration failed: %s", exc)
+            await asyncio.sleep(30)
 
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
@@ -3795,10 +5001,15 @@ async def lifespan(app: FastAPI):
     )
     backup_task = asyncio.create_task(run_nightly_backup())  # Sprint 24.5
     state["backup_task"] = backup_task
+    # Sprint 49: cron poller fires due persistent agents every 30s.
+    orchestrator._stopping = False
+    state["persistent_agents_task"] = asyncio.create_task(
+        orchestrator._persistent_agents_loop()
+    )
     state["pool_bootstrap_task"] = asyncio.create_task(_bootstrap_pool_in_background())
     logger.info(
-        "HTTP up; sweeper + nightly backup started; pool bootstrap kicked off "
-        "in background (target=%d)",
+        "HTTP up; sweeper + nightly backup + persistent-agents cron started; "
+        "pool bootstrap kicked off in background (target=%d)",
         target_pool_size,
     )
     try:
@@ -3809,7 +5020,8 @@ async def lifespan(app: FastAPI):
         # Sprint 35: processor_task only exists after pool bootstrap; the
         # bootstrap task itself might still be in flight if shutdown
         # arrives during a redeploy window.  Cancel whatever's set.
-        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task"):
+        orchestrator._stopping = True
+        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task", "persistent_agents_task"):
             t = state.get(key)
             if t is None:
                 continue
@@ -4268,6 +5480,28 @@ async def submit_task(
             task_id[:8], body.parent_task_id[:8],
         )
     db.increment_task_count(user.id)
+    # Sprint 48 A6: insert a team_proposal message in the user's #general
+    # channel so the Discord-shaped UI can show the proposed team and let
+    # the user approve/edit/cancel before any agent is dispatched.
+    # team_spec may be None when the client omits it and redpill is off;
+    # only insert the proposal when there is a team to propose.
+    if team_spec is not None:
+        from .channels import insert_team_proposal_message
+        msg_id = insert_team_proposal_message(
+            db,
+            task_id=task_id,
+            user_id=user.id,
+            description=body.description,
+            team_spec=team_spec,
+        )
+        if msg_id > 0:
+            row = db._conn.execute(
+                "SELECT channel_id FROM messages WHERE id=?", (msg_id,)
+            ).fetchone()
+            if row:
+                t = asyncio.create_task(_broadcast_new_message(row[0], msg_id))
+                _background_tasks.add(t)
+                t.add_done_callback(_background_tasks.discard)
     task = db.get_task(task_id)
     # Enrich the response with the parent/children edges so the
     # Flutter shell can render the relationship without an extra round
@@ -4291,6 +5525,136 @@ async def get_task(
     task["parent_task_id"] = db.get_parent_task_id(task_id)
     task["child_task_ids"] = db.list_child_task_ids(task_id)
     return TaskResponse(**task)
+
+
+@app.post("/tasks/{task_id}/approve")
+async def approve_task_route(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: transition a proposed task to pending + dispatch.
+    Owner-only.  409 on repeat (status already non-proposed)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can approve")
+    if status != "proposed":
+        raise HTTPException(409, f"task is not in 'proposed' state (current: {status})")
+    db.approve_task(task_id)
+    # Worker poller picks up status='pending' on its next tick.
+    # If the orchestrator has an explicit kick method, use it for lower latency.
+    orch = state.get("orchestrator")
+    if orch is not None and hasattr(orch, "_kick_poller"):
+        try:
+            asyncio.create_task(orch._kick_poller())
+        except Exception:
+            pass  # kick is best-effort
+    new_row = db._conn.execute(
+        "SELECT id, status, team_spec FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    return {
+        "id": new_row[0],
+        "status": new_row[1],
+        "team_spec": json.loads(new_row[2]) if new_row[2] else None,
+    }
+
+
+@app.patch("/tasks/{task_id}/team_spec")
+async def patch_task_team_spec(
+    task_id: str,
+    body: TaskTeamSpecPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: update a proposed task's team_spec.  Owner-only.
+    409 if task is no longer in 'proposed' state.  Re-broadcasts the
+    team_proposal message so other clients see the updated spec."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can edit the team_spec")
+    if status != "proposed":
+        raise HTTPException(409, f"task is not editable (status: {status})")
+    db._conn.execute(
+        "UPDATE tasks SET team_spec=?, updated_at=? WHERE id=?",
+        (json.dumps(body.team_spec), time.time(), task_id),
+    )
+    # Update the team_proposal message's payload + re-broadcast
+    msg_row = db._conn.execute(
+        "SELECT m.id, m.channel_id, m.payload_json FROM messages m "
+        "JOIN channels c ON m.channel_id=c.id "
+        "JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id=? AND c.kind='general' "
+        "AND m.kind='team_proposal' AND json_extract(m.payload_json, '$.task_id')=? "
+        "ORDER BY m.id DESC LIMIT 1",
+        (user.id, task_id),
+    ).fetchone()
+    if msg_row is not None:
+        msg_id, channel_id, payload_json = msg_row
+        payload = json.loads(payload_json)
+        payload["team_spec"] = body.team_spec
+        db._conn.execute(
+            "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+            (json.dumps(payload), time.time(), msg_id),
+        )
+        t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+        _background_tasks.add(t)
+        t.add_done_callback(_background_tasks.discard)
+    return {"id": task_id, "status": status, "team_spec": body.team_spec}
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task_route(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: cancel a proposed task.  Owner-only.  Updates the
+    team_proposal message to mark it cancelled (UI greys buttons)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can cancel")
+    if status != "proposed":
+        raise HTTPException(409, f"only proposed tasks can be cancelled (current: {status})")
+    db._conn.execute(
+        "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
+        (time.time(), task_id),
+    )
+    msg_row = db._conn.execute(
+        "SELECT m.id, m.channel_id, m.payload_json FROM messages m "
+        "JOIN channels c ON m.channel_id=c.id "
+        "JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id=? AND c.kind='general' "
+        "AND m.kind='team_proposal' AND json_extract(m.payload_json, '$.task_id')=? "
+        "ORDER BY m.id DESC LIMIT 1",
+        (user.id, task_id),
+    ).fetchone()
+    if msg_row is not None:
+        msg_id, channel_id, payload_json = msg_row
+        payload = json.loads(payload_json)
+        payload["cancelled"] = True
+        db._conn.execute(
+            "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+            (json.dumps(payload), time.time(), msg_id),
+        )
+        t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+        _background_tasks.add(t)
+        t.add_done_callback(_background_tasks.discard)
+    return {"id": task_id, "status": "cancelled"}
 
 
 @app.get("/tasks", response_model=list[TaskResponse])
@@ -5055,6 +6419,1176 @@ async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
     return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
 
 
+# ── Sprint 50 A3: workspace create route ──────────────────────────────────────
+
+
+@app.post("/workspaces")
+async def create_workspace_route(
+    body: WorkspaceCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: create a workspace owned by the caller.
+    Enforces 20-per-user soft cap (429 workspace_limit)."""
+    db: Db = state["db"]
+    existing = db._conn.execute(
+        "SELECT COUNT(*) FROM workspaces WHERE owner_user_id=? AND deleted_at IS NULL",
+        (user.id,),
+    ).fetchone()[0]
+    if existing >= 20:
+        raise HTTPException(429, {"error": "workspace_limit", "limit": 20, "current": existing})
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "workspace name required")
+    wid = db.create_workspace(name=name, owner_user_id=user.id)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_created", payload={"name": name})
+    except Exception as exc:
+        logger.warning("audit_log workspace_created failed: %s", exc)
+    return {"id": wid, "name": name, "role": "owner"}
+
+
+class WorkspacePatchRequest(BaseModel):
+    name: str | None = None
+    settings: dict | None = None
+
+
+@app.patch("/workspaces/{wid}")
+async def patch_workspace_route(
+    wid: int,
+    body: WorkspacePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: update workspace name and/or merge settings_json. Owner-only."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id, name, settings_json FROM workspaces WHERE id=? AND deleted_at IS NULL",
+        (wid,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    owner, current_name, current_settings = row
+    if owner != user.id:
+        raise HTTPException(403, "owner only")
+    sets: list[str] = []
+    params: list = []
+    if body.name is not None:
+        sets.append("name=?")
+        params.append(body.name.strip())
+    if body.settings is not None:
+        merged = json.loads(current_settings or "{}")
+        merged.update(body.settings)
+        sets.append("settings_json=?")
+        params.append(json.dumps(merged))
+    if not sets:
+        return {"id": wid, "name": current_name}
+    params.append(wid)
+    db._conn.execute(f"UPDATE workspaces SET {', '.join(sets)} WHERE id=?", tuple(params))
+    if body.name is not None and body.name.strip() != current_name:
+        try:
+            db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_renamed",
+                         payload={"old_name": current_name, "new_name": body.name.strip()})
+        except Exception as exc:
+            logger.warning("audit_log workspace_renamed failed: %s", exc)
+    if body.settings is not None:
+        try:
+            db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_settings_updated",
+                         payload={"keys_changed": list(body.settings.keys())})
+        except Exception as exc:
+            logger.warning("audit_log workspace_settings_updated failed: %s", exc)
+    return {"id": wid}
+
+
+@app.delete("/workspaces/{wid}")
+async def delete_workspace_route(wid: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: owner-only soft delete.  Sets deleted_at; preserves
+    workspace history.  /me/workspaces filters by deleted_at IS NULL."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id, name FROM workspaces WHERE id=? AND deleted_at IS NULL", (wid,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "owner only")
+    db._conn.execute("UPDATE workspaces SET deleted_at=? WHERE id=?", (time.time(), wid))
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="workspace_deleted", payload={"name": row[1]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log workspace_deleted failed: %s", exc)
+    return {"ok": True}
+
+
+@app.post("/workspaces/{wid}/leave")
+async def leave_workspace_route(wid: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: non-owner self-remove from workspace."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "not a member")
+    if row[0] == "owner":
+        raise HTTPException(400, "owner cannot leave; delete workspace instead")
+    db.remove_workspace_member(workspace_id=wid, user_id=user.id)
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="member_left", target_kind="member", target_id=user.id, payload={},
+        )
+    except Exception as exc:
+        logger.warning("audit_log member_left failed: %s", exc)
+    return {"ok": True}
+
+
+@app.post("/workspaces/{wid}/transfer-ownership")
+async def transfer_workspace_ownership_route(
+    wid: int,
+    body: WorkspaceOwnershipTransferRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 52: transfer workspace ownership.  Owner-only.  Old owner
+    auto-demoted to admin.  Target must be an existing workspace_member."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id FROM workspaces WHERE id=? AND deleted_at IS NULL",
+        (wid,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "only the owner can transfer ownership")
+    if body.new_owner_user_id == user.id:
+        raise HTTPException(400, "cannot transfer to yourself")
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, body.new_owner_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "target user is not a member of this workspace")
+    # Atomic transfer: promote target, demote old owner, update workspaces table
+    db._conn.execute("BEGIN")
+    try:
+        db._conn.execute(
+            "UPDATE workspace_members SET role='owner' "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (wid, body.new_owner_user_id),
+        )
+        db._conn.execute(
+            "UPDATE workspace_members SET role='admin' "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (wid, user.id),
+        )
+        db._conn.execute(
+            "UPDATE workspaces SET owner_user_id=? WHERE id=?",
+            (body.new_owner_user_id, wid),
+        )
+        db._conn.execute("COMMIT")
+    except Exception:
+        db._conn.execute("ROLLBACK")
+        raise
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="workspace_ownership_transferred",
+            target_kind="member", target_id=body.new_owner_user_id,
+            payload={"old_owner": user.id, "new_owner": body.new_owner_user_id},
+        )
+    except Exception as exc:
+        logger.warning("audit_log workspace_ownership_transferred failed: %s", exc)
+    return {"ok": True, "new_owner": body.new_owner_user_id}
+
+
+@app.get("/me/workspaces")
+async def list_my_workspaces(
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: list all workspaces the caller is a member of."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT w.id, w.name, wm.role, w.created_at "
+        "FROM workspaces w JOIN workspace_members wm ON wm.workspace_id=w.id "
+        "WHERE wm.user_id=? AND wm.member_kind='human' "
+        "AND w.deleted_at IS NULL "
+        "ORDER BY w.created_at ASC",
+        (user.id,),
+    ).fetchall()
+    return {
+        "workspaces": [
+            {"id": r[0], "name": r[1], "role": r[2], "created_at": r[3]}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/workspaces/{wid}/members")
+async def list_workspace_members_route(
+    wid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: list workspace_members.  Member-only access (returns
+    empty for non-members, doesn't leak workspace existence)."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (wid, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"members": []}
+    return {"members": db.list_workspace_members(workspace_id=wid)}
+
+
+@app.post("/workspaces/{wid}/members")
+async def invite_workspace_member_route(
+    wid: int,
+    body: WorkspaceMemberInviteRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: invite a human to a workspace.  Admin+ only.
+    Sprint 50 trusts the caller's user_id (no Clerk roundtrip)."""
+    if body.role not in _VALID_WORKSPACE_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.role == "owner":
+        raise HTTPException(400, "cannot invite as owner; transfer ownership is Sprint 51")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None:
+        raise HTTPException(403, "not a member of this workspace")
+    if caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    # Sprint 52: optional Clerk validation
+    exists = await _validate_clerk_user(body.user_id)
+    if exists is False:
+        raise HTTPException(404, {"error": "user_not_found", "user_id": body.user_id})
+    db.add_workspace_member(workspace_id=wid, user_id=body.user_id, role=body.role)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_invited",
+                     target_kind="member", target_id=body.user_id,
+                     payload={"user_id": body.user_id, "role": body.role})
+    except Exception as exc:
+        logger.warning("audit_log member_invited failed: %s", exc)
+    return {"ok": True, "workspace_id": wid, "user_id": body.user_id, "role": body.role}
+
+
+@app.delete("/workspaces/{wid}/members/{target_user_id}")
+async def remove_workspace_member_route(
+    wid: int,
+    target_user_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: remove a human member.  Admin+ only.  Cannot remove owner."""
+    db: Db = state["db"]
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, target_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "member not found")
+    if target[0] == "owner":
+        raise HTTPException(400, "cannot remove the workspace owner")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db.remove_workspace_member(workspace_id=wid, user_id=target_user_id)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_removed",
+                     target_kind="member", target_id=target_user_id,
+                     payload={"user_id": target_user_id})
+    except Exception as exc:
+        logger.warning("audit_log member_removed failed: %s", exc)
+    return {"ok": True}
+
+
+@app.patch("/workspaces/{wid}/members/{target_user_id}")
+async def patch_workspace_member_role_route(
+    wid: int,
+    target_user_id: str,
+    body: WorkspaceMemberRolePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: change a member's role.
+    - Owner can change any non-owner role.
+    - Admin can change Manager/Member roles.
+    - Cannot set role to/from 'owner' (ownership transfer is Sprint 51).
+    """
+    if body.role not in _VALID_WORKSPACE_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.role == "owner":
+        raise HTTPException(400, "ownership transfer is Sprint 51")
+    db: Db = state["db"]
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, target_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "member not found")
+    if target[0] == "owner":
+        raise HTTPException(400, "cannot change the owner's role")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None:
+        raise HTTPException(403, "not a workspace member")
+    if caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    # Admin can only change Manager/Member roles
+    if caller[0] == "admin" and target[0] not in ("manager", "member"):
+        raise HTTPException(403, "admin can only change manager/member roles")
+    old_role = target[0]
+    if not db.update_workspace_member_role(workspace_id=wid, user_id=target_user_id, role=body.role):
+        raise HTTPException(404, "member not found")
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_role_changed",
+                     target_kind="member", target_id=target_user_id,
+                     payload={"user_id": target_user_id, "old_role": old_role, "new_role": body.role})
+    except Exception as exc:
+        logger.warning("audit_log member_role_changed failed: %s", exc)
+    return {"ok": True, "role": body.role}
+
+
+@app.get("/workspaces/{wid}/audit-log")
+async def get_workspace_audit_log_route(
+    wid: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    before_id: int | None = Query(default=None, ge=1),
+    kind: str | None = Query(default=None, max_length=64),
+    actor_user_id: str | None = Query(default=None, max_length=128),
+    since: float | None = Query(default=None, ge=0),
+    until: float | None = Query(default=None, ge=0),
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 51 + 52: owner+admin audit-log read with keyset pagination + filters."""
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    return {"entries": db.list_audit_log(
+        workspace_id=wid, limit=limit, before_id=before_id,
+        kind=kind, actor_user_id=actor_user_id, since=since, until=until,
+    )}
+
+
+@app.get("/workspaces/{wid}/audit-log/export")
+async def export_workspace_audit_log_route(
+    wid: int,
+    kind: str | None = Query(default=None, max_length=64),
+    actor_user_id: str | None = Query(default=None, max_length=128),
+    since: float | None = Query(default=None, ge=0),
+    until: float | None = Query(default=None, ge=0),
+    user: ClerkUser = Depends(require_user),
+) -> Response:
+    """Sprint 52: export audit log as CSV.  Owner+Admin only.  10,000 row cap."""
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    entries = db.list_audit_log(
+        workspace_id=wid, limit=10000,
+        kind=kind, actor_user_id=actor_user_id, since=since, until=until,
+    )
+    import csv as _csv
+    import io
+    buf = io.StringIO()
+    writer = _csv.writer(buf, quoting=_csv.QUOTE_ALL)
+    writer.writerow(["id", "created_at", "actor_user_id", "actor_kind", "kind",
+                     "target_kind", "target_id", "payload_json"])
+    for e in entries:
+        writer.writerow([
+            e["id"], e["created_at"], e["actor_user_id"], e["actor_kind"],
+            e["kind"], e["target_kind"] or "", e["target_id"] or "",
+            json.dumps(e["payload"]),
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="audit-log-ws{wid}.csv"'},
+    )
+
+
+class AuditLogPruneRequest(BaseModel):
+    older_than_days: int
+
+
+@app.post("/workspaces/{wid}/audit-log/prune")
+async def prune_workspace_audit_log_route(
+    wid: int,
+    body: AuditLogPruneRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 52: prune audit log entries older than N days.  Owner+Admin only.
+    30-day floor (safety)."""
+    if body.older_than_days < 30:
+        raise HTTPException(400, "older_than_days must be >= 30")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    cutoff = time.time() - (body.older_than_days * 86400)
+    cur = db._conn.execute(
+        "DELETE FROM workspace_audit_log WHERE workspace_id=? AND created_at < ?",
+        (wid, cutoff),
+    )
+    deleted = cur.rowcount
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="audit_log_pruned",
+            payload={"deleted": deleted, "older_than_days": body.older_than_days},
+        )
+    except Exception as exc:
+        logger.warning("audit_log audit_log_pruned failed: %s", exc)
+    return {"ok": True, "deleted": deleted}
+
+
+# ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
+
+
+@app.get("/channels")
+async def list_workspace_channels(
+    workspace_id: int,
+    include_archived: bool = False,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: list channels in a workspace, filtered by the caller's
+    visibility.  Only channels where the user is a `channel_members` row
+    are returned (so private custom channels stay hidden).  Returns an
+    empty list if the caller is not a member of the workspace at all
+    (don't leak workspace existence)."""
+    db: Db = state["db"]
+    # Workspace-isolation guard: caller must be a workspace_members row.
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"channels": []}
+    where = ["c.workspace_id=?"]
+    params: list = [workspace_id]
+    if not include_archived:
+        where.append("c.archived_at IS NULL")
+    # Filter to channels where the user is a member OR the channel is
+    # a workspace-wide auto-channel (general / backlog).
+    where.append(
+        "(c.kind IN ('general', 'backlog') OR EXISTS ("
+        "SELECT 1 FROM channel_members cm WHERE cm.channel_id=c.id AND cm.user_id=?))"
+    )
+    params.append(user.id)
+    rows = db._conn.execute(
+        f"SELECT c.id, c.workspace_id, c.kind, c.name, c.task_id, "
+        f"c.persistent_agent_id, c.auto_jump_in_for_tally, "
+        f"c.created_at, c.archived_at "
+        f"FROM channels c WHERE {' AND '.join(where)} "
+        f"ORDER BY c.created_at DESC",
+        params,
+    ).fetchall()
+    return {
+        "channels": [
+            {
+                "id": r[0], "workspace_id": r[1], "kind": r[2], "name": r[3],
+                "task_id": r[4], "persistent_agent_id": r[5],
+                "auto_jump_in_for_tally": bool(r[6]),
+                "created_at": r[7], "archived_at": r[8],
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/channels/dm")
+async def create_dm_channel(
+    body: DmCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: open or find a DM channel.  Idempotent.
+
+    target_kind: 'tally' | 'human' | 'persistent_agent'
+    target_id:   for 'tally', null; for 'human', the other user_id;
+                 for 'persistent_agent', the agent id as string.
+    """
+    if body.target_kind not in ("tally", "human", "persistent_agent"):
+        raise HTTPException(400, f"invalid target_kind: {body.target_kind}")
+    db: Db = state["db"]
+    ws_row = db._conn.execute(
+        "SELECT id FROM workspaces WHERE owner_user_id=? LIMIT 1", (user.id,)
+    ).fetchone()
+    if ws_row is None:
+        raise HTTPException(404, "no workspace for caller")
+    workspace_id = ws_row[0]
+    from .channels import ensure_dm_channel, resolve_channel
+    if body.target_kind == "tally":
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="tally", id_b=None,
+        )
+    elif body.target_kind == "human":
+        if not body.target_id:
+            raise HTTPException(400, "target_id required for human DM")
+        target_member = db._conn.execute(
+            "SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, body.target_id),
+        ).fetchone()
+        if not target_member:
+            raise HTTPException(404, "target user not in workspace")
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="human", id_b=body.target_id,
+        )
+    else:  # persistent_agent
+        if not body.target_id:
+            raise HTTPException(400, "target_id required for persistent_agent DM")
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="persistent_agent", id_b=body.target_id,
+        )
+    return resolve_channel(db, ch_id)
+
+
+@app.post("/channels")
+async def create_custom_channel_route(
+    body: CustomChannelCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: create a custom channel.  Admin+ only.
+
+    Only kind='custom' is accepted; attempting another kind returns 400.
+    Members are inserted atomically in the same transaction.
+
+    Example::
+
+        POST /channels
+        {
+            "workspace_id": 1, "kind": "custom", "name": "code-review",
+            "members": [{"kind": "human", "id": "alice"}, {"kind": "tally"}]
+        }
+    """
+    if body.kind != "custom":
+        raise HTTPException(400, f"Sprint 50 only supports kind='custom'; got {body.kind!r}")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (body.workspace_id, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    now = time.time()
+    cur = db._conn.execute(
+        "INSERT INTO channels (workspace_id, kind, name, created_at) "
+        "VALUES (?, 'custom', ?, ?)",
+        (body.workspace_id, name, now),
+    )
+    ch_id = int(cur.lastrowid or 0)
+    for m in body.members:
+        if m.kind == "human":
+            db._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_id, m.id, now),
+            )
+        elif m.kind == "tally":
+            db._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'tally', NULL, ?)",
+                (ch_id, now),
+            )
+        elif m.kind == "persistent_agent":
+            pa_id = int(m.id) if m.id else None
+            db._conn.execute(
+                "INSERT INTO channel_members "
+                "(channel_id, member_kind, persistent_agent_id, joined_at) "
+                "VALUES (?, 'persistent_agent', ?, ?)",
+                (ch_id, pa_id, now),
+            )
+    try:
+        db.audit_log(workspace_id=body.workspace_id, actor_user_id=user.id, kind="channel_created",
+                     target_kind="channel", target_id=str(ch_id),
+                     payload={"channel_id": ch_id, "kind": "custom", "name": name})
+    except Exception as exc:
+        logger.warning("audit_log channel_created failed: %s", exc)
+    from .channels import resolve_channel
+    return resolve_channel(db, ch_id)
+
+
+@app.post("/channels/{channel_id}/archive")
+async def archive_channel_route(channel_id: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: archive a channel.  Admin+ only.  Restricted to 'custom' and 'task' kinds."""
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind, name FROM channels WHERE id=? AND archived_at IS NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found or already archived")
+    if ch[1] not in ("custom", "task"):
+        raise HTTPException(400, f"cannot archive {ch[1]} channels via this route")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db._conn.execute("UPDATE channels SET archived_at=? WHERE id=?", (time.time(), channel_id))
+    try:
+        db.audit_log(
+            workspace_id=ch[0], actor_user_id=user.id,
+            kind="channel_archived",
+            target_kind="channel", target_id=str(channel_id),
+            payload={"name": ch[2]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log channel_archived failed: %s", exc)
+    return {"ok": True}
+
+
+@app.post("/channels/{channel_id}/unarchive")
+async def unarchive_channel_route(channel_id: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: unarchive a channel.  Admin+ only.  Restricted to 'custom' and 'task' kinds."""
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind, name FROM channels WHERE id=? AND archived_at IS NOT NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found or not archived")
+    if ch[1] not in ("custom", "task"):
+        raise HTTPException(400, f"cannot unarchive {ch[1]} channels via this route")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db._conn.execute("UPDATE channels SET archived_at=NULL WHERE id=?", (channel_id,))
+    try:
+        db.audit_log(
+            workspace_id=ch[0], actor_user_id=user.id,
+            kind="channel_unarchived",
+            target_kind="channel", target_id=str(channel_id),
+            payload={"name": ch[2]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log channel_unarchived failed: %s", exc)
+    return {"ok": True}
+
+
+@app.post("/channels/{channel_id}/members")
+async def add_channel_member_route(
+    channel_id: int,
+    body: ChannelMemberAddRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: add a member to a custom channel.  Admin+ only.
+
+    Returns 400 if the channel is not of kind='custom' (general / task /
+    scheduled_agent channels manage their own membership automatically).
+
+    Example::
+
+        POST /channels/42/members
+        {"member_kind": "human", "user_id": "bob"}
+    """
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind FROM channels WHERE id=? AND archived_at IS NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found")
+    if ch[1] != "custom":
+        raise HTTPException(400, "only custom channels can have members added directly")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    now = time.time()
+    db._conn.execute(
+        "INSERT INTO channel_members "
+        "(channel_id, member_kind, user_id, persistent_agent_id, joined_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (channel_id, body.member_kind, body.user_id, body.persistent_agent_id, now),
+    )
+    return {"ok": True}
+
+
+@app.delete("/channels/{channel_id}/members/{target_user_id}")
+async def remove_channel_member_route(
+    channel_id: int,
+    target_user_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: remove a human member from a custom channel.  Admin+ only.
+
+    Returns 400 for non-custom channels, 404 if the member isn't present.
+
+    Example::
+
+        DELETE /channels/42/members/bob
+    """
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind FROM channels WHERE id=?",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found")
+    if ch[1] != "custom":
+        raise HTTPException(400, "only custom channels support member removal")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    cur = db._conn.execute(
+        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?",
+        (channel_id, target_user_id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "member not in channel")
+    return {"ok": True}
+
+
+@app.post("/channels/{channel_id}/members/{target_user_id}/role_override")
+async def post_channel_role_override(
+    channel_id: int,
+    target_user_id: str,
+    body: ChannelMemberRoleOverrideRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: set a per-channel role override for `target_user_id`.
+
+    Permission: caller must be workspace Admin or Owner (per
+    `can_manage_members`).  Valid override values: channel_admin,
+    read_only.  Pass null to clear.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_effective_role, can_manage_members
+    caller_role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if not can_manage_members(caller_role):
+        raise HTTPException(403, "only Owner/Admin can set role overrides")
+    if body.role_override is not None and body.role_override not in ("channel_admin", "read_only"):
+        raise HTTPException(400, "role_override must be 'channel_admin', 'read_only', or null")
+    cur = db._conn.execute(
+        "UPDATE channel_members SET role_override=? "
+        "WHERE channel_id=? AND user_id=?",
+        (body.role_override, channel_id, target_user_id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, f"{target_user_id} is not a member of channel {channel_id}")
+    return {"ok": True}
+
+
+@app.post("/channels/{channel_id}/read")
+async def post_channel_read(
+    channel_id: int,
+    body: ChannelReadRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: mark messages up to `last_read_message_id` as read for
+    the caller in this channel.  Returns 403 if caller isn't a member.
+
+    Uses MAX(last_read_message_id, ?) so out-of-order calls cannot
+    regress the read pointer.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_effective_role
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if role is None:
+        raise HTTPException(403, "permission denied")
+    cur = db._conn.execute(
+        "UPDATE channel_members SET last_read_message_id = MAX(last_read_message_id, ?) "
+        "WHERE channel_id=? AND user_id=?",
+        (body.last_read_message_id, channel_id, user.id),
+    )
+    return {"ok": True, "updated": cur.rowcount > 0}
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+@app.post("/channels/{channel_id}/messages")
+async def post_message(
+    channel_id: int,
+    body: MessageCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: post a message in a channel.
+
+    Permission: caller must have a role that returns True from
+    `can_post_in_channel`.  Returns 403 for non-members or read-only.
+    Returns 404 if channel doesn't exist.
+
+    For `kind='text'`, body.text is the required content.  If both
+    `body.text` and `body.payload['text']` are provided, `body.text`
+    wins and overwrites the payload field.
+
+    TODO(Sprint 49): when private channels (DMs) land, consider
+    collapsing the 404/403 paths into 403 to avoid leaking channel
+    existence to non-members.
+    """
+    db: Db = state["db"]
+    from .channels import (
+        resolve_channel, resolve_effective_role, can_post_in_channel, insert_message,
+    )
+    if resolve_channel(db, channel_id) is None:
+        raise HTTPException(404, f"channel {channel_id} not found")
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if not can_post_in_channel(role):
+        raise HTTPException(403, "permission denied — you are not a member of this channel or are read-only")
+    text = (body.text or "").strip()
+    if body.kind == "text" and not text:
+        raise HTTPException(400, "text is required for kind=text")
+    payload = dict(body.payload or {})
+    if text:
+        payload["text"] = text
+    msg_id = insert_message(
+        db,
+        channel_id=channel_id,
+        author_kind="human",
+        author_user_id=user.id,
+        kind=body.kind,
+        payload=payload,
+        reply_to_id=body.reply_to_id,
+    )
+    row = db._conn.execute(
+        "SELECT id, channel_id, author_kind, author_user_id, author_agent_id, "
+        "kind, payload_json, reply_to_id, created_at, edited_at "
+        "FROM messages WHERE id=?",
+        (msg_id,),
+    ).fetchone()
+    # Sprint 47 Task A10 will broadcast over WebSocket here.
+    # Hold a strong reference so the GC cannot collect the task before it runs.
+    t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+    return {
+        "id": row[0], "channel_id": row[1], "author_kind": row[2],
+        "author_user_id": row[3], "author_agent_id": row[4],
+        "kind": row[5], "payload_json": row[6], "reply_to_id": row[7],
+        "created_at": row[8], "edited_at": row[9],
+    }
+
+
+@app.get("/channels/{channel_id}/messages")
+async def get_messages(
+    channel_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    since_id: int | None = Query(default=None, ge=1),
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: paginated message history.  Reverse chronological
+    (newest first).  `since_id` returns messages with id > since_id
+    (used by clients catching up after WebSocket reconnect).
+
+    Permission: 404 if channel doesn't exist; 403 if caller is not a
+    channel member.
+
+    TODO(Sprint 49): when private channels (DMs) land, collapse 404/403
+    into 403 to avoid leaking channel existence.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_channel, resolve_effective_role, list_messages
+    if resolve_channel(db, channel_id) is None:
+        raise HTTPException(404, f"channel {channel_id} not found")
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if role is None:
+        raise HTTPException(403, "permission denied — not a channel member")
+    msgs = list_messages(db, channel_id=channel_id, limit=limit, since_id=since_id)
+    return {"channel_id": channel_id, "messages": msgs}
+
+
+@app.patch("/channels/{channel_id}/messages/{message_id}")
+async def patch_message(
+    channel_id: int,
+    message_id: int,
+    body: MessagePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: edit a message.  Author-only (admins cannot edit
+    other users' messages; that would be a moderation concern out of
+    scope for v1)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT author_user_id, payload_json FROM messages "
+        "WHERE id=? AND channel_id=?",
+        (message_id, channel_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "message not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "only the author can edit a message")
+    text = (body.text or "").strip()
+    if not text and not body.payload:
+        raise HTTPException(400, "nothing to update")
+    payload = json.loads(row[1])
+    if body.payload:
+        payload.update(body.payload)
+    if text:
+        payload["text"] = text
+    db._conn.execute(
+        "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+        (json.dumps(payload), time.time(), message_id),
+    )
+    new_row = db._conn.execute(
+        "SELECT id, channel_id, author_kind, author_user_id, author_agent_id, "
+        "kind, payload_json, reply_to_id, created_at, edited_at "
+        "FROM messages WHERE id=?",
+        (message_id,),
+    ).fetchone()
+    return {
+        "id": new_row[0], "channel_id": new_row[1], "author_kind": new_row[2],
+        "author_user_id": new_row[3], "author_agent_id": new_row[4],
+        "kind": new_row[5], "payload_json": new_row[6], "reply_to_id": new_row[7],
+        "created_at": new_row[8], "edited_at": new_row[9],
+    }
+
+
+async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
+    """Sprint 47 A10: send new_message events to every WebSocket subscribed
+    to the user's notification feed where the user is a member of the channel.
+
+    Re-uses the existing notifications WS registry (_ACTIVE_WS) from Sprint 46
+    rather than introducing a new per-channel WebSocket type.
+    Frame shape:
+        {"type": "new_message", "channel_id": int, "message_id": int}
+    """
+    from .notifications import _ACTIVE_WS
+    db: Db = state["db"]
+    members = db._conn.execute(
+        "SELECT DISTINCT user_id FROM channel_members "
+        "WHERE channel_id=? AND user_id IS NOT NULL",
+        (channel_id,),
+    ).fetchall()
+    user_ids = {m[0] for m in members}
+    for user_id in user_ids:
+        sockets = list(_ACTIVE_WS.get(user_id) or [])  # works for list or set
+        for ws in sockets:
+            try:
+                await ws.send_json({
+                    "type": "new_message",
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "ws send_new_message failed for user=%s: %s", user_id, exc
+                )
+
+    # Sprint 49: Tally escalation responder.  If the broadcast message is
+    # kind='escalation', create a DM with the workspace owner + post the
+    # templated Tally message.
+    try:
+        msg_row = db._conn.execute(
+            "SELECT kind FROM messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if msg_row and msg_row[0] == "escalation":
+            from .channels import handle_escalation
+            dm_ch = handle_escalation(db, channel_id=channel_id, message_id=message_id)
+            if dm_ch:
+                new_msg = db._conn.execute(
+                    "SELECT id FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1",
+                    (dm_ch,),
+                ).fetchone()
+                if new_msg:
+                    # Re-enter broadcast for the DM message.  Bounded:
+                    # the new message is kind='text', not 'escalation',
+                    # so this won't recurse further.
+                    await _broadcast_new_message(dm_ch, new_msg[0])
+    except Exception as exc:
+        logger.warning("escalation handler failed: %s", exc)
+
+
+# ── Sprint 49: persistent_agents routes ───────────────────────────────────────
+
+
+@app.post("/persistent_agents")
+async def create_persistent_agent_route(
+    body: PersistentAgentCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: create a persistent agent + scheduled_agent channel.
+    Caller must be a workspace_member of the target workspace."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (body.workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    # Sprint 49: server generates id + HMAC secret for new HTTP triggers
+    triggers = list(body.event_triggers or [])
+    for trig in triggers:
+        if trig.get("kind") == "http" and not trig.get("secret"):
+            trig["secret"] = secrets.token_hex(16)
+        if not trig.get("id"):
+            trig["id"] = secrets.token_hex(8)
+    pid = db.create_persistent_agent(
+        workspace_id=body.workspace_id,
+        name=body.name,
+        role_name=body.role_name,
+        team_spec=body.team_spec,
+        tool_allowlist=body.tool_allowlist,
+        model=body.model,
+        cron_schedule=body.cron_schedule,
+        event_triggers=triggers,
+    )
+    try:
+        db.audit_log(workspace_id=body.workspace_id, actor_user_id=user.id,
+                     kind="persistent_agent_created",
+                     target_kind="persistent_agent", target_id=str(pid),
+                     payload={"agent_id": pid, "name": body.name, "role_name": body.role_name})
+    except Exception as exc:
+        logger.warning("audit_log persistent_agent_created failed: %s", exc)
+    return db.get_persistent_agent(pid)
+
+
+@app.get("/persistent_agents")
+async def list_persistent_agents_route(
+    workspace_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: list active persistent agents in a workspace.
+    Returns empty list if caller isn't a member (workspace-isolation
+    pattern from Sprint 47 GET /channels)."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"persistent_agents": []}
+    return {"persistent_agents": db.list_persistent_agents(workspace_id=workspace_id)}
+
+
+@app.patch("/persistent_agents/{pid}")
+async def patch_persistent_agent_route(
+    pid: int,
+    body: PersistentAgentPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: partial update.  Owner-only via workspace membership.
+    Recomputes next_scheduled_run_at if cron_schedule changes."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    patch = body.model_dump(exclude_unset=True)
+    db.update_persistent_agent(pid, patch=patch)
+    if body.enabled is not None and bool(body.enabled) != bool(agent.get("enabled")):
+        try:
+            db.audit_log(workspace_id=agent["workspace_id"], actor_user_id=user.id,
+                         kind="persistent_agent_enabled_toggled",
+                         target_kind="persistent_agent", target_id=str(pid),
+                         payload={"agent_id": pid, "name": agent["name"], "enabled": bool(body.enabled)})
+        except Exception as exc:
+            logger.warning("audit_log persistent_agent_enabled_toggled failed: %s", exc)
+    return db.get_persistent_agent(pid)
+
+
+@app.post("/persistent_agents/{pid}/run_now")
+async def run_persistent_agent_now_route(
+    pid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: manually fire a persistent agent.  Workspace-member only."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    orch: "Orchestrator" = state.get("orchestrator")
+    if orch is None:
+        raise HTTPException(503, "orchestrator not ready")
+    task_id = await orch._fire_persistent_agent(pid, trigger="manual")
+    return {"ok": True, "task_id": task_id, "persistent_agent_id": pid}
+
+
+@app.delete("/persistent_agents/{pid}")
+async def delete_persistent_agent_route(
+    pid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: soft-delete a persistent agent."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    db.delete_persistent_agent(pid)
+    try:
+        db.audit_log(workspace_id=agent["workspace_id"], actor_user_id=user.id,
+                     kind="persistent_agent_deleted",
+                     target_kind="persistent_agent", target_id=str(pid),
+                     payload={"agent_id": pid, "name": agent["name"]})
+    except Exception as exc:
+        logger.warning("audit_log persistent_agent_deleted failed: %s", exc)
+    return {"ok": True}
+
+
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
 
 
@@ -5712,6 +8246,43 @@ async def stripe_webhook(request: Request) -> dict:
     return {"ok": True}
 
 
+# ── Sprint 49 A10: persistent-agent HTTP event triggers ───────────────────────
+
+
+@app.post("/webhooks/agents/{trigger_id}")
+async def fire_event_trigger(trigger_id: str, request: Request) -> dict:
+    """Sprint 49 A10: fire a persistent agent via its HTTP event trigger.
+
+    Auth: HMAC-SHA256 over raw request body using the trigger's secret,
+    passed in ``X-Tally-Signature: sha256=<hex>``.  No user session
+    required — callers are external systems (GitHub, Slack, etc.)."""
+    raw_body = await request.body()
+    sig = request.headers.get("X-Tally-Signature", "")
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, event_triggers_json FROM persistent_agents "
+        "WHERE deleted_at IS NULL AND enabled=1"
+    ).fetchall()
+    for agent_id, triggers_json in rows:
+        triggers = json.loads(triggers_json or "[]")
+        for trig in triggers:
+            if trig.get("id") == trigger_id and trig.get("kind") == "http":
+                expected = "sha256=" + hmac.new(
+                    trig["secret"].encode(),
+                    raw_body,
+                    hashlib.sha256,
+                ).hexdigest()
+                if hmac.compare_digest(sig, expected):
+                    orch: "Orchestrator" = state.get("orchestrator")
+                    if orch is None:
+                        raise HTTPException(503, "orchestrator not ready")
+                    task_id = await orch._fire_persistent_agent(agent_id, trigger="webhook")
+                    return {"ok": True, "agent_id": agent_id, "task_id": task_id}
+                else:
+                    raise HTTPException(401, "invalid signature")
+    raise HTTPException(404, "trigger not found")
+
+
 @app.get("/admin/agent_roles")
 async def list_agent_roles(user: ClerkUser = Depends(require_user)) -> dict:
     """The agent palette.  Returns seeded roles plus the caller's
@@ -5767,6 +8338,42 @@ _ALLOWED_TOOLS = {
     "bash_read",
     "browser",
 }
+
+
+async def _validate_clerk_user(user_id: str) -> bool | None:
+    """Sprint 52: validate a user_id against Clerk's REST API.
+
+    Returns:
+      - True: user exists (HTTP 200)
+      - False: user not found in Clerk (HTTP 404)
+      - None: validation skipped (CLERK_SECRET_KEY unset) OR Clerk API failed
+              non-deterministically (network / 5xx / timeout)
+    """
+    secret = os.environ.get("CLERK_SECRET_KEY", "").strip()
+    if not secret:
+        return None
+    # Sprint 52 hardening: reject malformed IDs before building the URL.
+    # A value like `user_x/../organizations` or `user_x?foo=1` would silently
+    # redirect the GET to a different Clerk endpoint.  Returning False here is
+    # semantically identical to Clerk's 404 — "this user does not exist."
+    if not _CLERK_USER_ID_PATTERN.fullmatch(user_id):
+        logger.warning("_validate_clerk_user: malformed user_id rejected")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=_CLERK_VALIDATE_TIMEOUT) as client:
+            resp = await client.get(
+                f"{CLERK_API_BASE}/users/{user_id}",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 404:
+            return False
+        logger.warning("Clerk validation returned %s for %s; skipping", resp.status_code, user_id)
+        return None
+    except Exception as exc:
+        logger.warning("Clerk validation failed for %s: %s; skipping", user_id, exc)
+        return None
 
 
 def _validate_custom_role_inputs(

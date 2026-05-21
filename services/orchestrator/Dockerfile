@@ -31,8 +31,8 @@ RUN maturin build --release --features python --compatibility linux -o /wheels
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
-LABEL org.opencontainers.image.version=v26
-LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 46: credit-based pricing + privacy-respecting push notifications)"
+LABEL org.opencontainers.image.version=v32
+LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 52: ownership transfer + Clerk validation + audit log filters/export/prune)"
 
 WORKDIR /app
 
@@ -69,7 +69,8 @@ RUN pip install --no-cache-dir \
     "python-dotenv>=1.0.0" \
     "pyjwt[crypto]>=2.10.0" \
     "stripe>=11.0.0" \
-    "websockets>=13.0"
+    "websockets>=13.0" \
+    "croniter>=6.2.2"
 
 # Install the skytale-sdk wheel from stage 1.
 COPY --from=skytale-builder /wheels/skytale_sdk-*.whl /tmp/wheels/

@@ -6,13 +6,17 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
+import '../state/workspace_context.dart';
 import '../widgets/channel_header.dart';
 import '../widgets/cost_estimate_banner.dart';
+import '../widgets/team_proposal_card.dart';
+import 'workflow_editor.dart';
 
 class GeneralChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
@@ -42,10 +46,95 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
   int _availableCredits = 0;
   int _perTaskCap = 100;
 
+  int? _generalChannelId;
+  List<Map<String, dynamic>> _proposals = [];
+
   @override
   void initState() {
     super.initState();
     unawaited(_refreshCreditState());
+    unawaited(_loadProposals());
+  }
+
+  Future<void> _loadProposals() async {
+    try {
+      if (_generalChannelId == null) {
+        // Resolve #general channel id once
+        final channels = await widget.client.listChannels(
+          workspaceId: WorkspaceContext.activeIdOrDefault(context),
+        );
+        final general = channels.firstWhere(
+          (c) => c['kind'] == 'general',
+          orElse: () => const {},
+        );
+        if (general.isEmpty) return;
+        _generalChannelId = general['id'] as int;
+      }
+      final msgs = await widget.client.getMessages(channelId: _generalChannelId!);
+      if (!mounted) return;
+      setState(() {
+        _proposals = msgs
+            .where((m) => m['kind'] == 'team_proposal')
+            .toList();
+      });
+    } catch (_) {
+      // Silent — proposal UI is additive; no UX impact if it fails
+    }
+  }
+
+  Map<String, dynamic>? _findProposalPayload(String taskId) {
+    for (final m in _proposals) {
+      try {
+        final p = jsonDecode(m['payload_json'] as String) as Map<String, dynamic>;
+        if (p['task_id'] == taskId) return p;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Future<void> _onProposalAction(String taskId, String action) async {
+    // Capture context-dependent objects before any await to satisfy
+    // use_build_context_synchronously lint rule.
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    try {
+      switch (action) {
+        case 'approve':
+          await widget.client.approveTask(taskId: taskId);
+          if (mounted) {
+            await _loadProposals();
+            messenger.showSnackBar(
+              const SnackBar(content: Text('Approved — task dispatched')),
+            );
+          }
+          break;
+        case 'edit':
+          final payload = _findProposalPayload(taskId);
+          if (payload == null) return;
+          await navigator.push(
+            MaterialPageRoute(
+              builder: (_) => WorkflowEditorScreen(
+                client: widget.client,
+                taskId: taskId,
+                initialTeamSpec:
+                    Map<String, dynamic>.from(payload['team_spec'] as Map),
+              ),
+            ),
+          );
+          if (mounted) await _loadProposals();
+          break;
+        case 'cancel':
+          await widget.client.cancelTask(taskId: taskId);
+          if (mounted) await _loadProposals();
+          break;
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('$action failed: $e')),
+        );
+      }
+    }
   }
 
   Future<void> _refreshCreditState() async {
@@ -80,6 +169,7 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
       if (overrideDescription == null) _ctrl.clear();
       if (!mounted) return;
       setState(() => _submitting = false);
+      unawaited(_loadProposals());
       widget.onTaskSubmitted(t);
     } catch (e) {
       if (!mounted) return;
@@ -101,6 +191,28 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
             name: 'general',
             description: 'Describe what to build. Tally picks the team.',
           ),
+          if (_proposals.isNotEmpty)
+            Container(
+              constraints: const BoxConstraints(maxHeight: 240),
+              color: const Color(0xFF2B2D31),
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: _proposals.length,
+                itemBuilder: (_, i) => TeamProposalCard(
+                  message: _proposals[i],
+                  onAction: (action) {
+                    try {
+                      final payload = jsonDecode(
+                              _proposals[i]['payload_json'] as String)
+                          as Map<String, dynamic>;
+                      final taskId =
+                          payload['task_id'] as String? ?? '';
+                      _onProposalAction(taskId, action);
+                    } catch (_) {}
+                  },
+                ),
+              ),
+            ),
           Expanded(
             child: _GeneralFeed(
               recentTasks: widget.recentTasks,

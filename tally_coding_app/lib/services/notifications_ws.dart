@@ -25,6 +25,11 @@ class NotificationsWsClient {
   /// REST fetch completes). Callers can set this to update UI state.
   void Function(Map<String, dynamic>)? onNotification;
 
+  /// Called when a `new_message` event arrives on the WS connection.
+  /// Provides the [channelId] and [messageId] from the server frame so
+  /// callers can fetch or refresh the relevant message without polling.
+  void Function(int channelId, int messageId)? onNewMessage;
+
   NotificationsWsClient({
     required this.api,
     required this.wsUrl,
@@ -67,6 +72,10 @@ class NotificationsWsClient {
     final msg = jsonDecode(raw as String) as Map<String, dynamic>;
     final type = msg['type'] as String?;
     if (type == 'hello' || type == 'pong') return;
+    if (type == 'new_message') {
+      onNewMessage?.call(msg['channel_id'] as int, msg['message_id'] as int);
+      return;
+    }
     if (type == 'new_notification') {
       final id = msg['id'] as int;
       try {
