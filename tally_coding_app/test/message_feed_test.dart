@@ -39,4 +39,31 @@ void main() {
     )));
     expect(find.textContaining('No messages yet'), findsOneWidget);
   });
+
+  testWidgets('renders team_proposal message via TeamProposalCard', (tester) async {
+    final messages = [
+      {
+        'id': 1, 'channel_id': 1, 'author_kind': 'tally',
+        'kind': 'team_proposal',
+        'payload_json': jsonEncode({
+          'task_id': 'abc', 'description': 'build it',
+          'team_spec': {'nodes': [{'id':'n1','kind':'agent','role':'Coder'}], 'edges':[]},
+          'options': [{'value':'approve','label':'Approve'}, {'value':'edit','label':'Edit'}, {'value':'cancel','label':'Cancel'}],
+        }),
+        'created_at': 1700000000.0,
+      },
+    ];
+    String? clicked;
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body:
+      MessageFeed(
+        messages: messages,
+        onAnswerPrompt: (_, __) {},
+        onTeamProposalAction: (taskId, action) => clicked = '$taskId:$action',
+      ),
+    )));
+    expect(find.textContaining('build it'), findsOneWidget);
+    await tester.tap(find.text('Approve'));
+    await tester.pumpAndSettle();
+    expect(clicked, 'abc:approve');
+  });
 }
