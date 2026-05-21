@@ -691,6 +691,11 @@ class PersistentAgentPatchRequest(BaseModel):
     enabled: bool | None = None
 
 
+class DmCreateRequest(BaseModel):
+    target_kind: str
+    target_id: str | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6068,6 +6073,58 @@ async def list_workspace_channels(
             for r in rows
         ],
     }
+
+
+@app.post("/channels/dm")
+async def create_dm_channel(
+    body: DmCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: open or find a DM channel.  Idempotent.
+
+    target_kind: 'tally' | 'human' | 'persistent_agent'
+    target_id:   for 'tally', null; for 'human', the other user_id;
+                 for 'persistent_agent', the agent id as string.
+    """
+    if body.target_kind not in ("tally", "human", "persistent_agent"):
+        raise HTTPException(400, f"invalid target_kind: {body.target_kind}")
+    db: Db = state["db"]
+    ws_row = db._conn.execute(
+        "SELECT id FROM workspaces WHERE owner_user_id=? LIMIT 1", (user.id,)
+    ).fetchone()
+    if ws_row is None:
+        raise HTTPException(404, "no workspace for caller")
+    workspace_id = ws_row[0]
+    from .channels import ensure_dm_channel, resolve_channel
+    if body.target_kind == "tally":
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="tally", id_b=None,
+        )
+    elif body.target_kind == "human":
+        if not body.target_id:
+            raise HTTPException(400, "target_id required for human DM")
+        target_member = db._conn.execute(
+            "SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, body.target_id),
+        ).fetchone()
+        if not target_member:
+            raise HTTPException(404, "target user not in workspace")
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="human", id_b=body.target_id,
+        )
+    else:  # persistent_agent
+        if not body.target_id:
+            raise HTTPException(400, "target_id required for persistent_agent DM")
+        ch_id = ensure_dm_channel(
+            db, workspace_id=workspace_id,
+            kind_a="human", id_a=user.id,
+            kind_b="persistent_agent", id_b=body.target_id,
+        )
+    return resolve_channel(db, ch_id)
 
 
 @app.post("/channels/{channel_id}/members/{target_user_id}/role_override")
