@@ -121,10 +121,52 @@ class _PersistentAgentsScreenState extends State<PersistentAgentsScreen> {
     );
   }
 
+  Future<void> _onNewAgent() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (_) => const _NewPersistentAgentDialog(),
+    );
+    if (result == null) return;
+    try {
+      final agent = await widget.client.createPersistentAgent(
+        workspaceId: widget.workspaceId,
+        name: result['name'] as String,
+        roleName: result['role_name'] as String,
+        teamSpec: const {'nodes': [], 'edges': [], 'format': 'nodes_v1'},
+        cronSchedule: (result['cron_schedule'] as String?)?.isEmpty ?? true
+            ? null
+            : result['cron_schedule'] as String,
+      );
+      if (!mounted) return;
+      // Push into editor so user can configure team_spec + triggers
+      await navigator.push(MaterialPageRoute(
+        builder: (_) => WorkflowEditorScreen(
+          client: widget.client,
+          persistentAgentId: agent['id'] as int,
+          initialTeamSpec: Map<String, dynamic>.from(agent['team_spec'] as Map? ?? {}),
+        ),
+      ));
+      if (mounted) await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Create failed: $e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Scheduled agents')),
+      appBar: AppBar(
+        title: const Text('Scheduled agents'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'New persistent agent',
+            onPressed: _onNewAgent,
+          ),
+        ],
+      ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error != null
@@ -145,6 +187,95 @@ class _PersistentAgentsScreenState extends State<PersistentAgentsScreen> {
                         itemBuilder: (_, i) => _agentTile(_agents[i]),
                       ),
                     ),
+    );
+  }
+}
+
+class _NewPersistentAgentDialog extends StatefulWidget {
+  const _NewPersistentAgentDialog();
+  @override
+  State<_NewPersistentAgentDialog> createState() => _NewPersistentAgentDialogState();
+}
+
+class _NewPersistentAgentDialogState extends State<_NewPersistentAgentDialog> {
+  final _nameCtrl = TextEditingController();
+  final _cronCtrl = TextEditingController();
+  String _role = 'Tester';
+  static const _roles = ['Coder', 'Reviewer', 'Tester', 'Architect', 'Solo Coder'];
+  static const _commonCrons = <Map<String, String>>[
+    {'label': 'No schedule (event triggers only)', 'value': ''},
+    {'label': 'every minute', 'value': '* * * * *'},
+    {'label': 'every hour', 'value': '0 * * * *'},
+    {'label': 'daily 9am', 'value': '0 9 * * *'},
+    {'label': 'weekdays 9am', 'value': '0 9 * * 1-5'},
+    {'label': 'nightly 9pm', 'value': '0 21 * * *'},
+  ];
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _cronCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('New persistent agent'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _nameCtrl,
+              decoration: const InputDecoration(labelText: 'Name', hintText: 'e.g. nightly-tests'),
+              autofocus: true,
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _role,
+              decoration: const InputDecoration(labelText: 'Role'),
+              items: [for (final r in _roles) DropdownMenuItem(value: r, child: Text(r))],
+              onChanged: (v) { if (v != null) setState(() => _role = v); },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _cronCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Cron schedule (optional)',
+                hintText: '0 9 * * *',
+              ),
+            ),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 6,
+              children: [
+                for (final pat in _commonCrons)
+                  ActionChip(
+                    label: Text(pat['label']!),
+                    onPressed: () => _cronCtrl.text = pat['value']!,
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+        TextButton(
+          onPressed: () {
+            final name = _nameCtrl.text.trim();
+            if (name.isEmpty) return;
+            Navigator.of(context).pop({
+              'name': name,
+              'role_name': _role,
+              'cron_schedule': _cronCtrl.text.trim(),
+            });
+          },
+          child: const Text('Create'),
+        ),
+      ],
     );
   }
 }
