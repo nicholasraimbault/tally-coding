@@ -135,8 +135,8 @@ def test_get_messages_since_id(client):
     assert r.status_code == 200
     msgs = r.json()["messages"]
     assert len(msgs) == 2
-    texts = sorted([json.loads(m["payload_json"])["text"] for m in msgs])
-    assert texts == ["b", "c"]
+    texts = [json.loads(m["payload_json"])["text"] for m in msgs]
+    assert texts == ["c", "b"]   # reverse-chrono: c was posted last
 
 
 def test_get_messages_non_member_returns_403(client):
@@ -148,3 +148,11 @@ def test_get_messages_non_member_returns_403(client):
     )
     r = client.get(f"/channels/{ch_id}/messages")
     assert r.status_code == 403
+
+
+def test_get_messages_limit_clamped(client):
+    """limit > 200 is rejected by route validation."""
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r = client.get(f"/channels/{ch_id}/messages?limit=10000000")
+    assert r.status_code == 422  # FastAPI validation error

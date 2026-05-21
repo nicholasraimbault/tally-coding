@@ -106,7 +106,10 @@ def list_messages(
 
     `since_id` (if given) returns only messages with id > since_id (used by
     clients catching up after WebSocket reconnect).
+
+    `limit` is clamped to [1, 200] regardless of caller input.
     """
+    limit = min(max(1, limit), 200)
     where = ["channel_id=?"]
     params: list = [channel_id]
     if since_id is not None:

@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -5339,8 +5339,8 @@ async def post_message(
 @app.get("/channels/{channel_id}/messages")
 async def get_messages(
     channel_id: int,
-    limit: int = 50,
-    since_id: int | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    since_id: int | None = Query(default=None, ge=1),
     user: ClerkUser = Depends(require_user),
 ) -> dict:
     """Sprint 47: paginated message history.  Reverse chronological
