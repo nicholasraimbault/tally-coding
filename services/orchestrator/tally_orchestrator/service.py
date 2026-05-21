@@ -6306,6 +6306,24 @@ async def list_my_workspaces(
     }
 
 
+@app.get("/workspaces/{wid}/members")
+async def list_workspace_members_route(
+    wid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: list workspace_members.  Member-only access (returns
+    empty for non-members, doesn't leak workspace existence)."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (wid, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"members": []}
+    return {"members": db.list_workspace_members(workspace_id=wid)}
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 
