@@ -984,5 +984,44 @@ class TallyOrchClient {
     }
   }
 
+  // ── Sprint 48: task lifecycle (approve / edit / cancel) ─────────────────
+
+  Future<Map<String, dynamic>> approveTask({required String taskId}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/tasks/$taskId/approve'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /tasks/$taskId/approve ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> updateTaskTeamSpec({
+    required String taskId,
+    required Map<String, dynamic> teamSpec,
+  }) async {
+    final resp = await _http.patch(
+      baseUrl.resolve('/tasks/$taskId/team_spec'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'team_spec': teamSpec}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /tasks/$taskId/team_spec ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> cancelTask({required String taskId}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/tasks/$taskId/cancel'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /tasks/$taskId/cancel ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
   void close() => _http.close();
 }
