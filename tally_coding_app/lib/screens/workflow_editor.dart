@@ -2,18 +2,22 @@
 //
 // Sprint 48 B5+B6: wires in vyuh_node_flow's NodeFlowEditor + per-node config dialog
 // (B5) and per-edge condition + max_iterations config dialog (B6).
+// Sprint 49 B2: adds persistentAgentId constructor field; shows Trigger palette
+// node when in persistent-agent context; Trigger carries cronSchedule +
+// eventTriggers; save routes to updatePersistentAgent vs updateTaskTeamSpec.
 //
 // Data flow:
 //   initialTeamSpec (nodes_v1 JSON)
 //     → _specToNodes / _specToConnections  (on init)
 //     → NodeFlowController<_AgentNodeData, _EdgeData>
 //     → NodeFlowEditor (interactive canvas with drag, connect, pan, zoom)
-//     → NodeEvents.onTap → _NodeConfigDialog → mutates node.data + syncs _spec
+//     → NodeEvents.onTap → _NodeConfigDialog / _TriggerConfigDialog
 //     → ConnectionEvents.onTap → _EdgeConfigDialog → mutates conn.data + label
 //     → NodeEvents.onDragStop, ConnectionEvents.onCreated/onDeleted → _syncSpec
-//     → Save → PATCH /tasks/{id}/team_spec
+//     → Save → PATCH /tasks/{id}/team_spec  (task context)
+//           OR PATCH /persistent_agents/{id} (persistent-agent context)
 //
-// Palette: two Draggable<String> items targeting DragTarget wrapping the canvas.
+// Palette: Draggable<String> items targeting DragTarget wrapping the canvas.
 // Fallback "+ Add" buttons work without drag support.
 import 'dart:math' as math;
 
@@ -46,13 +50,18 @@ class _AgentNodeData implements NodeData {
     this.model = '',
     this.spec = '',
     this.workerAffinity = 'any',
+    this.cronSchedule = '',
+    this.eventTriggers = const <Map<String, dynamic>>[],
   });
 
-  final String kind; // 'agent' | 'output'
+  final String kind; // 'agent' | 'output' | 'trigger'
   String role;
   String model;
   String spec;
   String workerAffinity;
+  // Trigger-only fields (unused when kind != 'trigger').
+  String cronSchedule;
+  List<Map<String, dynamic>> eventTriggers;
 
   @override
   NodeData clone() => _AgentNodeData(
@@ -61,6 +70,8 @@ class _AgentNodeData implements NodeData {
     model: model,
     spec: spec,
     workerAffinity: workerAffinity,
+    cronSchedule: cronSchedule,
+    eventTriggers: List<Map<String, dynamic>>.from(eventTriggers),
   );
 }
 
@@ -86,6 +97,10 @@ List<Node<_AgentNodeData>> _specToNodes(Map<String, dynamic> spec) {
       model: (n['model'] as String?) ?? '',
       spec: (n['spec'] as String?) ?? '',
       workerAffinity: (n['worker_affinity'] as String?) ?? 'any',
+      cronSchedule: (n['cron_schedule'] as String?) ?? '',
+      eventTriggers:
+          (n['event_triggers'] as List?)?.cast<Map<String, dynamic>>() ??
+          const <Map<String, dynamic>>[],
     );
     // Lay nodes out horizontally if no saved position present.
     final xPos = (n['__x'] as num?)?.toDouble() ?? (i * 220.0 + 60);
@@ -103,22 +118,36 @@ List<Node<_AgentNodeData>> _specToNodes(Map<String, dynamic> spec) {
   return result;
 }
 
-List<Port> _portsForKind(String kind) => [
-  Port(
-    id: 'in',
-    name: 'in',
-    position: PortPosition.left,
-    type: PortType.input,
-    multiConnections: true,
-  ),
-  Port(
-    id: 'out',
-    name: 'out',
-    position: PortPosition.right,
-    type: PortType.output,
-    multiConnections: true,
-  ),
-];
+List<Port> _portsForKind(String kind) {
+  // Trigger nodes start the flow — they have no input port.
+  if (kind == 'trigger') {
+    return [
+      Port(
+        id: 'out',
+        name: 'out',
+        position: PortPosition.right,
+        type: PortType.output,
+        multiConnections: true,
+      ),
+    ];
+  }
+  return [
+    Port(
+      id: 'in',
+      name: 'in',
+      position: PortPosition.left,
+      type: PortType.input,
+      multiConnections: true,
+    ),
+    Port(
+      id: 'out',
+      name: 'out',
+      position: PortPosition.right,
+      type: PortType.output,
+      multiConnections: true,
+    ),
+  ];
+}
 
 List<Connection<_EdgeData>> _specToConnections(Map<String, dynamic> spec) {
   final rawEdges = (spec['edges'] as List<dynamic>?) ?? [];
@@ -170,10 +199,14 @@ Map<String, dynamic> _controllerToSpec(
     return <String, dynamic>{
       'id': node.id,
       'kind': d.kind,
-      'role': d.role,
-      'model': d.model,
-      'spec': d.spec,
-      'worker_affinity': d.workerAffinity,
+      if (d.kind == 'agent') 'role': d.role,
+      if (d.kind == 'agent') 'model': d.model,
+      if (d.kind == 'agent') 'spec': d.spec,
+      if (d.kind == 'agent') 'worker_affinity': d.workerAffinity,
+      if (d.kind == 'output') 'role': d.role,
+      if (d.kind == 'output') 'model': d.model,
+      if (d.kind == 'trigger') 'cron_schedule': d.cronSchedule,
+      if (d.kind == 'trigger') 'event_triggers': d.eventTriggers,
       '__x': node.position.value.dx,
       '__y': node.position.value.dy,
     };
@@ -205,15 +238,27 @@ Map<String, dynamic> _controllerToSpec(
 // ---------------------------------------------------------------------------
 class WorkflowEditorScreen extends StatefulWidget {
   final TallyOrchClient client;
-  final String taskId;
+
+  /// Task-context (Sprint 48): pass this when editing a task's team spec.
+  final String? taskId;
+
+  /// Persistent-agent context (Sprint 49 B2): pass this instead of taskId
+  /// when editing a persistent agent's workflow. Exactly one of taskId /
+  /// persistentAgentId must be non-null.
+  final int? persistentAgentId;
+
   final Map<String, dynamic> initialTeamSpec;
 
   const WorkflowEditorScreen({
     super.key,
     required this.client,
-    required this.taskId,
+    this.taskId,
+    this.persistentAgentId,
     required this.initialTeamSpec,
-  });
+  }) : assert(
+         taskId != null || persistentAgentId != null,
+         'Either taskId or persistentAgentId must be provided',
+       );
 
   @override
   State<WorkflowEditorScreen> createState() => _WorkflowEditorScreenState();
@@ -254,10 +299,18 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
     _syncSpec();
     setState(() => _saving = true);
     try {
-      await widget.client.updateTaskTeamSpec(
-        taskId: widget.taskId,
-        teamSpec: _spec,
-      );
+      if (widget.taskId != null) {
+        await widget.client.updateTaskTeamSpec(
+          taskId: widget.taskId!,
+          teamSpec: _spec,
+        );
+      } else if (widget.persistentAgentId != null) {
+        // Sprint 49 B2: persistent-agent context — send team_spec via PATCH.
+        await widget.client.updatePersistentAgent(
+          id: widget.persistentAgentId!,
+          patch: <String, dynamic>{'team_spec': _spec},
+        );
+      }
       if (mounted) Navigator.of(context).pop();
     } catch (e) {
       if (mounted) {
@@ -272,6 +325,20 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
 
   Future<void> _onNodeTap(Node<_AgentNodeData> node) async {
     final data = node.data;
+
+    if (data.kind == 'trigger') {
+      final updated = await showDialog<_AgentNodeData>(
+        context: context,
+        builder: (_) => _TriggerConfigDialog(initial: data),
+      );
+      if (updated == null || !mounted) return;
+      data
+        ..cronSchedule = updated.cronSchedule
+        ..eventTriggers = updated.eventTriggers;
+      _syncSpec();
+      return;
+    }
+
     final updated = await showDialog<_AgentNodeData>(
       context: context,
       builder: (_) => _NodeConfigDialog(initial: data),
@@ -321,6 +388,9 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
     _syncSpec();
   }
 
+  bool get _hasTriggerNode =>
+      _controller.nodes.values.any((n) => n.data.kind == 'trigger');
+
   bool get _hasOutputNode =>
       _controller.nodes.values.any((n) => n.data.kind == 'output');
 
@@ -341,9 +411,13 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
       ),
     );
 
+    final titleText = widget.taskId != null
+        ? 'Edit team for ${widget.taskId!.substring(0, 8)}'
+        : 'Edit workflow for agent #${widget.persistentAgentId}';
+
     return Scaffold(
       appBar: AppBar(
-        title: Text('Edit team for ${widget.taskId.substring(0, 8)}'),
+        title: Text(titleText),
         actions: [
           TextButton(
             onPressed: _saving ? null : _save,
@@ -360,6 +434,8 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
               color: const Color(0xFF2B2D31),
               child: _Palette(
                 hasOutputNode: _hasOutputNode,
+                hasTriggerNode: _hasTriggerNode,
+                showTrigger: widget.persistentAgentId != null,
                 onAddFallback: (kind) {
                   _addNode(
                     kind,
@@ -376,6 +452,7 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
               events: events,
               onDropKind: (kind, localPosition) {
                 if (kind == 'output' && _hasOutputNode) return;
+                if (kind == 'trigger' && _hasTriggerNode) return;
                 _addNode(kind, localPosition);
               },
             ),
@@ -391,9 +468,18 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
 // ---------------------------------------------------------------------------
 class _Palette extends StatelessWidget {
   final bool hasOutputNode;
+  final bool hasTriggerNode;
+
+  /// Whether to show the Trigger palette item (true in persistent-agent context).
+  final bool showTrigger;
   final void Function(String kind) onAddFallback;
 
-  const _Palette({required this.hasOutputNode, required this.onAddFallback});
+  const _Palette({
+    required this.hasOutputNode,
+    required this.hasTriggerNode,
+    required this.showTrigger,
+    required this.onAddFallback,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -412,6 +498,18 @@ class _Palette extends StatelessWidget {
             ),
           ),
         ),
+        if (showTrigger) ...[
+          _PaletteItem(
+            kind: 'trigger',
+            label: 'Trigger',
+            icon: Icons.alarm,
+            color: const Color(0xFFED4245),
+            // Trigger is a singleton — disable when already present.
+            disabled: hasTriggerNode,
+            onAddFallback: onAddFallback,
+          ),
+          const SizedBox(height: 6),
+        ],
         _PaletteItem(
           kind: 'agent',
           label: 'Agent',
@@ -578,8 +676,12 @@ class _AgentNodeWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     final data = node.data;
     final isOutput = data.kind == 'output';
-    final accentColor =
-        isOutput ? const Color(0xFF57F287) : const Color(0xFF5865F2);
+    final isTrigger = data.kind == 'trigger';
+    final accentColor = isTrigger
+        ? const Color(0xFFED4245)
+        : isOutput
+            ? const Color(0xFF57F287)
+            : const Color(0xFF5865F2);
 
     return Observer(
       builder: (_) {
@@ -603,15 +705,17 @@ class _AgentNodeWidget extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Icon(
-                    isOutput
-                        ? Icons.output_outlined
-                        : Icons.smart_toy_outlined,
+                    isTrigger
+                        ? Icons.alarm
+                        : isOutput
+                            ? Icons.output_outlined
+                            : Icons.smart_toy_outlined,
                     color: accentColor,
                     size: 13,
                   ),
                   const SizedBox(width: 5),
                   Text(
-                    isOutput ? 'Output' : 'Agent',
+                    isTrigger ? 'Trigger' : isOutput ? 'Output' : 'Agent',
                     style: TextStyle(
                       color: accentColor,
                       fontSize: 10,
@@ -621,35 +725,56 @@ class _AgentNodeWidget extends StatelessWidget {
                   ),
                 ],
               ),
-              if (data.role.isNotEmpty) ...[
+              if (isTrigger) ...[
                 const SizedBox(height: 4),
-                Text(
-                  data.role,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
+                if (data.cronSchedule.isNotEmpty)
+                  Text(
+                    data.cronSchedule,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
                   ),
-                ),
-              ],
-              if (data.model.isNotEmpty) ...[
-                const SizedBox(height: 2),
-                Text(
-                  data.model,
-                  style: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
+                if (data.eventTriggers.isNotEmpty)
+                  Text(
+                    '${data.eventTriggers.length} event trigger'
+                    '${data.eventTriggers.length == 1 ? '' : 's'}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 10),
                   ),
-                ),
-              ],
-              if (data.role.isEmpty && !isOutput)
-                const Padding(
-                  padding: EdgeInsets.only(top: 4),
-                  child: Text(
+                if (data.cronSchedule.isEmpty && data.eventTriggers.isEmpty)
+                  const Text(
                     'Tap to configure',
                     style: TextStyle(color: Colors.white38, fontSize: 10),
                   ),
-                ),
+              ] else ...[
+                if (data.role.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    data.role,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+                if (data.model.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    data.model,
+                    style: const TextStyle(color: Colors.white38, fontSize: 10),
+                  ),
+                ],
+                if (data.role.isEmpty && !isOutput)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 4),
+                    child: Text(
+                      'Tap to configure',
+                      style: TextStyle(color: Colors.white38, fontSize: 10),
+                    ),
+                  ),
+              ],
             ],
           ),
         );
@@ -740,6 +865,190 @@ class _EdgeConfigDialogState extends State<_EdgeConfigDialog> {
               ),
             ),
           ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _save,
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// _TriggerConfigDialog — per-trigger config: cronSchedule + eventTriggers
+// ---------------------------------------------------------------------------
+class _TriggerConfigDialog extends StatefulWidget {
+  final _AgentNodeData initial;
+
+  const _TriggerConfigDialog({required this.initial});
+
+  @override
+  State<_TriggerConfigDialog> createState() => _TriggerConfigDialogState();
+}
+
+class _TriggerConfigDialogState extends State<_TriggerConfigDialog> {
+  late TextEditingController _cronCtrl;
+  late List<Map<String, dynamic>> _triggers;
+  late List<TextEditingController> _nameCtrlList;
+
+  // Common cron presets for quick entry.
+  static const _commonCrons = <Map<String, String>>[
+    {'label': 'every minute', 'value': '* * * * *'},
+    {'label': 'every hour', 'value': '0 * * * *'},
+    {'label': 'daily 9am', 'value': '0 9 * * *'},
+    {'label': 'weekdays 9am', 'value': '0 9 * * 1-5'},
+    {'label': 'nightly 9pm', 'value': '0 21 * * *'},
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _cronCtrl = TextEditingController(text: widget.initial.cronSchedule);
+    _triggers = List<Map<String, dynamic>>.from(
+      widget.initial.eventTriggers.map((t) => Map<String, dynamic>.from(t)),
+    );
+    _nameCtrlList = _triggers
+        .map((t) => TextEditingController(text: (t['name'] as String?) ?? ''))
+        .toList();
+  }
+
+  @override
+  void dispose() {
+    _cronCtrl.dispose();
+    for (final c in _nameCtrlList) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  void _addEventTrigger() {
+    setState(() {
+      _triggers.add(<String, dynamic>{
+        'kind': 'http',
+        'name': 'webhook ${_triggers.length + 1}',
+      });
+      _nameCtrlList.add(
+        TextEditingController(text: 'webhook ${_triggers.length}'),
+      );
+    });
+  }
+
+  void _removeEventTrigger(int index) {
+    setState(() {
+      _nameCtrlList[index].dispose();
+      _nameCtrlList.removeAt(index);
+      _triggers.removeAt(index);
+    });
+  }
+
+  void _save() {
+    // Flush name controller text back into trigger maps before returning.
+    for (var i = 0; i < _triggers.length; i++) {
+      _triggers[i]['name'] = _nameCtrlList[i].text.trim();
+    }
+    Navigator.of(context).pop(
+      _AgentNodeData(
+        kind: 'trigger',
+        cronSchedule: _cronCtrl.text.trim(),
+        eventTriggers: List<Map<String, dynamic>>.from(_triggers),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Trigger config'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Cron schedule',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              TextField(
+                controller: _cronCtrl,
+                decoration: const InputDecoration(
+                  hintText: '0 9 * * *  (leave blank to disable)',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  for (final pat in _commonCrons)
+                    ActionChip(
+                      label: Text(
+                        pat['label']!,
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                      onPressed: () =>
+                          setState(() => _cronCtrl.text = pat['value']!),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Event triggers',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              for (int i = 0; i < _triggers.length; i++)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.webhook, size: 20),
+                  title: TextField(
+                    controller: _nameCtrlList[i],
+                    decoration: const InputDecoration(
+                      labelText: 'name',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  subtitle: _triggers[i].containsKey('id')
+                      ? SelectableText(
+                          'ID: ${_triggers[i]['id']}'
+                          '${_triggers[i].containsKey('secret') ? '\nSecret: ${_triggers[i]['secret']}' : ''}',
+                          style: const TextStyle(
+                            fontSize: 10,
+                            color: Color(0xFF949BA4),
+                          ),
+                        )
+                      : const Text(
+                          'Save → server will generate id + secret',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Color(0xFF949BA4),
+                          ),
+                        ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    tooltip: 'Remove trigger',
+                    onPressed: () => _removeEventTrigger(i),
+                  ),
+                ),
+              TextButton.icon(
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('Add event trigger'),
+                onPressed: _addEventTrigger,
+              ),
+            ],
+          ),
         ),
       ),
       actions: [
