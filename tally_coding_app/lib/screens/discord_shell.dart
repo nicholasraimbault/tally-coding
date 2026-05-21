@@ -27,6 +27,7 @@ import 'billing_screen.dart';
 import 'custom_roles_screen.dart';
 import 'general_channel.dart';
 import 'notifications_screen.dart';
+import 'persistent_agents.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
@@ -272,6 +273,17 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     error: _error,
                     onSelect: (sel) => setState(() => _selected = sel),
                     onRetry: _fetch,
+                    onNewScheduled: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => PersistentAgentsScreen(
+                          client: widget.client,
+                          workspaceId: 1,
+                        ),
+                      ),
+                    ),
+                    onNewDm: () => ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Direct messages coming in B6')),
+                    ),
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   Expanded(child: _mainPane()),
@@ -333,6 +345,23 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           _openNotifications(context);
         },
         onSignOut: () => resetTallyConfig(context),
+        onNewScheduled: () {
+          Navigator.of(context).pop();
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => PersistentAgentsScreen(
+                client: widget.client,
+                workspaceId: 1,
+              ),
+            ),
+          );
+        },
+        onNewDm: () {
+          Navigator.of(context).pop();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Direct messages coming in B6')),
+          );
+        },
       ),
       body: SafeArea(
         top: false,
@@ -587,6 +616,8 @@ class _ChannelList extends StatelessWidget {
   final String? error;
   final ValueChanged<ChannelSelection> onSelect;
   final VoidCallback onRetry;
+  final VoidCallback onNewScheduled;
+  final VoidCallback onNewDm;
   /// Sprint 31: when null the list fills its parent (drawer mode);
   /// when set it pins to that width (desktop left rail = 240).
   final double? width;
@@ -597,6 +628,8 @@ class _ChannelList extends StatelessWidget {
     required this.error,
     required this.onSelect,
     required this.onRetry,
+    required this.onNewScheduled,
+    required this.onNewDm,
     this.width = 240,
   });
 
@@ -630,68 +663,90 @@ class _ChannelList extends StatelessWidget {
             ),
           ),
           Container(height: 1, color: const Color(0xFF1E1F22)),
-          const SizedBox(height: 8),
-          _ChannelTile(
-            icon: const Text('✨', style: TextStyle(fontSize: 16)),
-            label: 'general',
-            selected: selected is GeneralSelected,
-            onTap: () => onSelect(const GeneralSelected()),
-          ),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-            child: Text(
-              'TASKS',
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: const Color(0xFF8E9297),
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                  ),
-            ),
-          ),
-          Expanded(child: _taskListBody(context)),
+          Expanded(child: _scrollableBody(context)),
         ],
       ),
     );
   }
 
-  Widget _taskListBody(BuildContext context) {
-    if (error != null && tasks.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            const Icon(Icons.cloud_off, color: Color(0xFF99AAB5)),
-            const SizedBox(height: 8),
-            Text(error!, style: const TextStyle(color: Color(0xFF99AAB5), fontSize: 11)),
-            const SizedBox(height: 8),
-            OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
-          ],
+  Widget _scrollableBody(BuildContext context) {
+    return ListView(
+      children: [
+        const SizedBox(height: 8),
+        _ChannelTile(
+          icon: const Text('✨', style: TextStyle(fontSize: 16)),
+          label: 'general',
+          selected: selected is GeneralSelected,
+          onTap: () => onSelect(const GeneralSelected()),
         ),
-      );
+        const SizedBox(height: 12),
+        _categoryHeader(context, 'TASKS'),
+        ..._taskItems(context),
+        const SizedBox(height: 12),
+        // Sprint 49 B5: Scheduled category
+        _categoryHeader(context, 'SCHEDULED'),
+        _NewTile(label: '+ New scheduled', onTap: onNewScheduled),
+        const SizedBox(height: 12),
+        // Sprint 49 B5: Direct messages category
+        _categoryHeader(context, 'DIRECT MESSAGES'),
+        _NewTile(label: '+ New DM', onTap: onNewDm),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  Widget _categoryHeader(BuildContext context, String label) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+      child: Text(
+        label,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: const Color(0xFF8E9297),
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+            ),
+      ),
+    );
+  }
+
+  List<Widget> _taskItems(BuildContext context) {
+    if (error != null && tasks.isEmpty) {
+      return [
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              const Icon(Icons.cloud_off, color: Color(0xFF99AAB5)),
+              const SizedBox(height: 8),
+              Text(error!, style: const TextStyle(color: Color(0xFF99AAB5), fontSize: 11)),
+              const SizedBox(height: 8),
+              OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
+            ],
+          ),
+        ),
+      ];
     }
     if (tasks.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.all(16),
-        child: Text(
-          'No tasks yet.\nType in #general to start one.',
-          style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+      return const [
+        Padding(
+          padding: EdgeInsets.all(16),
+          child: Text(
+            'No tasks yet.\nType in #general to start one.',
+            style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+          ),
         ),
-      );
+      ];
     }
-    return ListView.builder(
-      itemCount: tasks.length,
-      itemBuilder: (context, i) {
-        final t = tasks[i];
-        return _ChannelTile(
+    return [
+      for (final t in tasks)
+        _ChannelTile(
           icon: _statusGlyph(t.status),
           label: t.channelTitle,
           subtitle: '#${t.id.substring(0, 8)} · ${t.status}',
           selected: selected is TaskSelected && (selected as TaskSelected).taskId == t.id,
           onTap: () => onSelect(TaskSelected(t.id)),
-        );
-      },
-    );
+        ),
+    ];
   }
 
   Widget _statusGlyph(String status) {
@@ -704,6 +759,50 @@ class _ChannelList extends StatelessWidget {
       _ => (Icons.tag, Color(0xFF8E9297)),
     };
     return Icon(icon, color: color, size: 14);
+  }
+}
+
+/// A tappable "+ New" row shown at the bottom of each category section.
+class _NewTile extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+  const _NewTile({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(
+              children: [
+                const SizedBox(
+                  width: 20,
+                  child: Center(
+                    child: Icon(Icons.add, color: Color(0xFF8E9297), size: 14),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: Color(0xFF8E9297),
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -1018,6 +1117,8 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onOpenProjects;
   final VoidCallback onOpenNotifications;
   final VoidCallback onSignOut;
+  final VoidCallback onNewScheduled;
+  final VoidCallback onNewDm;
   const _NarrowDrawer({
     required this.tasks,
     required this.selected,
@@ -1030,6 +1131,8 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onOpenProjects,
     required this.onOpenNotifications,
     required this.onSignOut,
+    required this.onNewScheduled,
+    required this.onNewDm,
   });
 
   @override
@@ -1047,6 +1150,8 @@ class _NarrowDrawer extends StatelessWidget {
                 error: error,
                 onSelect: onSelect,
                 onRetry: onRetry,
+                onNewScheduled: onNewScheduled,
+                onNewDm: onNewDm,
                 width: null,
               ),
             ),
