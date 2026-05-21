@@ -4653,6 +4653,51 @@ async def patch_task_team_spec(
     return {"id": task_id, "status": status, "team_spec": body.team_spec}
 
 
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task_route(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: cancel a proposed task.  Owner-only.  Updates the
+    team_proposal message to mark it cancelled (UI greys buttons)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can cancel")
+    if status != "proposed":
+        raise HTTPException(409, f"only proposed tasks can be cancelled (current: {status})")
+    db._conn.execute(
+        "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?",
+        (time.time(), task_id),
+    )
+    msg_row = db._conn.execute(
+        "SELECT m.id, m.channel_id, m.payload_json FROM messages m "
+        "JOIN channels c ON m.channel_id=c.id "
+        "JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id=? AND c.kind='general' "
+        "AND m.kind='team_proposal' AND json_extract(m.payload_json, '$.task_id')=? "
+        "ORDER BY m.id DESC LIMIT 1",
+        (user.id, task_id),
+    ).fetchone()
+    if msg_row is not None:
+        msg_id, channel_id, payload_json = msg_row
+        payload = json.loads(payload_json)
+        payload["cancelled"] = True
+        db._conn.execute(
+            "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+            (json.dumps(payload), time.time(), msg_id),
+        )
+        t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+        _background_tasks.add(t)
+        t.add_done_callback(_background_tasks.discard)
+    return {"id": task_id, "status": "cancelled"}
+
+
 @app.get("/tasks", response_model=list[TaskResponse])
 async def list_tasks(
     limit: int = 100,

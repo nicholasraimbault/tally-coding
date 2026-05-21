@@ -177,3 +177,62 @@ def test_patch_team_spec_non_owner_returns_403(client):
     )
     r2 = client.patch(f"/tasks/{task_id}/team_spec", json={"team_spec": {"nodes": [], "edges": []}})
     assert r2.status_code == 403
+
+
+def test_cancel_proposed_task(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    r2 = client.post(f"/tasks/{task_id}/cancel")
+    assert r2.status_code == 200
+    db = svc.state["db"]
+    status = db._conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    assert status == "cancelled"
+
+
+def test_cancel_409_after_approve(client):
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    client.post(f"/tasks/{task_id}/approve")
+    r2 = client.post(f"/tasks/{task_id}/cancel")
+    assert r2.status_code == 409
+
+
+def test_cancel_non_owner_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.post(f"/tasks/{task_id}/cancel")
+    assert r2.status_code == 403
+
+
+def test_cancel_marks_team_proposal_message(client):
+    """The original team_proposal message gets `cancelled: true` in its payload."""
+    import json as _json
+    import tally_orchestrator.service as svc
+    r = client.post(
+        "/tasks",
+        json={
+            "description": "x",
+            "team_spec": {"agents": [{"role": "Coder"}]},
+        },
+    )
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    client.post(f"/tasks/{task_id}/cancel")
+    db = svc.state["db"]
+    row = db._conn.execute(
+        "SELECT payload_json FROM messages WHERE kind='team_proposal' "
+        "AND json_extract(payload_json, '$.task_id')=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    payload = _json.loads(row[0])
+    assert payload.get("cancelled") is True
