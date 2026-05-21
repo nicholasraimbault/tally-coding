@@ -5364,6 +5364,50 @@ async def get_messages(
     return {"channel_id": channel_id, "messages": msgs}
 
 
+@app.patch("/channels/{channel_id}/messages/{message_id}")
+async def patch_message(
+    channel_id: int,
+    message_id: int,
+    body: MessagePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: edit a message.  Author-only (admins cannot edit
+    other users' messages; that would be a moderation concern out of
+    scope for v1)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT author_user_id, payload_json FROM messages "
+        "WHERE id=? AND channel_id=?",
+        (message_id, channel_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "message not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "only the author can edit a message")
+    text = (body.text or "").strip()
+    if not text and not body.payload:
+        raise HTTPException(400, "nothing to update")
+    payload = dict(body.payload) if body.payload else json.loads(row[1])
+    if text:
+        payload["text"] = text
+    db._conn.execute(
+        "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+        (json.dumps(payload), time.time(), message_id),
+    )
+    new_row = db._conn.execute(
+        "SELECT id, channel_id, author_kind, author_user_id, author_agent_id, "
+        "kind, payload_json, reply_to_id, created_at, edited_at "
+        "FROM messages WHERE id=?",
+        (message_id,),
+    ).fetchone()
+    return {
+        "id": new_row[0], "channel_id": new_row[1], "author_kind": new_row[2],
+        "author_user_id": new_row[3], "author_agent_id": new_row[4],
+        "kind": new_row[5], "payload_json": new_row[6], "reply_to_id": new_row[7],
+        "created_at": new_row[8], "edited_at": new_row[9],
+    }
+
+
 async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
     """Placeholder; Task A10 implements the WebSocket fan-out."""
     pass

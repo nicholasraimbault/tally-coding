@@ -156,3 +156,35 @@ def test_get_messages_limit_clamped(client):
     ch_id = _admin_general_channel_id(svc)
     r = client.get(f"/channels/{ch_id}/messages?limit=10000000")
     assert r.status_code == 422  # FastAPI validation error
+
+
+def test_patch_message_author_succeeds(client):
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r = client.post(f"/channels/{ch_id}/messages", json={"text": "before"})
+    msg_id = r.json()["id"]
+    r2 = client.patch(f"/channels/{ch_id}/messages/{msg_id}", json={"text": "after"})
+    assert r2.status_code == 200
+    assert json.loads(r2.json()["payload_json"])["text"] == "after"
+    assert r2.json()["edited_at"] is not None
+
+
+def test_patch_message_non_author_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    ch_id = _admin_general_channel_id(svc)
+    r = client.post(f"/channels/{ch_id}/messages", json={"text": "by admin"})
+    msg_id = r.json()["id"]
+    # Switch to a different user
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="other", source="clerk", plan="free", email="o@x.com",
+    )
+    r2 = client.patch(f"/channels/{ch_id}/messages/{msg_id}", json={"text": "hacked"})
+    assert r2.status_code == 403
+
+
+def test_patch_unknown_message_returns_404(client):
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r = client.patch(f"/channels/{ch_id}/messages/99999", json={"text": "x"})
+    assert r.status_code == 404
