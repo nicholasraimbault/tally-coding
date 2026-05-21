@@ -1,5 +1,89 @@
-"""Sprint 50: workspace CRUD helpers."""
+"""Sprint 50: workspace CRUD helpers + POST /workspaces HTTP route."""
+import pytest
+from fastapi.testclient import TestClient
+
 from tally_orchestrator.service import Db
+
+
+# ── HTTP route fixture ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_db_path):
+    monkeypatch.setenv("ORCH_DB_PATH", tmp_db_path)
+    monkeypatch.setenv("TALLY_API_TOKEN", "test-token")
+    monkeypatch.setenv("REDPILL_API_KEY", "")
+    import importlib
+    import tally_orchestrator.service as svc
+    importlib.reload(svc)
+
+    db = svc.Db(tmp_db_path)
+    event_bus = svc.EventBus()
+    orchestrator = svc.Orchestrator(
+        tally_url="http://localhost:9999",
+        identity_path=tmp_db_path + ".orch.key",
+        mls_state_base_dir=tmp_db_path + ".mls",
+        db=db,
+        event_bus=event_bus,
+    )
+    orchestrator.redpill_key = None
+    svc.state["db"] = db
+    svc.state["orchestrator"] = orchestrator
+    svc.state["event_bus"] = event_bus
+    svc.state["api_token"] = "test-token"
+    svc.state["pool_ready"] = True
+    svc.state["pool_status"] = {"target_size": 0, "joined": 0, "last_error": None}
+
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="admin", source="admin", plan="unlimited", email="admin@x.com",
+    )
+    yield TestClient(svc.app)
+    svc.app.dependency_overrides.clear()
+
+
+# ── POST /workspaces tests ─────────────────────────────────────────────────────
+
+
+def test_post_workspace_returns_id(client):
+    r = client.post("/workspaces", json={"name": "My New Workspace"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "My New Workspace"
+    assert body["id"] > 0
+    assert body.get("role") == "owner"
+
+
+def test_post_workspace_creates_general_backlog(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/workspaces", json={"name": "W"})
+    wid = r.json()["id"]
+    db = svc.state["db"]
+    kinds = {row[0] for row in db._conn.execute(
+        "SELECT kind FROM channels WHERE workspace_id=?", (wid,)
+    ).fetchall()}
+    assert {"general", "backlog"}.issubset(kinds)
+
+
+def test_post_workspace_enforces_20_cap(client):
+    import tally_orchestrator.service as svc
+    db = svc.state["db"]
+    # The Db backfill always creates 1 workspace for "admin".
+    # Seed 18 more directly to bring the total to 19.
+    for i in range(18):
+        db.create_workspace(name=f"seeded-{i}", owner_user_id="admin")
+    # 20th via HTTP must succeed (fills the cap exactly)
+    r = client.post("/workspaces", json={"name": "20th"})
+    assert r.status_code == 200
+    # 21st must fail with 429 workspace_limit
+    r = client.post("/workspaces", json={"name": "21st"})
+    assert r.status_code == 429
+    body = r.json()
+    assert body["detail"]["error"] == "workspace_limit"
+    assert body["detail"]["limit"] == 20
+
+
+# ── Db-level unit tests ────────────────────────────────────────────────────────
 
 
 def test_create_workspace_returns_id(db: Db):

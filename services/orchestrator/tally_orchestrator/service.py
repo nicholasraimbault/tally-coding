@@ -696,6 +696,10 @@ class DmCreateRequest(BaseModel):
     target_id: str | None = None
 
 
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6156,6 +6160,30 @@ async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
     db: Db = state["db"]
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
     return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
+
+
+# ── Sprint 50 A3: workspace create route ──────────────────────────────────────
+
+
+@app.post("/workspaces")
+async def create_workspace_route(
+    body: WorkspaceCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: create a workspace owned by the caller.
+    Enforces 20-per-user soft cap (429 workspace_limit)."""
+    db: Db = state["db"]
+    existing = db._conn.execute(
+        "SELECT COUNT(*) FROM workspaces WHERE owner_user_id=? AND deleted_at IS NULL",
+        (user.id,),
+    ).fetchone()[0]
+    if existing >= 20:
+        raise HTTPException(429, {"error": "workspace_limit", "limit": 20, "current": existing})
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "workspace name required")
+    wid = db.create_workspace(name=name, owner_user_id=user.id)
+    return {"id": wid, "name": name, "role": "owner"}
 
 
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
