@@ -2769,6 +2769,20 @@ def _resolve_stages(raw: Any, n_agents: int) -> list[list[int]]:
 
 
 # ---------------------------------------------------------------------------
+# Sprint 50: per-node tool allowlist helper
+# ---------------------------------------------------------------------------
+
+def _effective_tools_for_node(role_tools: list[str], node_allowlist: list[str] | None) -> list[str]:
+    """Sprint 50: intersect a role's allowed tools with a node's optional
+    allowlist.  None allowlist = use all role tools; [] allowlist =
+    deliberately no tools.  Output preserves role_tools order."""
+    if node_allowlist is None:
+        return list(role_tools)
+    allowed_set = set(node_allowlist)
+    return [t for t in role_tools if t in allowed_set]
+
+
+# ---------------------------------------------------------------------------
 # Sprint 48: nodes_v1 graph-traversal helpers
 # ---------------------------------------------------------------------------
 
@@ -3380,6 +3394,27 @@ class Orchestrator:
                             "UPDATE agents SET last_user_msg_ts=? WHERE id=?",
                             (user_msgs[-1]["created_at"], agent["id"]),
                         )
+                # Sprint 50: per-node tool_allowlist intersects with role tools.
+                # nodes_v1: look up the nth agent-kind node; flat: look up
+                # agents[agent_idx].  None allowlist = full role tools.
+                node_allowlist: list[str] | None = None
+                try:
+                    from .team_spec_compat import is_nodes_v1
+                    if is_nodes_v1(team_spec):
+                        agent_nodes = [n for n in team_spec.get("nodes", []) if n.get("kind") == "agent"]
+                        if 0 <= agent_idx < len(agent_nodes):
+                            raw = agent_nodes[agent_idx].get("tool_allowlist")
+                            if isinstance(raw, list):
+                                node_allowlist = [str(t) for t in raw]
+                    else:
+                        agents_flat = team_spec.get("agents") or []
+                        if 0 <= agent_idx < len(agents_flat):
+                            raw = agents_flat[agent_idx].get("tool_allowlist")
+                            if isinstance(raw, list):
+                                node_allowlist = [str(t) for t in raw]
+                except Exception:
+                    node_allowlist = None
+                effective_tools = _effective_tools_for_node(role.get("tools", []), node_allowlist)
                 payload_obj = {
                     "task": task["description"],
                     "task_id": task["id"],
@@ -3390,7 +3425,7 @@ class Orchestrator:
                         "model": agent["model"],
                         "spec": agent_spec_text,
                         "system_prompt": role.get("system_prompt", ""),
-                        "tools": role.get("tools", []),
+                        "tools": effective_tools,
                     },
                     # Sprint 26: hand the agent its predecessors' files.
                     # Empty on the first agent in a team.
