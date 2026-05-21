@@ -6186,6 +6186,28 @@ async def create_workspace_route(
     return {"id": wid, "name": name, "role": "owner"}
 
 
+@app.get("/me/workspaces")
+async def list_my_workspaces(
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: list all workspaces the caller is a member of."""
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT w.id, w.name, wm.role, w.created_at "
+        "FROM workspaces w JOIN workspace_members wm ON wm.workspace_id=w.id "
+        "WHERE wm.user_id=? AND wm.member_kind='human' "
+        "AND w.deleted_at IS NULL "
+        "ORDER BY w.created_at ASC",
+        (user.id,),
+    ).fetchall()
+    return {
+        "workspaces": [
+            {"id": r[0], "name": r[1], "role": r[2], "created_at": r[3]}
+            for r in rows
+        ],
+    }
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 

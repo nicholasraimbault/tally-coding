@@ -120,3 +120,31 @@ def test_create_workspace_adds_tally_to_general_and_backlog(db: Db):
         ).fetchall()}
         assert "human" in members
         assert "tally" in members
+
+
+# ── GET /me/workspaces tests ───────────────────────────────────────────────────
+
+
+def test_get_me_workspaces_returns_caller_memberships(client):
+    client.post("/workspaces", json={"name": "W2"})
+    client.post("/workspaces", json={"name": "W3"})
+    r = client.get("/me/workspaces")
+    assert r.status_code == 200
+    body = r.json()
+    # admin has 1 from backfill + 2 just created
+    assert len(body["workspaces"]) == 3
+    names = {w["name"] for w in body["workspaces"]}
+    assert "W2" in names
+    assert "W3" in names
+    assert all("role" in w and "id" in w for w in body["workspaces"])
+
+
+def test_get_me_workspaces_skips_deleted(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/workspaces", json={"name": "deleted-soon"})
+    wid = r.json()["id"]
+    svc.state["db"]._conn.execute(
+        "UPDATE workspaces SET deleted_at=? WHERE id=?", (1.0, wid)
+    )
+    r = client.get("/me/workspaces")
+    assert not any(w["id"] == wid for w in r.json()["workspaces"])
