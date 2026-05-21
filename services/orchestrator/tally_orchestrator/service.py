@@ -2277,6 +2277,66 @@ def _resolve_stages(raw: Any, n_agents: int) -> list[list[int]]:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Sprint 48: nodes_v1 graph-traversal helpers
+# ---------------------------------------------------------------------------
+
+def _nodes_v1_entry_nodes(spec: dict) -> set[str]:
+    """Sprint 48: return the set of node ids with no incoming edge
+    (entry points dispatched first in nodes_v1 mode)."""
+    all_ids = {n["id"] for n in spec.get("nodes", [])}
+    targets = {e["to"] for e in spec.get("edges", [])}
+    return all_ids - targets
+
+
+def _nodes_v1_next_ready(spec: dict, completed: dict[str, str]) -> set[str]:
+    """Sprint 48: return node ids that are NOT yet completed but whose
+    incoming edges have all fired given the ``completed`` map
+    ``{node_id: 'succeeded'|'failed'}``.
+
+    Edge firing rules:
+      - ``'always'`` (default): fires when source completes regardless of status
+      - ``'if_succeeded'``: fires only if source status == ``'succeeded'``
+      - ``'if_failed'``: fires only if source status == ``'failed'``
+      - ``'if_returned'``: Sprint 48 parses but doesn't evaluate (deferred)
+
+    A node becomes ready when ALL its incoming edges have fired
+    (AND semantics across incoming edges).
+    """
+    ready: set[str] = set()
+    completed_ids = set(completed.keys())
+    for node in spec.get("nodes", []):
+        nid = node["id"]
+        if nid in completed_ids:
+            continue
+        incoming = [e for e in spec.get("edges", []) if e["to"] == nid]
+        if not incoming:
+            continue  # entry node — caller dispatches separately
+        all_fired = True
+        for edge in incoming:
+            src = edge["from"]
+            if src not in completed:
+                all_fired = False
+                break
+            condition = edge.get("condition", "always")
+            src_status = completed[src]
+            if condition == "always":
+                pass
+            elif condition == "if_succeeded" and src_status != "succeeded":
+                all_fired = False
+                break
+            elif condition == "if_failed" and src_status != "failed":
+                all_fired = False
+                break
+            elif condition == "if_returned":
+                # Sprint 48 parses but doesn't evaluate — deferred to Sprint 48.5
+                all_fired = False
+                break
+        if all_fired:
+            ready.add(nid)
+    return ready
+
+
 class EventBus:
     """In-memory per-task subscriber lists, used to push events to SSE clients
     the moment they're persisted (instead of forcing the client to poll the DB).
@@ -2630,7 +2690,71 @@ class Orchestrator:
         stages: `team_spec["stages"]` is `list[list[int]]`; every agent
         in stage N runs concurrently, the next stage starts when stage N
         is fully complete.
+
+        Sprint 48: when ``team_spec`` is nodes_v1 format (``"nodes"`` +
+        ``"edges"`` keys), use graph-traversal helpers to identify entry
+        nodes and dispatch them.  The advancement logic lives in
+        ``_handle_result_event``'s nodes_v1 branch.
         """
+        from .team_spec_compat import is_nodes_v1
+
+        # ---------------------------------------------------------------
+        # Sprint 48: nodes_v1 dispatch path
+        # ---------------------------------------------------------------
+        if is_nodes_v1(team_spec):
+            nodes = team_spec.get("nodes", [])
+            # Filter to dispatchable (agent-kind) nodes only.
+            agent_nodes = [n for n in nodes if n.get("kind", "agent") == "agent"]
+            if not agent_nodes:
+                self.db.mark_failed(task["id"], "nodes_v1 team_spec has no agent nodes")
+                await self._publish_status(task["id"], "failed",
+                                           {"error": "nodes_v1 team_spec has no agent nodes"})
+                return
+            owner_id = task.get("user_id")
+            role_scope = owner_id if owner_id and owner_id not in ("admin", "legacy-admin") else None
+            # Insert ALL agent nodes up-front so the team shape is visible
+            # in /admin/status.  Each node's list-index becomes agent_idx.
+            for idx, node in enumerate(nodes):
+                if node.get("kind", "agent") != "agent":
+                    continue  # skip output / terminal marker nodes
+                role_name = node.get("role")
+                role = self.db.get_agent_role(role_name, user_id=role_scope)
+                if not role:
+                    self.db.mark_failed(task["id"], f"unknown role: {role_name}")
+                    await self._publish_status(task["id"], "failed",
+                                               {"error": f"unknown role: {role_name}"})
+                    return
+                self.db.insert_agent(
+                    task_id=task["id"],
+                    agent_idx=idx,
+                    role=role_name,
+                    model=node.get("model") or role["default_model"],
+                    spec=node.get("spec", ""),
+                )
+            self.db.mark_running(task["id"])
+            await self._publish_status(task["id"], "running", {"team_size": len(agent_nodes)})
+            # Determine entry nodes (those with no incoming edge).
+            entry_ids = _nodes_v1_entry_nodes(team_spec)
+            all_agents = self.db.list_agents(task["id"])
+            by_idx = {a["agent_idx"]: a for a in all_agents}
+            # Map node_id → agent_idx for dispatch.
+            node_id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
+            entry_agents = [
+                by_idx[node_id_to_idx[nid]]
+                for nid in entry_ids
+                if nid in node_id_to_idx and node_id_to_idx[nid] in by_idx
+            ]
+            logger.info(
+                "starting nodes_v1 team for task %s: %d agent nodes, entries = [%s]",
+                task["id"][:8], len(agent_nodes),
+                ", ".join(a["role"] for a in entry_agents),
+            )
+            for agent in entry_agents:
+                asyncio.create_task(self._dispatch_agent(task, agent))
+            return
+        # ---------------------------------------------------------------
+        # Flat (Sprint 22-27) dispatch path
+        # ---------------------------------------------------------------
         agents_spec = team_spec.get("agents", []) or []
         if not agents_spec:
             self.db.mark_failed(task["id"], "team_spec has no agents")
@@ -3304,48 +3428,136 @@ class Orchestrator:
             # Cost cap is safety, not feature — never crash the
             # orchestrator if accounting fails.
             logger.warning("cost cap check failed for task %s: %s", task_id[:8], exc)
-        # Sprint 27: stage-aware advancement. The agent we just finished
-        # is in some stage; only advance to the *next* stage when EVERY
-        # agent in this stage has reached a terminal status. Sequential
-        # workflows collapse to one-agent-per-stage and behave identically
-        # to Sprint 22.
+        # Sprint 27 / 48: stage-aware (flat) or graph-aware (nodes_v1) advancement.
         task = self.db.get_task(task_id)
         if task is None:
             logger.error("task %s gone before stage advance", task_id[:8])
             return
         team_spec = task.get("team_spec") or {}
-        stages = _resolve_stages(team_spec.get("stages"), len(agents))
-        cur_stage_idx = next(
-            (i for i, stage in enumerate(stages) if agent_idx in stage),
-            None,
-        )
-        if cur_stage_idx is None:
-            logger.warning("task %s agent %d not in any stage; assuming sequential tail",
-                           task_id[:8], agent_idx)
-            cur_stage_idx = len(stages) - 1
-        # Refresh agents — this agent's status changed inside this handler.
-        fresh = self.db.list_agents(task_id)
-        by_idx = {a["agent_idx"]: a for a in fresh}
-        cur_stage = stages[cur_stage_idx]
-        stage_pending = [
-            i for i in cur_stage
-            if by_idx.get(i, {}).get("status") not in ("completed", "failed")
-        ]
-        if stage_pending:
-            logger.debug("task %s stage %d still has pending: %s",
-                         task_id[:8], cur_stage_idx, stage_pending)
-            return  # other agents in this stage still running
-        # Stage complete; dispatch the next one if any.
-        next_stage_idx = cur_stage_idx + 1
-        if next_stage_idx < len(stages):
-            next_stage_indices = stages[next_stage_idx]
-            next_agents = [by_idx[i] for i in next_stage_indices if by_idx.get(i)]
-            logger.info("task %s stage %d → %d: dispatching [%s]",
-                        task_id[:8], cur_stage_idx, next_stage_idx,
-                        ", ".join(a["role"] for a in next_agents))
-            for a in next_agents:
-                asyncio.create_task(self._dispatch_agent(task, a))
-            return
+
+        # -------------------------------------------------------------------
+        # Sprint 48: nodes_v1 advancement path
+        # -------------------------------------------------------------------
+        from .team_spec_compat import is_nodes_v1
+        if is_nodes_v1(team_spec):
+            fresh = self.db.list_agents(task_id)
+            by_idx = {a["agent_idx"]: a for a in fresh}
+            nodes = team_spec.get("nodes", [])
+            # Build completed map: {node_id -> 'succeeded'|'failed'}.
+            # agent_idx == the node's index in the nodes list.
+            completed_map: dict[str, str] = {}
+            for a in fresh:
+                idx = a["agent_idx"]
+                if 0 <= idx < len(nodes) and a["status"] in ("completed", "failed"):
+                    node_id = nodes[idx]["id"]
+                    completed_map[node_id] = (
+                        "succeeded" if a["status"] == "completed" else "failed"
+                    )
+            # Find newly-ready nodes (all completed agent nodes whose
+            # edges have fired, excluding output/terminal nodes).
+            ready_ids = _nodes_v1_next_ready(team_spec, completed_map)
+            # Also exclude already-dispatched nodes (pending/running/done).
+            dispatched_idxs = {a["agent_idx"] for a in fresh}
+            node_id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
+            to_dispatch = [
+                nid for nid in ready_ids
+                if (
+                    nid in node_id_to_idx
+                    and nodes[node_id_to_idx[nid]].get("kind", "agent") == "agent"
+                    and node_id_to_idx[nid] not in dispatched_idxs
+                )
+            ]
+            if to_dispatch:
+                for nid in to_dispatch:
+                    a_idx = node_id_to_idx[nid]
+                    agent_row = by_idx.get(a_idx)
+                    if agent_row is None:
+                        # Insert the agent row on first dispatch (lazy init).
+                        node = nodes[a_idx]
+                        role_name = node.get("role")
+                        owner_id = task.get("user_id")
+                        role_scope = (
+                            owner_id
+                            if owner_id and owner_id not in ("admin", "legacy-admin")
+                            else None
+                        )
+                        role = self.db.get_agent_role(role_name, user_id=role_scope) or {}
+                        self.db.insert_agent(
+                            task_id=task_id,
+                            agent_idx=a_idx,
+                            role=role_name or "unknown",
+                            model=node.get("model") or role.get("default_model", "unknown"),
+                            spec=node.get("spec", ""),
+                        )
+                        fresh2 = self.db.list_agents(task_id)
+                        by_idx = {a["agent_idx"]: a for a in fresh2}
+                        agent_row = by_idx.get(a_idx)
+                    if agent_row:
+                        logger.info(
+                            "task %s nodes_v1: dispatching next node %s (%s)",
+                            task_id[:8], nid, agent_row["role"],
+                        )
+                        asyncio.create_task(self._dispatch_agent(task, agent_row))
+                return
+            # No new nodes to dispatch.  Check if all agent nodes are terminal.
+            agent_node_idxs = [
+                i for i, n in enumerate(nodes)
+                if n.get("kind", "agent") == "agent"
+            ]
+            all_terminal = all(
+                by_idx.get(i, {}).get("status") in ("completed", "failed")
+                for i in agent_node_idxs
+            )
+            if not all_terminal:
+                # Some agent nodes are still running / pending — wait.
+                logger.debug(
+                    "task %s nodes_v1: waiting on %d more agent node(s)",
+                    task_id[:8],
+                    sum(
+                        1 for i in agent_node_idxs
+                        if by_idx.get(i, {}).get("status") not in ("completed", "failed")
+                    ),
+                )
+                return
+            # Fall through to task-completion aggregation below.
+
+        else:
+            # ---------------------------------------------------------------
+            # Sprint 27: flat stage-aware advancement (unchanged)
+            # ---------------------------------------------------------------
+            stages = _resolve_stages(team_spec.get("stages"), len(agents))
+            cur_stage_idx = next(
+                (i for i, stage in enumerate(stages) if agent_idx in stage),
+                None,
+            )
+            if cur_stage_idx is None:
+                logger.warning("task %s agent %d not in any stage; assuming sequential tail",
+                               task_id[:8], agent_idx)
+                cur_stage_idx = len(stages) - 1
+            # Refresh agents — this agent's status changed inside this handler.
+            fresh = self.db.list_agents(task_id)
+            by_idx = {a["agent_idx"]: a for a in fresh}
+            cur_stage = stages[cur_stage_idx]
+            stage_pending = [
+                i for i in cur_stage
+                if by_idx.get(i, {}).get("status") not in ("completed", "failed")
+            ]
+            if stage_pending:
+                logger.debug("task %s stage %d still has pending: %s",
+                             task_id[:8], cur_stage_idx, stage_pending)
+                return  # other agents in this stage still running
+            # Stage complete; dispatch the next one if any.
+            next_stage_idx = cur_stage_idx + 1
+            if next_stage_idx < len(stages):
+                next_stage_indices = stages[next_stage_idx]
+                next_agents = [by_idx[i] for i in next_stage_indices if by_idx.get(i)]
+                logger.info("task %s stage %d → %d: dispatching [%s]",
+                            task_id[:8], cur_stage_idx, next_stage_idx,
+                            ", ".join(a["role"] for a in next_agents))
+                for a in next_agents:
+                    asyncio.create_task(self._dispatch_agent(task, a))
+                return
+
         # All agents done — task is complete. Aggregate results.
         final_agents = self.db.list_agents(task_id)
         aggregate = {
