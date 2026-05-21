@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tally_coding_app/api.dart';
 import 'package:tally_coding_app/screens/discord_shell.dart';
+import 'package:tally_coding_app/services/notifications_ws.dart';
 
 void main() {
   testWidgets('DiscordShellScreen renders the four-column layout', (WidgetTester tester) async {
@@ -10,7 +11,15 @@ void main() {
       baseUrl: Uri.parse('http://127.0.0.1:65535'),
       token: 'fake',
     );
-    await tester.pumpWidget(MaterialApp(home: DiscordShellScreen(client: client)));
+    // Sprint 47 B7: wsClient is now required; pass a disconnected stub.
+    final wsClient = NotificationsWsClient(
+      api: client,
+      wsUrl: Uri.parse('ws://127.0.0.1:65535/ws/notifications'),
+      bearerProvider: () async => 'fake',
+    );
+    await tester.pumpWidget(MaterialApp(
+      home: DiscordShellScreen(client: client, wsClient: wsClient),
+    ));
     // Server rail label
     expect(find.text('T'), findsOneWidget);
     // Channel list header

@@ -22,6 +22,7 @@ import 'package:flutter/material.dart';
 import '../agent_roles.dart';
 import '../api.dart';
 import '../main.dart';
+import '../services/notifications_ws.dart';
 import 'billing_screen.dart';
 import 'custom_roles_screen.dart';
 import 'general_channel.dart';
@@ -48,10 +49,16 @@ class TaskSelected extends ChannelSelection {
 
 class DiscordShellScreen extends StatefulWidget {
   final TallyOrchClient client;
+  final NotificationsWsClient wsClient;
   /// Optional: when set, the shell opens with this task channel selected
   /// instead of #general. Used by the dev/screenshot deep-link.
   final String? initialTaskId;
-  const DiscordShellScreen({super.key, required this.client, this.initialTaskId});
+  const DiscordShellScreen({
+    super.key,
+    required this.client,
+    required this.wsClient,
+    this.initialTaskId,
+  });
 
   @override
   State<DiscordShellScreen> createState() => _DiscordShellScreenState();
@@ -410,6 +417,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           key: ValueKey(id),
           client: widget.client,
           taskId: id,
+          wsClient: widget.wsClient,
         ),
     };
   }

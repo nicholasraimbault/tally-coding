@@ -255,7 +255,10 @@ class _SignedInShellState extends State<_SignedInShell> {
   Widget build(BuildContext context) {
     return _SignedInInherited(
       authState: widget.authState,
-      child: DiscordShellScreen(client: widget.client),
+      child: DiscordShellScreen(
+        client: widget.client,
+        wsClient: _wsClient!,
+      ),
     );
   }
 }
