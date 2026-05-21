@@ -158,3 +158,38 @@ def get_task_channel_id(db: "Db", task_id: str) -> int | None:
         (task_id,),
     ).fetchone()
     return int(row[0]) if row else None
+
+
+def fetch_user_messages_since(
+    db: "Db",
+    *,
+    channel_id: int,
+    since_ts: float,
+) -> list[dict]:
+    """Return user (human) messages in a channel posted after `since_ts`,
+    chronological order.  Used by the orchestrator to inject user
+    intervention into the agent's next LLM turn.
+
+    Returns each as a dict with `text`, `author_user_id`, `created_at`.
+    Messages without a text payload key are skipped.
+    """
+    rows = db._conn.execute(
+        "SELECT payload_json, author_user_id, created_at FROM messages "
+        "WHERE channel_id=? AND author_kind='human' AND created_at > ? "
+        "ORDER BY created_at ASC",
+        (channel_id, since_ts),
+    ).fetchall()
+    out: list[dict] = []
+    for payload_json, author_user_id, created_at in rows:
+        try:
+            payload = json.loads(payload_json) if payload_json else {}
+        except (TypeError, ValueError):
+            payload = {}
+        text = payload.get("text", "")
+        if text:
+            out.append({
+                "text": text,
+                "author_user_id": author_user_id,
+                "created_at": created_at,
+            })
+    return out

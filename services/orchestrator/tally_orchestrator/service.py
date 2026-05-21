@@ -716,6 +716,14 @@ class Db:
                 self._conn.execute(f"ALTER TABLE quotas ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+        # Sprint 47: track which user messages each agent has already seen
+        # so the dispatch path can inject only the new ones.
+        try:
+            self._conn.execute(
+                "ALTER TABLE agents ADD COLUMN last_user_msg_ts REAL NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Sprint 47: backfill workspaces + channels for pre-existing data.
         # Idempotent — only creates rows when they're missing.
         self._backfill_workspaces_and_channels()
@@ -1221,7 +1229,7 @@ class Db:
     def list_agents(self, task_id: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT id, task_id, agent_idx, role, model, spec, status, "
-            "result_json, worker_identity, started_at, finished_at "
+            "result_json, worker_identity, started_at, finished_at, last_user_msg_ts "
             "FROM agents WHERE task_id=? ORDER BY agent_idx",
             (task_id,),
         ).fetchall()
@@ -1232,6 +1240,7 @@ class Db:
                 "result": json.loads(r[7]) if r[7] else None,
                 "worker_identity": r[8],
                 "started_at": r[9], "finished_at": r[10],
+                "last_user_msg_ts": r[11] if r[11] is not None else 0.0,
             }
             for r in rows
         ]
@@ -2676,6 +2685,27 @@ class Orchestrator:
                         task["id"][:8], agent["agent_idx"], agent["role"],
                         agent["model"], handle.identity[:8])
             try:
+                # Sprint 47: pull any user messages posted in the task channel
+                # since the last agent step; prepend to this agent's spec so the
+                # LLM sees them as teammate input.  Persists the new
+                # last_user_msg_ts so subsequent steps don't re-include them.
+                from .channels import get_task_channel_id, fetch_user_messages_since
+                agent_spec_text = agent["spec"] or ""
+                ch_id = get_task_channel_id(self.db, task["id"])
+                if ch_id is not None:
+                    since_ts = float(agent.get("last_user_msg_ts") or 0)
+                    user_msgs = fetch_user_messages_since(
+                        self.db, channel_id=ch_id, since_ts=since_ts,
+                    )
+                    if user_msgs:
+                        intervention_block = "\n\n## User intervention (since last step)\n" + "\n".join(
+                            f"- @{m['author_user_id']}: {m['text']}" for m in user_msgs
+                        )
+                        agent_spec_text = agent_spec_text + intervention_block
+                        self.db._conn.execute(
+                            "UPDATE agents SET last_user_msg_ts=? WHERE id=?",
+                            (user_msgs[-1]["created_at"], agent["id"]),
+                        )
                 payload_obj = {
                     "task": task["description"],
                     "task_id": task["id"],
@@ -2684,7 +2714,7 @@ class Orchestrator:
                     "agent_spec": {
                         "role": agent["role"],
                         "model": agent["model"],
-                        "spec": agent["spec"],
+                        "spec": agent_spec_text,
                         "system_prompt": role.get("system_prompt", ""),
                         "tools": role.get("tools", []),
                     },
