@@ -52,6 +52,7 @@ class _AgentNodeData implements NodeData {
     this.workerAffinity = 'any',
     this.cronSchedule = '',
     this.eventTriggers = const <Map<String, dynamic>>[],
+    this.toolAllowlist,
   });
 
   final String kind; // 'agent' | 'output' | 'trigger'
@@ -62,6 +63,8 @@ class _AgentNodeData implements NodeData {
   // Trigger-only fields (unused when kind != 'trigger').
   String cronSchedule;
   List<Map<String, dynamic>> eventTriggers;
+  // Sprint 50: null = all role tools; explicit list = allowlist.
+  List<String>? toolAllowlist;
 
   @override
   NodeData clone() => _AgentNodeData(
@@ -72,6 +75,7 @@ class _AgentNodeData implements NodeData {
     workerAffinity: workerAffinity,
     cronSchedule: cronSchedule,
     eventTriggers: List<Map<String, dynamic>>.from(eventTriggers),
+    toolAllowlist: toolAllowlist != null ? List<String>.from(toolAllowlist!) : null,
   );
 }
 
@@ -80,6 +84,16 @@ class _AgentNodeData implements NodeData {
 // ---------------------------------------------------------------------------
 const _roles = ['Coder', 'Reviewer', 'Tester', 'Architect', 'Solo Coder'];
 const _affinities = ['any', 'tee', 'local', 'local_if_available'];
+
+// Sprint 50: hardcoded tool list per role.  Sprint 51+ can fetch dynamically
+// via GET /agent-roles/{role}.
+const _toolsByRole = <String, List<String>>{
+  'Coder': ['create_file', 'edit_file', 'shell', 'browse_web'],
+  'Reviewer': ['read_file', 'comment', 'approve'],
+  'Tester': ['read_file', 'shell', 'pytest'],
+  'Architect': ['read_file', 'edit_file', 'plan'],
+  'Solo Coder': ['create_file', 'edit_file', 'shell', 'browse_web', 'pytest'],
+};
 
 // ---------------------------------------------------------------------------
 // Spec ↔ vyuh_node_flow mappers
@@ -101,6 +115,7 @@ List<Node<_AgentNodeData>> _specToNodes(Map<String, dynamic> spec) {
       eventTriggers:
           (n['event_triggers'] as List?)?.cast<Map<String, dynamic>>() ??
           const <Map<String, dynamic>>[],
+      toolAllowlist: (n['tool_allowlist'] as List?)?.cast<String>(),
     );
     // Lay nodes out horizontally if no saved position present.
     final xPos = (n['__x'] as num?)?.toDouble() ?? (i * 220.0 + 60);
@@ -203,6 +218,8 @@ Map<String, dynamic> _controllerToSpec(
       if (d.kind == 'agent') 'model': d.model,
       if (d.kind == 'agent') 'spec': d.spec,
       if (d.kind == 'agent') 'worker_affinity': d.workerAffinity,
+      if (d.kind == 'agent' && d.toolAllowlist != null)
+        'tool_allowlist': d.toolAllowlist,
       if (d.kind == 'output') 'role': d.role,
       if (d.kind == 'output') 'model': d.model,
       if (d.kind == 'trigger') 'cron_schedule': d.cronSchedule,
@@ -348,7 +365,8 @@ class _WorkflowEditorScreenState extends State<WorkflowEditorScreen> {
       ..role = updated.role
       ..model = updated.model
       ..spec = updated.spec
-      ..workerAffinity = updated.workerAffinity;
+      ..workerAffinity = updated.workerAffinity
+      ..toolAllowlist = updated.toolAllowlist;
     _syncSpec();
   }
 
@@ -1082,6 +1100,9 @@ class _NodeConfigDialogState extends State<_NodeConfigDialog> {
   late String _workerAffinity;
   late TextEditingController _modelCtrl;
   late TextEditingController _specCtrl;
+  // Sprint 50: tool allowlist state.
+  late Set<String> _selectedTools;
+  late bool _allToolsSelected; // true → toolAllowlist will be null (all role tools)
 
   @override
   void initState() {
@@ -1096,6 +1117,16 @@ class _NodeConfigDialogState extends State<_NodeConfigDialog> {
         : 'any';
     _modelCtrl = TextEditingController(text: widget.initial.model);
     _specCtrl = TextEditingController(text: widget.initial.spec);
+
+    final allowlist = widget.initial.toolAllowlist;
+    if (allowlist == null) {
+      // null = all tools (default)
+      _allToolsSelected = true;
+      _selectedTools = (_toolsByRole[_role] ?? const <String>[]).toSet();
+    } else {
+      _allToolsSelected = false;
+      _selectedTools = allowlist.toSet();
+    }
   }
 
   @override
@@ -1113,6 +1144,7 @@ class _NodeConfigDialogState extends State<_NodeConfigDialog> {
         model: _modelCtrl.text.trim(),
         spec: _specCtrl.text.trim(),
         workerAffinity: _workerAffinity,
+        toolAllowlist: _allToolsSelected ? null : _selectedTools.toList(),
       ),
     );
   }
@@ -1137,7 +1169,13 @@ class _NodeConfigDialogState extends State<_NodeConfigDialog> {
                   items: _roles
                       .map((r) => DropdownMenuItem(value: r, child: Text(r)))
                       .toList(),
-                  onChanged: (v) => setState(() => _role = v!),
+                  onChanged: (v) => setState(() {
+                    _role = v!;
+                    // Reset tool selection to all tools for the new role.
+                    _allToolsSelected = true;
+                    _selectedTools =
+                        (_toolsByRole[_role] ?? const <String>[]).toSet();
+                  }),
                   decoration: const InputDecoration(
                     border: OutlineInputBorder(),
                     isDense: true,
@@ -1166,6 +1204,46 @@ class _NodeConfigDialogState extends State<_NodeConfigDialog> {
                   border: OutlineInputBorder(),
                 ),
               ),
+              if (!isOutput) ...[
+                const SizedBox(height: 16),
+                const Text(
+                  'Tools',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    for (final tool
+                        in _toolsByRole[_role] ?? const <String>[])
+                      FilterChip(
+                        label: Text(tool),
+                        selected: _selectedTools.contains(tool),
+                        onSelected: (selected) {
+                          setState(() {
+                            if (selected) {
+                              _selectedTools.add(tool);
+                            } else {
+                              _selectedTools.remove(tool);
+                            }
+                            // Any explicit chip interaction switches to explicit
+                            // allowlist mode (no longer "all role tools").
+                            _allToolsSelected = false;
+                          });
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: () => setState(() {
+                    _allToolsSelected = true;
+                    _selectedTools =
+                        (_toolsByRole[_role] ?? const <String>[]).toSet();
+                  }),
+                  child: const Text('Use all role tools'),
+                ),
+              ],
               const SizedBox(height: 12),
               const Text('Worker affinity'),
               const SizedBox(height: 4),
