@@ -87,3 +87,57 @@ def test_post_tasks_no_dispatch_yet(client):
         "SELECT COUNT(*) FROM agents WHERE task_id=?", (task_id,)
     ).fetchone()[0]
     assert cnt == 0, f"expected no dispatched agents while proposed; got {cnt}"
+
+
+def test_approve_transitions_to_pending(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    r2 = client.post(f"/tasks/{task_id}/approve")
+    assert r2.status_code == 200
+    db = svc.state["db"]
+    status = db._conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    assert status == "pending"
+
+
+def test_approve_creates_task_channel(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    db = svc.state["db"]
+    pre = db._conn.execute("SELECT id FROM channels WHERE task_id=?", (task_id,)).fetchone()
+    assert pre is None
+    client.post(f"/tasks/{task_id}/approve")
+    post = db._conn.execute("SELECT id, kind FROM channels WHERE task_id=?", (task_id,)).fetchone()
+    assert post is not None
+    assert post[1] == "task"
+
+
+def test_approve_returns_409_on_repeat(client):
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    r1 = client.post(f"/tasks/{task_id}/approve")
+    assert r1.status_code == 200
+    r2 = client.post(f"/tasks/{task_id}/approve")
+    assert r2.status_code == 409
+
+
+def test_approve_non_owner_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.post(f"/tasks/{task_id}/approve")
+    assert r2.status_code == 403
+
+
+def test_approve_unknown_task_returns_404(client):
+    r = client.post("/tasks/nonexistent/approve")
+    assert r.status_code == 404

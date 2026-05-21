@@ -4564,6 +4564,43 @@ async def get_task(
     return TaskResponse(**task)
 
 
+@app.post("/tasks/{task_id}/approve")
+async def approve_task_route(
+    task_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: transition a proposed task to pending + dispatch.
+    Owner-only.  409 on repeat (status already non-proposed)."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can approve")
+    if status != "proposed":
+        raise HTTPException(409, f"task is not in 'proposed' state (current: {status})")
+    db.approve_task(task_id)
+    # Worker poller picks up status='pending' on its next tick.
+    # If the orchestrator has an explicit kick method, use it for lower latency.
+    orch = state.get("orchestrator")
+    if orch is not None and hasattr(orch, "_kick_poller"):
+        try:
+            asyncio.create_task(orch._kick_poller())
+        except Exception:
+            pass  # kick is best-effort
+    new_row = db._conn.execute(
+        "SELECT id, status, team_spec FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    return {
+        "id": new_row[0],
+        "status": new_row[1],
+        "team_spec": json.loads(new_row[2]) if new_row[2] else None,
+    }
+
+
 @app.get("/tasks", response_model=list[TaskResponse])
 async def list_tasks(
     limit: int = 100,
