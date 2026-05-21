@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 
 import '../api.dart';
 import '../services/notifications_ws.dart';
+import '../state/workspace_context.dart';
 import '../widgets/cap_abort_dialog.dart';
 import '../widgets/channel_header.dart';
 import '../widgets/message_composer.dart';
@@ -213,7 +214,9 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
         return;
       }
       // Sprint 47: task-channel path — resolve channel from task_id.
-      final channels = await widget.client.listChannels(workspaceId: 1);
+      final channels = await widget.client.listChannels(
+        workspaceId: WorkspaceContext.activeIdOrDefault(context),
+      );
       final mine = channels.firstWhere(
         (c) => c['task_id'] == widget.taskId,
         orElse: () => const {},

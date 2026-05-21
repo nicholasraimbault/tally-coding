@@ -5,10 +5,12 @@ import 'package:clerk_auth/clerk_auth.dart' as clerk;
 import 'package:clerk_flutter/clerk_flutter.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'screens/discord_shell.dart';
 import 'services/notifications_ws.dart';
+import 'state/workspace_context.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
@@ -228,6 +230,9 @@ class _SignedInShell extends StatefulWidget {
 
 class _SignedInShellState extends State<_SignedInShell> {
   NotificationsWsClient? _wsClient;
+  // Sprint 50: active workspace loaded from shared_preferences on first build.
+  int _activeWorkspaceId = 1;
+  bool _workspaceLoaded = false;
 
   @override
   void initState() {
@@ -243,6 +248,23 @@ class _SignedInShellState extends State<_SignedInShell> {
       bearerProvider: widget.bearerProvider,
     );
     unawaited(_wsClient!.connect());
+    unawaited(_loadActiveWorkspace());
+  }
+
+  Future<void> _loadActiveWorkspace() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _activeWorkspaceId = prefs.getInt('active_workspace_id') ?? 1;
+      _workspaceLoaded = true;
+    });
+  }
+
+  Future<void> _setActiveWorkspace(int id) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('active_workspace_id', id);
+    if (!mounted) return;
+    setState(() => _activeWorkspaceId = id);
   }
 
   @override
@@ -253,11 +275,20 @@ class _SignedInShellState extends State<_SignedInShell> {
 
   @override
   Widget build(BuildContext context) {
-    return _SignedInInherited(
-      authState: widget.authState,
-      child: DiscordShellScreen(
-        client: widget.client,
-        wsClient: _wsClient!,
+    if (!_workspaceLoaded) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    return WorkspaceContext(
+      activeWorkspaceId: _activeWorkspaceId,
+      onChange: _setActiveWorkspace,
+      child: _SignedInInherited(
+        authState: widget.authState,
+        child: DiscordShellScreen(
+          client: widget.client,
+          wsClient: _wsClient!,
+        ),
       ),
     );
   }

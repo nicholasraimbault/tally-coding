@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tally_coding_app/api.dart';
 import 'package:tally_coding_app/screens/discord_shell.dart';
 import 'package:tally_coding_app/services/notifications_ws.dart';
+import 'package:tally_coding_app/state/workspace_context.dart';
 
 void main() {
   testWidgets('DiscordShellScreen renders the four-column layout', (WidgetTester tester) async {
@@ -17,8 +18,13 @@ void main() {
       wsUrl: Uri.parse('ws://127.0.0.1:65535/ws/notifications'),
       bearerProvider: () async => 'fake',
     );
-    await tester.pumpWidget(MaterialApp(
-      home: DiscordShellScreen(client: client, wsClient: wsClient),
+    // Sprint 50 B3: DiscordShellScreen now reads WorkspaceContext.
+    await tester.pumpWidget(WorkspaceContext(
+      activeWorkspaceId: 1,
+      onChange: (_) {},
+      child: MaterialApp(
+        home: DiscordShellScreen(client: client, wsClient: wsClient),
+      ),
     ));
     // Server rail label
     expect(find.text('T'), findsOneWidget);

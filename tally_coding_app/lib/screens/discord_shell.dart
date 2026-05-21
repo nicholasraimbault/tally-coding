@@ -23,6 +23,7 @@ import '../agent_roles.dart';
 import '../api.dart';
 import '../main.dart';
 import '../services/notifications_ws.dart';
+import '../state/workspace_context.dart';
 import 'billing_screen.dart';
 import 'custom_roles_screen.dart';
 import 'general_channel.dart';
@@ -184,7 +185,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   /// then check escalation status on each scheduled_agent channel.
   Future<void> _fetchDirectChannels() async {
     try {
-      final channels = await widget.client.listChannels(workspaceId: 1);
+      final channels = await widget.client.listChannels(
+        workspaceId: WorkspaceContext.activeIdOrDefault(context),
+      );
       if (!mounted) return;
       final dms = channels.where((c) => c['kind'] == 'dm').toList();
       final scheduled = channels
@@ -336,7 +339,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                       MaterialPageRoute(
                         builder: (_) => PersistentAgentsScreen(
                           client: widget.client,
-                          workspaceId: 1,
+                          workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
                         ),
                       ),
                     ),
@@ -345,7 +348,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                         context: context,
                         builder: (_) => NewDmModal(
                           client: widget.client,
-                          workspaceId: 1,
+                          workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
                         ),
                       );
                       if (result != null && mounted) {
@@ -424,7 +427,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             MaterialPageRoute(
               builder: (_) => PersistentAgentsScreen(
                 client: widget.client,
-                workspaceId: 1,
+                workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
               ),
             ),
           );
@@ -435,7 +438,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             context: context,
             builder: (_) => NewDmModal(
               client: widget.client,
-              workspaceId: 1,
+              workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
             ),
           );
           if (result != null && mounted) {

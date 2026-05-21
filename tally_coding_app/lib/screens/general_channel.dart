@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
+import '../state/workspace_context.dart';
 import '../widgets/channel_header.dart';
 import '../widgets/cost_estimate_banner.dart';
 import '../widgets/team_proposal_card.dart';
@@ -59,7 +60,9 @@ class _GeneralChannelScreenState extends State<GeneralChannelScreen> {
     try {
       if (_generalChannelId == null) {
         // Resolve #general channel id once
-        final channels = await widget.client.listChannels(workspaceId: 1);
+        final channels = await widget.client.listChannels(
+          workspaceId: WorkspaceContext.activeIdOrDefault(context),
+        );
         final general = channels.firstWhere(
           (c) => c['kind'] == 'general',
           orElse: () => const {},
