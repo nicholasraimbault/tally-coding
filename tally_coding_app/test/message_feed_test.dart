@@ -40,6 +40,43 @@ void main() {
     expect(find.textContaining('No messages yet'), findsOneWidget);
   });
 
+  // Sprint 49 B8: verify escalation interactive_prompt wiring (cross-check Sprint 47 B3)
+  testWidgets('escalation interactive_prompt fires onAnswerPrompt with correct args', (tester) async {
+    // Persistent-agent escalation posts a kind='interactive_prompt' with
+    // pause/resume/cancel buttons in the agent's scheduled_agent channel.
+    final messages = [
+      {
+        'id': 42, 'channel_id': 9, 'author_kind': 'agent',
+        'kind': 'interactive_prompt',
+        'payload_json': jsonEncode({
+          'role': 'Tester',
+          'prompt': 'Test suite is failing intermittently. What should I do?',
+          'options': [
+            {'value': 'pause', 'label': 'Pause'},
+            {'value': 'resume', 'label': 'Resume'},
+            {'value': 'cancel', 'label': 'Cancel'},
+          ],
+        }),
+        'created_at': 1700000000.0,
+      },
+    ];
+    int? lastMsgId;
+    String? lastAnswer;
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body:
+      MessageFeed(
+        messages: messages,
+        onAnswerPrompt: (mid, v) { lastMsgId = mid; lastAnswer = v; },
+      ),
+    )));
+    expect(find.text('Pause'), findsOneWidget);
+    expect(find.text('Resume'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    await tester.tap(find.text('Pause'));
+    await tester.pumpAndSettle();
+    expect(lastMsgId, 42);
+    expect(lastAnswer, 'pause');
+  });
+
   testWidgets('renders team_proposal message via TeamProposalCard', (tester) async {
     final messages = [
       {
