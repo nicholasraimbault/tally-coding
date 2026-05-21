@@ -31,8 +31,8 @@ RUN maturin build --release --features python --compatibility linux -o /wheels
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
-LABEL org.opencontainers.image.version=v30
-LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 50: workspace finale — custom channels, multi-workspace, 4-tier role mgmt, agent tool allowlist; closes the Discord-shaped vision)"
+LABEL org.opencontainers.image.version=v31
+LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 51: workspace audit log + channel archival + Sprint 50 carry-over cleanup)"
 
 WORKDIR /app
 
