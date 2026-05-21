@@ -6287,6 +6287,51 @@ async def patch_persistent_agent_route(
     return db.get_persistent_agent(pid)
 
 
+@app.post("/persistent_agents/{pid}/run_now")
+async def run_persistent_agent_now_route(
+    pid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: manually fire a persistent agent.  Workspace-member only."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    orch: "Orchestrator" = state.get("orchestrator")
+    if orch is None:
+        raise HTTPException(503, "orchestrator not ready")
+    task_id = await orch._fire_persistent_agent(pid, trigger="manual")
+    return {"ok": True, "task_id": task_id, "persistent_agent_id": pid}
+
+
+@app.delete("/persistent_agents/{pid}")
+async def delete_persistent_agent_route(
+    pid: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: soft-delete a persistent agent."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    db.delete_persistent_agent(pid)
+    return {"ok": True}
+
+
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
 
 

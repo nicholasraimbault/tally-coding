@@ -144,3 +144,65 @@ def test_patch_non_member_returns_403(client):
     )
     r2 = client.patch(f"/persistent_agents/{pid}", json={"name": "x"})
     assert r2.status_code == 403
+
+
+# ── Sprint 49 A7: run_now + delete ────────────────────────────────────────────
+
+
+@pytest.mark.skip(reason="A8: needs Orchestrator._fire_persistent_agent")
+def test_run_now_creates_task_with_persistent_agent_id(client):
+    import tally_orchestrator.service as svc
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"agents": [{"role": "Tester"}], "stages": [[0]], "workflow": "sequential"},
+    })
+    pid = r.json()["id"]
+    r2 = client.post(f"/persistent_agents/{pid}/run_now")
+    assert r2.status_code == 200
+    db = svc.state["db"]
+    cnt = db._conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE persistent_agent_id=?", (pid,)
+    ).fetchone()[0]
+    assert cnt == 1
+
+
+def test_delete_persistent_agent_soft(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    r2 = client.delete(f"/persistent_agents/{pid}")
+    assert r2.status_code == 200
+    r3 = client.get("/persistent_agents?workspace_id=1")
+    assert all(a["id"] != pid for a in r3.json()["persistent_agents"])
+
+
+def test_run_now_non_member_returns_403(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.post(f"/persistent_agents/{pid}/run_now")
+    assert r2.status_code == 403
+
+
+def test_delete_non_member_returns_403(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.delete(f"/persistent_agents/{pid}")
+    assert r2.status_code == 403
