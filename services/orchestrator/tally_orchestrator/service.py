@@ -734,6 +734,10 @@ class WorkspaceMemberRolePatchRequest(BaseModel):
     role: str
 
 
+class WorkspaceOwnershipTransferRequest(BaseModel):
+    new_owner_user_id: str
+
+
 # Sprint 50: custom channel creation + channel_member CRUD models.
 
 class ChannelMemberSpec(BaseModel):
@@ -6512,6 +6516,59 @@ async def leave_workspace_route(wid: int, user: ClerkUser = Depends(require_user
     except Exception as exc:
         logger.warning("audit_log member_left failed: %s", exc)
     return {"ok": True}
+
+
+@app.post("/workspaces/{wid}/transfer-ownership")
+async def transfer_workspace_ownership_route(
+    wid: int,
+    body: WorkspaceOwnershipTransferRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 52: transfer workspace ownership.  Owner-only.  Old owner
+    auto-demoted to admin.  Target must be an existing workspace_member."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id FROM workspaces WHERE id=? AND deleted_at IS NULL",
+        (wid,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "only the owner can transfer ownership")
+    if body.new_owner_user_id == user.id:
+        raise HTTPException(400, "cannot transfer to yourself")
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, body.new_owner_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "target user is not a member of this workspace")
+    # Atomic transfer: promote target, demote old owner, update workspaces table
+    db._conn.execute(
+        "UPDATE workspace_members SET role='owner' "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, body.new_owner_user_id),
+    )
+    db._conn.execute(
+        "UPDATE workspace_members SET role='admin' "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    )
+    db._conn.execute(
+        "UPDATE workspaces SET owner_user_id=? WHERE id=?",
+        (body.new_owner_user_id, wid),
+    )
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="workspace_ownership_transferred",
+            target_kind="member", target_id=body.new_owner_user_id,
+            payload={"old_owner": user.id, "new_owner": body.new_owner_user_id},
+        )
+    except Exception as exc:
+        logger.warning("audit_log workspace_ownership_transferred failed: %s", exc)
+    return {"ok": True, "new_owner": body.new_owner_user_id}
 
 
 @app.get("/me/workspaces")
