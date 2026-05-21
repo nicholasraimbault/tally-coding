@@ -5470,8 +5470,35 @@ async def patch_message(
 
 
 async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
-    """Placeholder; Task A10 implements the WebSocket fan-out."""
-    pass
+    """Sprint 47 A10: send new_message events to every WebSocket subscribed
+    to the user's notification feed where the user is a member of the channel.
+
+    Re-uses the existing notifications WS registry (_ACTIVE_WS) from Sprint 46
+    rather than introducing a new per-channel WebSocket type.
+    Frame shape:
+        {"type": "new_message", "channel_id": int, "message_id": int}
+    """
+    from .notifications import _ACTIVE_WS
+    db: Db = state["db"]
+    members = db._conn.execute(
+        "SELECT DISTINCT user_id FROM channel_members "
+        "WHERE channel_id=? AND user_id IS NOT NULL",
+        (channel_id,),
+    ).fetchall()
+    user_ids = {m[0] for m in members}
+    for user_id in user_ids:
+        sockets = list(_ACTIVE_WS.get(user_id) or [])  # works for list or set
+        for ws in sockets:
+            try:
+                await ws.send_json({
+                    "type": "new_message",
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "ws send_new_message failed for user=%s: %s", user_id, exc
+                )
 
 
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
