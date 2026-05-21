@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v34
+    image: ghcr.io/nicholasraimbault/tally-orch:v35
     restart: unless-stopped
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
@@ -64,6 +64,14 @@ services:
       # checkout.session.completed / setup_intent.succeeded /
       # payment_intent.{succeeded,payment_failed}.
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      # Sprint 53: channel id for orchestrator self-reports (pool
+      # circuit-open + recovery).  When set, the bootstrap loop posts
+      # text messages to this channel on state-change events.  Empty
+      # = silent (no posts; logs still fire).
+      - OPS_CHANNEL_ID=${OPS_CHANNEL_ID:-}
+      # Sprint 53: optional override of the circuit-breaker threshold
+      # in seconds.  Default 1800 (30 min) absorbs slow cold-starts.
+      - POOL_CIRCUIT_BREAKER_SECONDS=${POOL_CIRCUIT_BREAKER_SECONDS:-1800}
     volumes:
       - data:/data
 
