@@ -667,6 +667,19 @@ class TaskTeamSpecPatchRequest(BaseModel):
     team_spec: dict
 
 
+# Sprint 49: persistent_agents request model.
+
+class PersistentAgentCreateRequest(BaseModel):
+    workspace_id: int
+    name: str
+    role_name: str
+    team_spec: dict
+    tool_allowlist: dict | None = None
+    model: str | None = None
+    cron_schedule: str | None = None
+    event_triggers: list[dict] | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6181,6 +6194,44 @@ async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
                 logger.warning(
                     "ws send_new_message failed for user=%s: %s", user_id, exc
                 )
+
+
+# ── Sprint 49: persistent_agents routes ───────────────────────────────────────
+
+
+@app.post("/persistent_agents")
+async def create_persistent_agent_route(
+    body: PersistentAgentCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: create a persistent agent + scheduled_agent channel.
+    Caller must be a workspace_member of the target workspace."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (body.workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    # Sprint 49: server generates id + HMAC secret for new HTTP triggers
+    triggers = list(body.event_triggers or [])
+    for trig in triggers:
+        if trig.get("kind") == "http" and not trig.get("secret"):
+            trig["secret"] = secrets.token_hex(16)
+        if not trig.get("id"):
+            trig["id"] = secrets.token_hex(8)
+    pid = db.create_persistent_agent(
+        workspace_id=body.workspace_id,
+        name=body.name,
+        role_name=body.role_name,
+        team_spec=body.team_spec,
+        tool_allowlist=body.tool_allowlist,
+        model=body.model,
+        cron_schedule=body.cron_schedule,
+        event_triggers=triggers,
+    )
+    return db.get_persistent_agent(pid)
 
 
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
