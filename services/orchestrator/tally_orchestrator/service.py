@@ -5270,6 +5270,65 @@ async def list_workspace_channels(
     }
 
 
+@app.post("/channels/{channel_id}/messages")
+async def post_message(
+    channel_id: int,
+    body: MessageCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: post a message in a channel.
+
+    Permission: caller must have a role that returns True from
+    `can_post_in_channel`.  Returns 403 for non-members or read-only.
+    Returns 404 if channel doesn't exist.
+
+    For `kind='text'`, body.text is the required content.
+    """
+    db: Db = state["db"]
+    from .channels import (
+        resolve_channel, resolve_effective_role, can_post_in_channel, insert_message,
+    )
+    if resolve_channel(db, channel_id) is None:
+        raise HTTPException(404, f"channel {channel_id} not found")
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if not can_post_in_channel(role):
+        raise HTTPException(403, "permission denied — you are not a member of this channel or are read-only")
+    text = (body.text or "").strip()
+    if body.kind == "text" and not text:
+        raise HTTPException(400, "text is required for kind=text")
+    payload = dict(body.payload or {})
+    if text:
+        payload["text"] = text
+    msg_id = insert_message(
+        db,
+        channel_id=channel_id,
+        author_kind="human",
+        author_user_id=user.id,
+        kind=body.kind,
+        payload=payload,
+        reply_to_id=body.reply_to_id,
+    )
+    row = db._conn.execute(
+        "SELECT id, channel_id, author_kind, author_user_id, author_agent_id, "
+        "kind, payload_json, reply_to_id, created_at, edited_at "
+        "FROM messages WHERE id=?",
+        (msg_id,),
+    ).fetchone()
+    # Sprint 47 Task A10 will broadcast over WebSocket here.
+    asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+    return {
+        "id": row[0], "channel_id": row[1], "author_kind": row[2],
+        "author_user_id": row[3], "author_agent_id": row[4],
+        "kind": row[5], "payload_json": row[6], "reply_to_id": row[7],
+        "created_at": row[8], "edited_at": row[9],
+    }
+
+
+async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
+    """Placeholder; Task A10 implements the WebSocket fan-out."""
+    pass
+
+
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
 
 
