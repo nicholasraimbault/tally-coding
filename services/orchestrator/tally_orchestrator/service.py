@@ -6392,6 +6392,10 @@ async def create_workspace_route(
     if not name:
         raise HTTPException(400, "workspace name required")
     wid = db.create_workspace(name=name, owner_user_id=user.id)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_created", payload={"name": name})
+    except Exception as exc:
+        logger.warning("audit_log workspace_created failed: %s", exc)
     return {"id": wid, "name": name, "role": "owner"}
 
 
@@ -6431,6 +6435,18 @@ async def patch_workspace_route(
         return {"id": wid, "name": current_name}
     params.append(wid)
     db._conn.execute(f"UPDATE workspaces SET {', '.join(sets)} WHERE id=?", tuple(params))
+    if body.name is not None and body.name.strip() != current_name:
+        try:
+            db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_renamed",
+                         payload={"old_name": current_name, "new_name": body.name.strip()})
+        except Exception as exc:
+            logger.warning("audit_log workspace_renamed failed: %s", exc)
+    if body.settings is not None:
+        try:
+            db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="workspace_settings_updated",
+                         payload={"keys_changed": list(body.settings.keys())})
+        except Exception as exc:
+            logger.warning("audit_log workspace_settings_updated failed: %s", exc)
     return {"id": wid}
 
 
@@ -6497,6 +6513,12 @@ async def invite_workspace_member_route(
     if caller[0] not in ("owner", "admin"):
         raise HTTPException(403, "admin+ only")
     db.add_workspace_member(workspace_id=wid, user_id=body.user_id, role=body.role)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_invited",
+                     target_kind="member", target_id=body.user_id,
+                     payload={"user_id": body.user_id, "role": body.role})
+    except Exception as exc:
+        logger.warning("audit_log member_invited failed: %s", exc)
     return {"ok": True, "workspace_id": wid, "user_id": body.user_id, "role": body.role}
 
 
@@ -6525,6 +6547,12 @@ async def remove_workspace_member_route(
     if caller is None or caller[0] not in ("owner", "admin"):
         raise HTTPException(403, "admin+ only")
     db.remove_workspace_member(workspace_id=wid, user_id=target_user_id)
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_removed",
+                     target_kind="member", target_id=target_user_id,
+                     payload={"user_id": target_user_id})
+    except Exception as exc:
+        logger.warning("audit_log member_removed failed: %s", exc)
     return {"ok": True}
 
 
@@ -6566,8 +6594,15 @@ async def patch_workspace_member_role_route(
     # Admin can only change Manager/Member roles
     if caller[0] == "admin" and target[0] not in ("manager", "member"):
         raise HTTPException(403, "admin can only change manager/member roles")
+    old_role = target[0]
     if not db.update_workspace_member_role(workspace_id=wid, user_id=target_user_id, role=body.role):
         raise HTTPException(404, "member not found")
+    try:
+        db.audit_log(workspace_id=wid, actor_user_id=user.id, kind="member_role_changed",
+                     target_kind="member", target_id=target_user_id,
+                     payload={"user_id": target_user_id, "old_role": old_role, "new_role": body.role})
+    except Exception as exc:
+        logger.warning("audit_log member_role_changed failed: %s", exc)
     return {"ok": True, "role": body.role}
 
 
@@ -6737,6 +6772,12 @@ async def create_custom_channel_route(
                 "VALUES (?, 'persistent_agent', ?, ?)",
                 (ch_id, pa_id, now),
             )
+    try:
+        db.audit_log(workspace_id=body.workspace_id, actor_user_id=user.id, kind="channel_created",
+                     target_kind="channel", target_id=str(ch_id),
+                     payload={"channel_id": ch_id, "kind": "custom", "name": name})
+    except Exception as exc:
+        logger.warning("audit_log channel_created failed: %s", exc)
     from .channels import resolve_channel
     return resolve_channel(db, ch_id)
 
@@ -7107,6 +7148,13 @@ async def create_persistent_agent_route(
         cron_schedule=body.cron_schedule,
         event_triggers=triggers,
     )
+    try:
+        db.audit_log(workspace_id=body.workspace_id, actor_user_id=user.id,
+                     kind="persistent_agent_created",
+                     target_kind="persistent_agent", target_id=str(pid),
+                     payload={"agent_id": pid, "name": body.name, "role_name": body.role_name})
+    except Exception as exc:
+        logger.warning("audit_log persistent_agent_created failed: %s", exc)
     return db.get_persistent_agent(pid)
 
 
@@ -7150,6 +7198,14 @@ async def patch_persistent_agent_route(
         raise HTTPException(403, "not a member of this workspace")
     patch = body.model_dump(exclude_unset=True)
     db.update_persistent_agent(pid, patch=patch)
+    if body.enabled is not None and bool(body.enabled) != bool(agent.get("enabled")):
+        try:
+            db.audit_log(workspace_id=agent["workspace_id"], actor_user_id=user.id,
+                         kind="persistent_agent_enabled_toggled",
+                         target_kind="persistent_agent", target_id=str(pid),
+                         payload={"agent_id": pid, "name": agent["name"], "enabled": bool(body.enabled)})
+        except Exception as exc:
+            logger.warning("audit_log persistent_agent_enabled_toggled failed: %s", exc)
     return db.get_persistent_agent(pid)
 
 
@@ -7195,6 +7251,13 @@ async def delete_persistent_agent_route(
     if not is_member:
         raise HTTPException(403, "not a member of this workspace")
     db.delete_persistent_agent(pid)
+    try:
+        db.audit_log(workspace_id=agent["workspace_id"], actor_user_id=user.id,
+                     kind="persistent_agent_deleted",
+                     target_kind="persistent_agent", target_id=str(pid),
+                     payload={"agent_id": pid, "name": agent["name"]})
+    except Exception as exc:
+        logger.warning("audit_log persistent_agent_deleted failed: %s", exc)
     return {"ok": True}
 
 
