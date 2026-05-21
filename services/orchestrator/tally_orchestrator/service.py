@@ -445,6 +445,28 @@ CREATE TABLE IF NOT EXISTS persistent_agents (
 );
 CREATE INDEX IF NOT EXISTS idx_persistent_agents
     ON persistent_agents(workspace_id, enabled, next_scheduled_run_at);
+
+-- Sprint 51: workspace-scoped audit log.  Records every privileged
+-- action taken inside a workspace (member invite/kick, channel create/
+-- archive, agent enable/disable, settings change, etc.) so workspace
+-- owners and compliance exports have a tamper-evident history.
+-- actor_kind: 'user' | 'persistent_agent' | 'system'
+-- kind: free-text action verb (e.g. 'member.invite', 'channel.archive')
+-- target_kind / target_id: the entity acted upon (optional)
+-- payload_json: action-specific structured detail
+CREATE TABLE IF NOT EXISTS workspace_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+    actor_user_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target_kind TEXT,
+    target_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_workspace ON workspace_audit_log(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON workspace_audit_log(actor_user_id);
 """
 
 # Sprint 46: credit-based plan config.  Replaces Sprint 33's
