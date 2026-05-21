@@ -6829,6 +6829,70 @@ async def create_custom_channel_route(
     return resolve_channel(db, ch_id)
 
 
+@app.post("/channels/{channel_id}/archive")
+async def archive_channel_route(channel_id: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: archive a channel.  Admin+ only.  Restricted to 'custom' and 'task' kinds."""
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind, name FROM channels WHERE id=? AND archived_at IS NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found or already archived")
+    if ch[1] not in ("custom", "task"):
+        raise HTTPException(400, f"cannot archive {ch[1]} channels via this route")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db._conn.execute("UPDATE channels SET archived_at=? WHERE id=?", (time.time(), channel_id))
+    try:
+        db.audit_log(
+            workspace_id=ch[0], actor_user_id=user.id,
+            kind="channel_archived",
+            target_kind="channel", target_id=str(channel_id),
+            payload={"name": ch[2]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log channel_archived failed: %s", exc)
+    return {"ok": True}
+
+
+@app.post("/channels/{channel_id}/unarchive")
+async def unarchive_channel_route(channel_id: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: unarchive a channel.  Admin+ only.  Restricted to 'custom' and 'task' kinds."""
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind, name FROM channels WHERE id=? AND archived_at IS NOT NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found or not archived")
+    if ch[1] not in ("custom", "task"):
+        raise HTTPException(400, f"cannot unarchive {ch[1]} channels via this route")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db._conn.execute("UPDATE channels SET archived_at=NULL WHERE id=?", (channel_id,))
+    try:
+        db.audit_log(
+            workspace_id=ch[0], actor_user_id=user.id,
+            kind="channel_unarchived",
+            target_kind="channel", target_id=str(channel_id),
+            payload={"name": ch[2]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log channel_unarchived failed: %s", exc)
+    return {"ok": True}
+
+
 @app.post("/channels/{channel_id}/members")
 async def add_channel_member_route(
     channel_id: int,
