@@ -25,7 +25,6 @@ import '../main.dart';
 import '../services/notifications_ws.dart';
 import '../state/workspace_context.dart';
 import 'billing_screen.dart';
-import 'custom_roles_screen.dart';
 import 'general_channel.dart';
 import 'notifications_screen.dart';
 import 'persistent_agents.dart';
@@ -270,15 +269,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     );
   }
 
-  /// Sprint 40: server rail 🧑‍💻 → custom agent roles catalogue.
-  Future<void> _openCustomRoles(BuildContext context) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => CustomRolesScreen(client: widget.client),
-      ),
-    );
-  }
-
   /// Sprint 46 B7: server rail 🔔 → notifications screen (inbox + rules +
   /// devices).
   Future<void> _openNotifications(BuildContext context) async {
@@ -329,14 +319,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     client: widget.client,
                     activeWorkspaceId: WorkspaceContext.of(context).activeWorkspaceId,
                     onSelect: WorkspaceContext.of(context).onChange,
-                  ),
-                  _ServerRail(
-                    onSignOut: () => resetTallyConfig(context),
-                    onOpenBilling: () => _openBilling(context),
-                    onOpenTemplates: () => _openTemplates(context),
-                    onOpenProjects: () => _openProjects(context),
-                    onOpenCustomRoles: () => _openCustomRoles(context),
-                    onOpenNotifications: () => _openNotifications(context),
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   _ChannelList(
@@ -692,117 +674,6 @@ class _PoolWarmingBanner extends StatelessWidget {
             ),
           ),
         ],
-      ),
-    );
-  }
-}
-
-/// Leftmost narrow rail. One server (this team) + a settings button +
-/// Sprint 30's team builder entry + Sprint 33's billing entry +
-/// Sprint 34's templates catalogue entry.
-class _ServerRail extends StatelessWidget {
-  final VoidCallback onSignOut;
-  final VoidCallback onOpenBilling;
-  final VoidCallback onOpenTemplates;
-  final VoidCallback onOpenProjects;
-  final VoidCallback onOpenCustomRoles;
-  final VoidCallback onOpenNotifications;
-  const _ServerRail({
-    required this.onSignOut,
-    required this.onOpenBilling,
-    required this.onOpenTemplates,
-    required this.onOpenProjects,
-    required this.onOpenCustomRoles,
-    required this.onOpenNotifications,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 72,
-      color: const Color(0xFF1E1F22),
-      child: Column(
-        children: [
-          const SizedBox(height: 12),
-          _ServerTile(
-            label: 'T',
-            tooltip: 'My Team',
-            selected: true,
-            background: const Color(0xFF7C5CFC),
-          ),
-          const SizedBox(height: 8),
-          const Divider(color: Color(0xFF2B2D31), thickness: 2, indent: 16, endIndent: 16),
-          IconButton(
-            tooltip: 'Projects',
-            icon: const Icon(Icons.folder_outlined, color: Color(0xFF99AAB5)),
-            onPressed: onOpenProjects,
-          ),
-          IconButton(
-            tooltip: 'Saved templates',
-            icon: const Icon(Icons.bookmark_border, color: Color(0xFF99AAB5)),
-            onPressed: onOpenTemplates,
-          ),
-          IconButton(
-            tooltip: 'Agent roles',
-            icon: const Icon(Icons.psychology_outlined, color: Color(0xFF99AAB5)),
-            onPressed: onOpenCustomRoles,
-          ),
-          IconButton(
-            tooltip: 'Billing & usage',
-            icon: const Icon(Icons.credit_card, color: Color(0xFF99AAB5)),
-            onPressed: onOpenBilling,
-          ),
-          IconButton(
-            tooltip: 'Notifications',
-            icon: const Icon(Icons.notifications_outlined,
-                color: Color(0xFF99AAB5)),
-            onPressed: onOpenNotifications,
-          ),
-          const Spacer(),
-          IconButton(
-            tooltip: 'Sign out / reconnect',
-            icon: const Icon(Icons.logout, color: Color(0xFF99AAB5)),
-            onPressed: onSignOut,
-          ),
-          const SizedBox(height: 8),
-        ],
-      ),
-    );
-  }
-}
-
-class _ServerTile extends StatelessWidget {
-  final String label;
-  final String tooltip;
-  final bool selected;
-  final Color background;
-  const _ServerTile({
-    required this.label,
-    required this.tooltip,
-    required this.selected,
-    required this.background,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Container(
-        width: 48,
-        height: 48,
-        decoration: BoxDecoration(
-          color: background,
-          borderRadius: BorderRadius.circular(selected ? 14 : 24),
-        ),
-        alignment: Alignment.center,
-        child: Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
-            fontSize: 18,
-          ),
-        ),
       ),
     );
   }
