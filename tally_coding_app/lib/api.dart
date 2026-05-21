@@ -1213,9 +1213,17 @@ class TallyOrchClient {
     required int workspaceId,
     int? beforeId,
     int limit = 100,
+    String? kind,
+    String? actorUserId,
+    double? since,
+    double? until,
   }) async {
     final qs = <String, String>{'limit': '$limit'};
     if (beforeId != null) qs['before_id'] = '$beforeId';
+    if (kind != null) qs['kind'] = kind;
+    if (actorUserId != null) qs['actor_user_id'] = actorUserId;
+    if (since != null) qs['since'] = '$since';
+    if (until != null) qs['until'] = '$until';
     final resp = await _http.get(
       baseUrl.resolve('/workspaces/$workspaceId/audit-log').replace(queryParameters: qs),
       headers: await _authHeaders,
@@ -1223,7 +1231,46 @@ class TallyOrchClient {
     if (resp.statusCode != 200) {
       throw Exception('GET /workspaces/$workspaceId/audit-log ${resp.statusCode}: ${resp.body}');
     }
-    return List<Map<String, dynamic>>.from(jsonDecode(resp.body)['entries'] as List);
+    return List<Map<String, dynamic>>.from(
+      (jsonDecode(resp.body)['entries'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
+    );
+  }
+
+  Future<String> exportAuditLogCsv({
+    required int workspaceId,
+    String? kind,
+    String? actorUserId,
+    double? since,
+    double? until,
+  }) async {
+    final qs = <String, String>{};
+    if (kind != null) qs['kind'] = kind;
+    if (actorUserId != null) qs['actor_user_id'] = actorUserId;
+    if (since != null) qs['since'] = '$since';
+    if (until != null) qs['until'] = '$until';
+    final url = baseUrl
+        .resolve('/workspaces/$workspaceId/audit-log/export')
+        .replace(queryParameters: qs.isEmpty ? null : qs);
+    final resp = await _http.get(url, headers: await _authHeaders);
+    if (resp.statusCode != 200) {
+      throw Exception('GET /workspaces/$workspaceId/audit-log/export ${resp.statusCode}: ${resp.body}');
+    }
+    return resp.body;
+  }
+
+  Future<Map<String, dynamic>> pruneAuditLog({
+    required int workspaceId,
+    required int olderThanDays,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/workspaces/$workspaceId/audit-log/prune'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'older_than_days': olderThanDays}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /workspaces/$workspaceId/audit-log/prune ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
   Future<void> archiveChannel({required int channelId}) async {
@@ -1244,6 +1291,21 @@ class TallyOrchClient {
     if (resp.statusCode != 200) {
       throw Exception('POST /channels/$channelId/unarchive ${resp.statusCode}: ${resp.body}');
     }
+  }
+
+  Future<Map<String, dynamic>> transferOwnership({
+    required int workspaceId,
+    required String newOwnerUserId,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/workspaces/$workspaceId/transfer-ownership'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'new_owner_user_id': newOwnerUserId}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /workspaces/$workspaceId/transfer-ownership ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
   Future<void> deleteWorkspace({required int id}) async {
