@@ -637,6 +637,10 @@ class MessagePatchRequest(BaseModel):
     payload: dict | None = None
 
 
+class TaskTeamSpecPatchRequest(BaseModel):
+    team_spec: dict
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -4599,6 +4603,54 @@ async def approve_task_route(
         "status": new_row[1],
         "team_spec": json.loads(new_row[2]) if new_row[2] else None,
     }
+
+
+@app.patch("/tasks/{task_id}/team_spec")
+async def patch_task_team_spec(
+    task_id: str,
+    body: TaskTeamSpecPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 48: update a proposed task's team_spec.  Owner-only.
+    409 if task is no longer in 'proposed' state.  Re-broadcasts the
+    team_proposal message so other clients see the updated spec."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT user_id, status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "task not found")
+    owner, status = row
+    if owner != user.id:
+        raise HTTPException(403, "only the task owner can edit the team_spec")
+    if status != "proposed":
+        raise HTTPException(409, f"task is not editable (status: {status})")
+    db._conn.execute(
+        "UPDATE tasks SET team_spec=?, updated_at=? WHERE id=?",
+        (json.dumps(body.team_spec), time.time(), task_id),
+    )
+    # Update the team_proposal message's payload + re-broadcast
+    msg_row = db._conn.execute(
+        "SELECT m.id, m.channel_id, m.payload_json FROM messages m "
+        "JOIN channels c ON m.channel_id=c.id "
+        "JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id=? AND c.kind='general' "
+        "AND m.kind='team_proposal' AND json_extract(m.payload_json, '$.task_id')=? "
+        "ORDER BY m.id DESC LIMIT 1",
+        (user.id, task_id),
+    ).fetchone()
+    if msg_row is not None:
+        msg_id, channel_id, payload_json = msg_row
+        payload = json.loads(payload_json)
+        payload["team_spec"] = body.team_spec
+        db._conn.execute(
+            "UPDATE messages SET payload_json=?, edited_at=? WHERE id=?",
+            (json.dumps(payload), time.time(), msg_id),
+        )
+        t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+        _background_tasks.add(t)
+        t.add_done_callback(_background_tasks.discard)
+    return {"id": task_id, "status": status, "team_spec": body.team_spec}
 
 
 @app.get("/tasks", response_model=list[TaskResponse])

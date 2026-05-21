@@ -141,3 +141,39 @@ def test_approve_non_owner_returns_403(client):
 def test_approve_unknown_task_returns_404(client):
     r = client.post("/tasks/nonexistent/approve")
     assert r.status_code == 404
+
+
+def test_patch_team_spec_updates(client):
+    import tally_orchestrator.service as svc
+    import json as _json
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    new_spec = {"nodes": [{"id": "n1", "kind": "agent", "role": "Tester"}], "edges": [], "format": "nodes_v1"}
+    r2 = client.patch(f"/tasks/{task_id}/team_spec", json={"team_spec": new_spec})
+    assert r2.status_code == 200
+    db = svc.state["db"]
+    stored = _json.loads(db._conn.execute("SELECT team_spec FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
+    assert stored["nodes"][0]["role"] == "Tester"
+
+
+def test_patch_team_spec_409_after_approve(client):
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    client.post(f"/tasks/{task_id}/approve")
+    r2 = client.patch(f"/tasks/{task_id}/team_spec", json={"team_spec": {"nodes": [], "edges": []}})
+    assert r2.status_code == 409
+
+
+def test_patch_team_spec_non_owner_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    r = client.post("/tasks", json={"description": "x"})
+    body = r.json()
+    task_id = body.get("task_id") or body.get("id")
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.patch(f"/tasks/{task_id}/team_spec", json={"team_spec": {"nodes": [], "edges": []}})
+    assert r2.status_code == 403
