@@ -700,6 +700,14 @@ class WorkspaceCreateRequest(BaseModel):
     name: str
 
 
+_VALID_WORKSPACE_ROLES = {"owner", "admin", "manager", "member"}
+
+
+class WorkspaceMemberInviteRequest(BaseModel):
+    user_id: str
+    role: str
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6322,6 +6330,32 @@ async def list_workspace_members_route(
     if not is_member:
         return {"members": []}
     return {"members": db.list_workspace_members(workspace_id=wid)}
+
+
+@app.post("/workspaces/{wid}/members")
+async def invite_workspace_member_route(
+    wid: int,
+    body: WorkspaceMemberInviteRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: invite a human to a workspace.  Admin+ only.
+    Sprint 50 trusts the caller's user_id (no Clerk roundtrip)."""
+    if body.role not in _VALID_WORKSPACE_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.role == "owner":
+        raise HTTPException(400, "cannot invite as owner; transfer ownership is Sprint 51")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None:
+        raise HTTPException(403, "not a member of this workspace")
+    if caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db.add_workspace_member(workspace_id=wid, user_id=body.user_id, role=body.role)
+    return {"ok": True, "workspace_id": wid, "user_id": body.user_id, "role": body.role}
 
 
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────

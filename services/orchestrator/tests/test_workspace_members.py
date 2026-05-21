@@ -107,3 +107,36 @@ def test_remove_workspace_member(db: Db):
     db.remove_workspace_member(workspace_id=wid, user_id="bob")
     members = db.list_workspace_members(workspace_id=wid)
     assert all(m.get("user_id") != "bob" for m in members)
+
+
+# ── POST /workspaces/{wid}/members route tests ─────────────────────────────────
+
+
+def test_post_workspace_members_admin_can_invite(client):
+    # admin is owner of workspace 1 from backfill
+    r = client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    assert r.status_code == 200
+    members = client.get("/workspaces/1/members").json()["members"]
+    assert any(m["user_id"] == "bob" for m in members)
+
+
+def test_post_workspace_members_non_admin_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    # add bob as 'member' role
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="bob", source="clerk", plan="free", email="b@x.com",
+    )
+    r = client.post("/workspaces/1/members", json={"user_id": "charlie", "role": "member"})
+    assert r.status_code == 403
+
+
+def test_post_workspace_members_invalid_role_returns_400(client):
+    r = client.post("/workspaces/1/members", json={"user_id": "bob", "role": "superuser"})
+    assert r.status_code == 400
+
+
+def test_post_workspace_members_cannot_invite_as_owner(client):
+    r = client.post("/workspaces/1/members", json={"user_id": "bob", "role": "owner"})
+    assert r.status_code == 400
