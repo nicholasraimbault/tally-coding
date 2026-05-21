@@ -63,6 +63,7 @@ from .github_push import (
     push_project,
     validate_repo,
 )
+import httpx
 import jwt
 from .worker_pool import WorkerPool
 
@@ -74,6 +75,10 @@ TASK_CONTEXT_ID = "task:start"
 EVENT_CONTEXT_ID = "task:event"
 FS_LIST_CONTEXT_ID = "task:fs:list"
 FS_READ_CONTEXT_ID = "task:fs:read"
+
+# Sprint 52: Clerk user validation
+CLERK_API_BASE = "https://api.clerk.com/v1"
+_CLERK_VALIDATE_TIMEOUT = httpx.Timeout(5.0)
 
 # Sprint 48: task lifecycle statuses
 TASK_STATUS_TERMINAL: frozenset[str] = frozenset({
@@ -8220,6 +8225,35 @@ _ALLOWED_TOOLS = {
     "bash_read",
     "browser",
 }
+
+
+async def _validate_clerk_user(user_id: str) -> bool | None:
+    """Sprint 52: validate a user_id against Clerk's REST API.
+
+    Returns:
+      - True: user exists (HTTP 200)
+      - False: user not found in Clerk (HTTP 404)
+      - None: validation skipped (CLERK_SECRET_KEY unset) OR Clerk API failed
+              non-deterministically (network / 5xx / timeout)
+    """
+    secret = os.environ.get("CLERK_SECRET_KEY", "").strip()
+    if not secret:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_CLERK_VALIDATE_TIMEOUT) as client:
+            resp = await client.get(
+                f"{CLERK_API_BASE}/users/{user_id}",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 404:
+            return False
+        logger.warning("Clerk validation returned %s for %s; skipping", resp.status_code, user_id)
+        return None
+    except Exception as exc:
+        logger.warning("Clerk validation failed for %s: %s; skipping", user_id, exc)
+        return None
 
 
 def _validate_custom_role_inputs(
