@@ -862,6 +862,39 @@ class Db:
                 "VALUES (?, 'human', ?, ?)",
                 (ch_cur.lastrowid, user_id, created_at),
             )
+        # Sprint 49: ensure every workspace has a Tally workspace_member.
+        all_workspace_ids = [r[0] for r in self._conn.execute("SELECT id FROM workspaces").fetchall()]
+        for ws_id in all_workspace_ids:
+            existing = self._conn.execute(
+                "SELECT 1 FROM workspace_members WHERE workspace_id=? AND member_kind='tally'",
+                (ws_id,),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+                    "VALUES (?, 'tally', NULL, 'tally', ?)",
+                    (ws_id, now),
+                )
+        # Sprint 49: add Tally as channel_member of every existing #general / #backlog channel.
+        for ws_id in all_workspace_ids:
+            for kind in ("general", "backlog"):
+                ch_row = self._conn.execute(
+                    "SELECT id FROM channels WHERE workspace_id=? AND kind=?",
+                    (ws_id, kind),
+                ).fetchone()
+                if ch_row is None:
+                    continue
+                channel_id = ch_row[0]
+                existing = self._conn.execute(
+                    "SELECT 1 FROM channel_members WHERE channel_id=? AND member_kind='tally'",
+                    (channel_id,),
+                ).fetchone()
+                if existing is None:
+                    self._conn.execute(
+                        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                        "VALUES (?, 'tally', NULL, ?)",
+                        (channel_id, now),
+                    )
 
     def _seed_agent_roles(self) -> None:
         """Idempotent seed of the 7-role palette. INSERT OR IGNORE so

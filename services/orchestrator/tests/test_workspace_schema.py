@@ -167,3 +167,24 @@ def test_approve_task_idempotent(db: Db):
     db.approve_task(task_id)
     cnt = db._conn.execute("SELECT COUNT(*) FROM channels WHERE task_id=?", (task_id,)).fetchone()[0]
     assert cnt == 1
+
+
+def test_backfill_tally_workspace_member(db: Db):
+    """Every workspace has a tally workspace_member after backfill."""
+    rows = db._conn.execute(
+        "SELECT w.id FROM workspaces w "
+        "WHERE NOT EXISTS (SELECT 1 FROM workspace_members wm "
+        "                  WHERE wm.workspace_id=w.id AND wm.member_kind='tally')"
+    ).fetchall()
+    assert rows == []
+
+
+def test_backfill_tally_in_general_and_backlog(db: Db):
+    """Tally is a channel_member of every existing #general and #backlog channel."""
+    rows = db._conn.execute(
+        "SELECT c.id, c.kind FROM channels c "
+        "WHERE c.kind IN ('general', 'backlog') "
+        "AND NOT EXISTS (SELECT 1 FROM channel_members cm "
+        "                WHERE cm.channel_id=c.id AND cm.member_kind='tally')"
+    ).fetchall()
+    assert rows == []
