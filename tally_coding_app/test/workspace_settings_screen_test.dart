@@ -42,7 +42,7 @@ void main() {
       callerRole: 'owner',
     )));
     await tester.pumpAndSettle();
-    expect(find.text('Delete workspace'), findsOneWidget);
+    expect(find.text('Delete workspace', skipOffstage: false), findsOneWidget);
   });
 
   testWidgets('non-owner sees Leave workspace button (not Delete)', (tester) async {
@@ -54,8 +54,8 @@ void main() {
       callerRole: 'member',
     )));
     await tester.pumpAndSettle();
-    expect(find.text('Leave workspace'), findsOneWidget);
-    expect(find.text('Delete workspace'), findsNothing);
+    expect(find.text('Leave workspace', skipOffstage: false), findsOneWidget);
+    expect(find.text('Delete workspace', skipOffstage: false), findsNothing);
   });
 
   testWidgets('renders Archived channels section with archived channels', (tester) async {
