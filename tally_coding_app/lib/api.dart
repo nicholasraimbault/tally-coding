@@ -876,5 +876,113 @@ class TallyOrchClient {
     return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
+  // ── Sprint 47: channels + messages ──────────────────────────────────────
+
+  Future<List<Map<String, dynamic>>> listChannels({
+    required int workspaceId,
+    bool includeArchived = false,
+  }) async {
+    final qs = {'workspace_id': '$workspaceId'};
+    if (includeArchived) qs['include_archived'] = 'true';
+    final resp = await _http.get(
+      baseUrl.resolve('/channels').replace(queryParameters: qs),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /channels ${resp.statusCode}: ${resp.body}');
+    }
+    final body = Map<String, dynamic>.from(jsonDecode(resp.body));
+    return List<Map<String, dynamic>>.from(body['channels'] as List);
+  }
+
+  Future<List<Map<String, dynamic>>> getMessages({
+    required int channelId,
+    int limit = 50,
+    int? sinceId,
+  }) async {
+    final qs = <String, String>{'limit': '$limit'};
+    if (sinceId != null) qs['since_id'] = '$sinceId';
+    final resp = await _http.get(
+      baseUrl.resolve('/channels/$channelId/messages').replace(queryParameters: qs),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /channels/$channelId/messages ${resp.statusCode}: ${resp.body}');
+    }
+    final body = Map<String, dynamic>.from(jsonDecode(resp.body));
+    return List<Map<String, dynamic>>.from(body['messages'] as List);
+  }
+
+  Future<Map<String, dynamic>> postMessage({
+    required int channelId,
+    String? text,
+    String kind = 'text',
+    Map<String, dynamic>? payload,
+    int? replyToId,
+  }) async {
+    final body = <String, dynamic>{'kind': kind};
+    if (text != null) body['text'] = text;
+    if (payload != null) body['payload'] = payload;
+    if (replyToId != null) body['reply_to_id'] = replyToId;
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/messages'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /channels/$channelId/messages ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> patchMessage(
+    int channelId,
+    int messageId, {
+    String? text,
+    Map<String, dynamic>? payload,
+  }) async {
+    final body = <String, dynamic>{};
+    if (text != null) body['text'] = text;
+    if (payload != null) body['payload'] = payload;
+    final resp = await _http.patch(
+      baseUrl.resolve('/channels/$channelId/messages/$messageId'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('PATCH /channels/$channelId/messages/$messageId ${resp.statusCode}: ${resp.body}');
+    }
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> postChannelRead({
+    required int channelId,
+    required int lastReadMessageId,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/read'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'last_read_message_id': lastReadMessageId}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /channels/$channelId/read ${resp.statusCode}');
+    }
+  }
+
+  Future<void> setChannelMemberRoleOverride({
+    required int channelId,
+    required String targetUserId,
+    String? roleOverride,
+  }) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/members/$targetUserId/role_override'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'role_override': roleOverride}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST role_override ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
   void close() => _http.close();
 }
