@@ -176,11 +176,23 @@ Tally's deterministic responder reacts:
 
 The Tally responder runs as part of the `_broadcast_new_message` fan-out: after the new_message frame goes out to subscribers, check if the message warrants Tally action.
 
-### 8. `tally` workspace_member
+### 8. `tally` workspace_member + channel_member
 
-Every workspace has a synthetic `tally` workspace_member: `member_kind='tally', user_id=NULL, role='tally'`. Created by the backfill (and by `create_workspace` for new workspaces) so Tally can be a `channel_member` of relevant channels.
+Every workspace has a synthetic `tally` workspace_member: `member_kind='tally', user_id=NULL, role='tally'`. Created by the backfill (and by `create_workspace` for new workspaces) so Tally can be added as a `channel_member`.
 
-The Sprint 47 `_backfill_workspaces_and_channels` is extended to insert a Tally workspace_member if missing.
+Channels Tally is auto-joined to:
+- `#general` — Tally answers `@tally` mentions, surfaces team_proposal context
+- `#backlog` — same scope as #general
+- Every `kind='scheduled_agent'` channel (on creation, via `POST /persistent_agents`)
+- Every `kind='dm'` channel where Tally is the target (idempotent via `POST /channels/dm {target_kind: 'tally'}`)
+
+NOT auto-joined to:
+- `kind='task'` channels — task channels are private per-task; if escalation happens within a task, the existing agent dispatches the escalation message and Tally reacts via the cross-channel `_broadcast_new_message` hook without needing membership there.
+- `kind='custom'` channels (Sprint 50) — the user decides who joins.
+
+The Sprint 47 `_backfill_workspaces_and_channels` is extended to:
+1. Insert a Tally `workspace_members` row if missing
+2. Insert Tally as `channel_members` in every existing `#general` + `#backlog` + `scheduled_agent` channel without one
 
 ### 9. New endpoints
 
@@ -213,9 +225,14 @@ These are templated string formats, no LLM call. `{reason_truncated_to_140}` is 
 
 ### 11. Auto-pause on repeated failures
 
-When `_fire_persistent_agent` catches an exception or the dispatched team_spec results in `status='failed'`, increment `consecutive_failures`. If it reaches 3, set `enabled=0` and emit the "permanent failure DM" to the owner. On a successful run, reset to 0.
+`consecutive_failures` increments on two paths:
 
-This is the cost-control + sanity gate that prevents a broken cron from filling logs.
+1. **Synchronous failure inside `_fire_persistent_agent`** — exception during `Db.create_task` or initial dispatch. Increment immediately.
+2. **Async failure after dispatch** — the task transitions to `status='failed'` later (after `_handle_result_event` aggregates agent results). The orchestrator's existing task-completion path (the same place that today sets `tasks.status='failed'`) is extended: if the task has `persistent_agent_id`, also `UPDATE persistent_agents SET consecutive_failures = consecutive_failures + 1 WHERE id=?`.
+
+On a successful run (task transitions to `status='completed'` with `persistent_agent_id`), reset `consecutive_failures` to 0.
+
+When `consecutive_failures` reaches 3, set `enabled=0` and emit the "permanent failure DM" to the owner. This is the cost-control + sanity gate that prevents a broken cron from filling logs.
 
 ## Frontend changes
 
