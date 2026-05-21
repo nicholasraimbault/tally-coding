@@ -3,6 +3,7 @@
 // Sprint 51: workspace audit log viewer.  Reached from WorkspaceSettingsScreen
 // via an "Activity log" button (B3).  Keyset-paginated via before_id.
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../api.dart';
 
 const _pageSize = 50;
@@ -83,6 +84,26 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() { _error = e.toString(); _loading = false; });
+    }
+  }
+
+  Future<void> _onExport() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final csv = await widget.client.exportAuditLogCsv(
+        workspaceId: widget.workspaceId,
+        kind: _kindFilter,
+        actorUserId: _actorFilter.isEmpty ? null : _actorFilter,
+      );
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => _ExportPreviewDialog(csv: csv),
+      );
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      }
     }
   }
 
@@ -234,7 +255,16 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('Activity log: ${widget.workspaceName}')),
+      appBar: AppBar(
+        title: Text('Activity log: ${widget.workspaceName}'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.download),
+            tooltip: 'Export CSV',
+            onPressed: _onExport,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           _filterBar(),
@@ -278,6 +308,44 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _ExportPreviewDialog extends StatelessWidget {
+  final String csv;
+  const _ExportPreviewDialog({required this.csv});
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Export preview'),
+      content: SizedBox(
+        width: 600,
+        height: 400,
+        child: SingleChildScrollView(
+          child: SelectableText(
+            csv,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: csv));
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Copied to clipboard')),
+              );
+            }
+          },
+          child: const Text('Copy to clipboard'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
     );
   }
 }
