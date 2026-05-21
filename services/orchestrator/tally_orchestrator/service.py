@@ -930,6 +930,49 @@ class Db:
                         (channel_id, now),
                     )
 
+    def create_workspace(self, *, name: str, owner_user_id: str, plan_slug: str = "free") -> int:
+        """Sprint 50: create a workspace + owner + Tally workspace_members
+        + #general / #backlog channels + Tally as channel_member of each.
+        Mirrors what the Sprint 47 backfill does for a single user."""
+        now = time.time()
+        cur = self._conn.execute(
+            "INSERT INTO workspaces (name, owner_user_id, plan_slug, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, owner_user_id, plan_slug, now),
+        )
+        ws_id = int(cur.lastrowid or 0)
+        # Owner workspace_member
+        self._conn.execute(
+            "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'human', ?, 'owner', ?)",
+            (ws_id, owner_user_id, now),
+        )
+        # Tally workspace_member
+        self._conn.execute(
+            "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'tally', NULL, 'tally', ?)",
+            (ws_id, now),
+        )
+        # general + backlog channels with owner + Tally as members
+        for kind in ("general", "backlog"):
+            ch_cur = self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (ws_id, kind, kind, now),
+            )
+            ch_id = int(ch_cur.lastrowid or 0)
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_id, owner_user_id, now),
+            )
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'tally', NULL, ?)",
+                (ch_id, now),
+            )
+        return ws_id
+
     def _seed_agent_roles(self) -> None:
         """Idempotent seed of the 7-role palette. INSERT OR IGNORE so
         adding/upgrading a role's prompt requires an explicit migration
