@@ -160,6 +160,44 @@ def get_task_channel_id(db: "Db", task_id: str) -> int | None:
     return int(row[0]) if row else None
 
 
+def insert_team_proposal_message(
+    db: "Db",
+    *,
+    task_id: str,
+    user_id: str,
+    description: str,
+    team_spec: dict,
+) -> int:
+    """Sprint 48: insert a kind='team_proposal' message in the user's
+    #general channel with the architect's proposed team_spec.  Returns
+    the new message_id, or 0 if the user has no #general channel."""
+    row = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id=? AND c.kind='general' LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    channel_id = int(row[0])
+    payload = {
+        "task_id": task_id,
+        "description": description,
+        "team_spec": team_spec,
+        "options": [
+            {"value": "approve", "label": "Approve & dispatch"},
+            {"value": "edit", "label": "Edit in builder"},
+            {"value": "cancel", "label": "Cancel"},
+        ],
+    }
+    return insert_message(
+        db,
+        channel_id=channel_id,
+        author_kind="tally",
+        kind="team_proposal",
+        payload=payload,
+    )
+
+
 def fetch_user_messages_since(
     db: "Db",
     *,
