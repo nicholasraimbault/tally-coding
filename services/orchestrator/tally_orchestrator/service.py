@@ -6473,6 +6473,30 @@ async def delete_workspace_route(wid: int, user: ClerkUser = Depends(require_use
     return {"ok": True}
 
 
+@app.post("/workspaces/{wid}/leave")
+async def leave_workspace_route(wid: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: non-owner self-remove from workspace."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "not a member")
+    if row[0] == "owner":
+        raise HTTPException(400, "owner cannot leave; delete workspace instead")
+    db.remove_workspace_member(workspace_id=wid, user_id=user.id)
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="member_left", target_kind="member", target_id=user.id, payload={},
+        )
+    except Exception as exc:
+        logger.warning("audit_log member_left failed: %s", exc)
+    return {"ok": True}
+
+
 @app.get("/me/workspaces")
 async def list_my_workspaces(
     user: ClerkUser = Depends(require_user),
