@@ -97,3 +97,54 @@ def test_post_message_text_persists_to_db(client):
         "SELECT payload_json FROM messages WHERE id=?", (msg_id,)
     ).fetchone()
     assert json.loads(row[0])["text"] == "persisted"
+
+
+def test_get_messages_empty(client):
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r = client.get(f"/channels/{ch_id}/messages")
+    assert r.status_code == 200
+    assert r.json() == {"messages": [], "channel_id": ch_id}
+
+
+def test_get_messages_after_posts_in_reverse_chronological(client):
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    client.post(f"/channels/{ch_id}/messages", json={"text": "first"})
+    client.post(f"/channels/{ch_id}/messages", json={"text": "second"})
+    client.post(f"/channels/{ch_id}/messages", json={"text": "third"})
+
+    r = client.get(f"/channels/{ch_id}/messages")
+    assert r.status_code == 200
+    msgs = r.json()["messages"]
+    assert len(msgs) == 3
+    # newest first
+    texts = [json.loads(m["payload_json"])["text"] for m in msgs]
+    assert texts == ["third", "second", "first"]
+
+
+def test_get_messages_since_id(client):
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r1 = client.post(f"/channels/{ch_id}/messages", json={"text": "a"})
+    r2 = client.post(f"/channels/{ch_id}/messages", json={"text": "b"})
+    r3 = client.post(f"/channels/{ch_id}/messages", json={"text": "c"})
+    first_id = r1.json()["id"]
+
+    r = client.get(f"/channels/{ch_id}/messages?since_id={first_id}")
+    assert r.status_code == 200
+    msgs = r.json()["messages"]
+    assert len(msgs) == 2
+    texts = sorted([json.loads(m["payload_json"])["text"] for m in msgs])
+    assert texts == ["b", "c"]
+
+
+def test_get_messages_non_member_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    ch_id = _admin_general_channel_id(svc)
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r = client.get(f"/channels/{ch_id}/messages")
+    assert r.status_code == 403

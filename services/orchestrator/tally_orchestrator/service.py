@@ -5336,6 +5336,34 @@ async def post_message(
     }
 
 
+@app.get("/channels/{channel_id}/messages")
+async def get_messages(
+    channel_id: int,
+    limit: int = 50,
+    since_id: int | None = None,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: paginated message history.  Reverse chronological
+    (newest first).  `since_id` returns messages with id > since_id
+    (used by clients catching up after WebSocket reconnect).
+
+    Permission: 404 if channel doesn't exist; 403 if caller is not a
+    channel member.
+
+    TODO(Sprint 49): when private channels (DMs) land, collapse 404/403
+    into 403 to avoid leaking channel existence.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_channel, resolve_effective_role, list_messages
+    if resolve_channel(db, channel_id) is None:
+        raise HTTPException(404, f"channel {channel_id} not found")
+    role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if role is None:
+        raise HTTPException(403, "permission denied — not a channel member")
+    msgs = list_messages(db, channel_id=channel_id, limit=limit, since_id=since_id)
+    return {"channel_id": channel_id, "messages": msgs}
+
+
 async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
     """Placeholder; Task A10 implements the WebSocket fan-out."""
     pass
