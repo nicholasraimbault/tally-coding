@@ -150,3 +150,42 @@ def test_persistent_agent_deleted_audit(client):
     pid = rp.json()["id"]
     client.delete(f"/persistent_agents/{pid}")
     assert "persistent_agent_deleted" in _audit_kinds(svc, wid)
+
+
+def test_delete_persistent_agent_archives_channel(client):
+    """Sprint 51: deleting a persistent agent also archives its scheduled_agent channel."""
+    import tally_orchestrator.service as svc
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "x", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    client.delete(f"/persistent_agents/{pid}")
+    db = svc.state["db"]
+    row = db._conn.execute(
+        "SELECT archived_at FROM channels WHERE persistent_agent_id=?", (pid,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] is not None
+
+
+def test_auto_pause_emits_system_audit(client):
+    """When bump_persistent_agent_failure hits 3, emit persistent_agent_auto_paused audit with actor_kind='system'."""
+    import tally_orchestrator.service as svc
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "flaky-agent", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    db = svc.state["db"]
+    for _ in range(3):
+        db.bump_persistent_agent_failure(pid)
+    row = db._conn.execute(
+        "SELECT kind, actor_kind, payload_json FROM workspace_audit_log "
+        "WHERE workspace_id=1 AND kind='persistent_agent_auto_paused' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row[1] == "system"
+    import json as _json
+    payload = _json.loads(row[2])
+    assert payload.get("name") == "flaky-agent"

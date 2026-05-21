@@ -2214,10 +2214,18 @@ class Db:
         )
 
     def delete_persistent_agent(self, pid: int) -> None:
-        """Sprint 49: soft delete; disables future fires."""
+        """Sprint 49: soft delete the persistent agent.
+        Sprint 51: also archive its scheduled_agent channel."""
+        now = time.time()
         self._conn.execute(
             "UPDATE persistent_agents SET deleted_at=?, enabled=0 WHERE id=?",
-            (time.time(), pid),
+            (now, pid),
+        )
+        # Sprint 51: archive the scheduled_agent channel (idempotent: only updates active channels)
+        self._conn.execute(
+            "UPDATE channels SET archived_at=? "
+            "WHERE persistent_agent_id=? AND archived_at IS NULL",
+            (now, pid),
         )
 
     # ── Sprint 49 A13: auto-pause on consecutive failures ──────────────────
@@ -2269,6 +2277,15 @@ class Db:
                     self, channel_id=dm_ch, author_kind="tally", kind="text",
                     payload={"text": text},
                 )
+            try:
+                self.audit_log(
+                    workspace_id=workspace_id, actor_user_id=None, actor_kind="system",
+                    kind="persistent_agent_auto_paused",
+                    target_kind="persistent_agent", target_id=str(pid),
+                    payload={"name": name, "consecutive_failures": new_count},
+                )
+            except Exception:
+                pass  # best-effort; never break the bump
         else:
             self._conn.execute(
                 "UPDATE persistent_agents SET consecutive_failures=? WHERE id=?",
