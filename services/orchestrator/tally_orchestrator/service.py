@@ -418,6 +418,32 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_channel_id_desc ON messages(channel_id, id DESC);
+
+-- Sprint 49: persistent agents — long-lived agent identities that live
+-- inside a workspace and can be triggered by cron schedule or events.
+-- Mirrors the workspace_members.persistent_agent_id FK; this is the
+-- authoritative record.  deleted_at uses soft-delete so history and
+-- channel membership rows can still resolve the agent name after
+-- removal.
+CREATE TABLE IF NOT EXISTS persistent_agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+    name TEXT NOT NULL,
+    role_name TEXT NOT NULL,
+    team_spec_json TEXT NOT NULL,
+    tool_allowlist_json TEXT,
+    model TEXT,
+    cron_schedule TEXT,
+    event_triggers_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at REAL,
+    next_scheduled_run_at REAL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    deleted_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_persistent_agents
+    ON persistent_agents(workspace_id, enabled, next_scheduled_run_at);
 """
 
 # Sprint 46: credit-based plan config.  Replaces Sprint 33's
