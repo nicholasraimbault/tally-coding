@@ -772,6 +772,20 @@ class Db:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Sprint 49: link tasks to the persistent agent that triggered them.
+        # Nullable FK — ad-hoc tasks (no persistent agent) leave this NULL.
+        try:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN persistent_agent_id INTEGER REFERENCES persistent_agents(id)"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_persistent_agent ON tasks(persistent_agent_id)"
+            )
+        except sqlite3.OperationalError:
+            pass
         # Sprint 47: backfill workspaces + channels for pre-existing data.
         # Idempotent — only creates rows when they're missing.
         self._backfill_workspaces_and_channels()

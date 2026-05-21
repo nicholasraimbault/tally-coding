@@ -23,3 +23,13 @@ def test_persistent_agents_columns(db: Db):
 def test_persistent_agents_index(db: Db):
     idxs = {r[1] for r in db._conn.execute("PRAGMA index_list('persistent_agents')").fetchall()}
     assert "idx_persistent_agents" in idxs
+
+
+def test_tasks_persistent_agent_id_column(db: Db):
+    cols = {r[1] for r in db._conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    assert "persistent_agent_id" in cols
+
+
+def test_tasks_persistent_agent_id_index(db: Db):
+    idxs = {r[1] for r in db._conn.execute("PRAGMA index_list('tasks')").fetchall()}
+    assert "idx_tasks_persistent_agent" in idxs
