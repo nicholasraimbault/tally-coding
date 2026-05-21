@@ -708,6 +708,10 @@ class WorkspaceMemberInviteRequest(BaseModel):
     role: str
 
 
+class WorkspaceMemberRolePatchRequest(BaseModel):
+    role: str
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6384,6 +6388,49 @@ async def remove_workspace_member_route(
         raise HTTPException(403, "admin+ only")
     db.remove_workspace_member(workspace_id=wid, user_id=target_user_id)
     return {"ok": True}
+
+
+@app.patch("/workspaces/{wid}/members/{target_user_id}")
+async def patch_workspace_member_role_route(
+    wid: int,
+    target_user_id: str,
+    body: WorkspaceMemberRolePatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: change a member's role.
+    - Owner can change any non-owner role.
+    - Admin can change Manager/Member roles.
+    - Cannot set role to/from 'owner' (ownership transfer is Sprint 51).
+    """
+    if body.role not in _VALID_WORKSPACE_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.role == "owner":
+        raise HTTPException(400, "ownership transfer is Sprint 51")
+    db: Db = state["db"]
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, target_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "member not found")
+    if target[0] == "owner":
+        raise HTTPException(400, "cannot change the owner's role")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None:
+        raise HTTPException(403, "not a workspace member")
+    if caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    # Admin can only change Manager/Member roles
+    if caller[0] == "admin" and target[0] not in ("manager", "member"):
+        raise HTTPException(403, "admin can only change manager/member roles")
+    if not db.update_workspace_member_role(workspace_id=wid, user_id=target_user_id, role=body.role):
+        raise HTTPException(404, "member not found")
+    return {"ok": True, "role": body.role}
 
 
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────

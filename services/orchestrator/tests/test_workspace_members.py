@@ -173,3 +173,70 @@ def test_delete_workspace_member_non_admin_returns_403(client):
 def test_delete_workspace_member_404_if_not_present(client):
     r = client.delete("/workspaces/1/members/nonexistent")
     assert r.status_code == 404
+
+
+# ── PATCH /workspaces/{wid}/members/{target_user_id} route tests ──────────────
+
+
+def test_patch_member_role_owner_can_change_any(client):
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    r = client.patch("/workspaces/1/members/bob", json={"role": "admin"})
+    assert r.status_code == 200
+    members = client.get("/workspaces/1/members").json()["members"]
+    assert next(m for m in members if m["user_id"] == "bob")["role"] == "admin"
+
+
+def test_patch_member_role_admin_can_change_member(client):
+    """Admin (bob) can change Member (charlie) role to Manager."""
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "admin"})
+    client.post("/workspaces/1/members", json={"user_id": "charlie", "role": "member"})
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="bob", source="clerk", plan="free", email="b@x.com",
+    )
+    r = client.patch("/workspaces/1/members/charlie", json={"role": "manager"})
+    assert r.status_code == 200
+
+
+def test_patch_member_role_admin_cannot_change_other_admin(client):
+    """Admin can only change Manager/Member roles, not other Admins."""
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "admin"})
+    client.post("/workspaces/1/members", json={"user_id": "alex", "role": "admin"})
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="bob", source="clerk", plan="free", email="b@x.com",
+    )
+    r = client.patch("/workspaces/1/members/alex", json={"role": "member"})
+    assert r.status_code == 403
+
+
+def test_patch_member_role_cannot_change_owner_role(client):
+    r = client.patch("/workspaces/1/members/admin", json={"role": "member"})
+    assert r.status_code == 400
+
+
+def test_patch_member_role_cannot_set_owner(client):
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    r = client.patch("/workspaces/1/members/bob", json={"role": "owner"})
+    assert r.status_code == 400
+
+
+def test_patch_member_role_invalid_returns_400(client):
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    r = client.patch("/workspaces/1/members/bob", json={"role": "superuser"})
+    assert r.status_code == 400
+
+
+def test_patch_member_role_member_cannot_change_any(client):
+    """A Member-role caller can't change anyone's role."""
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    client.post("/workspaces/1/members", json={"user_id": "charlie", "role": "member"})
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="bob", source="clerk", plan="free", email="b@x.com",
+    )
+    r = client.patch("/workspaces/1/members/charlie", json={"role": "manager"})
+    assert r.status_code == 403
