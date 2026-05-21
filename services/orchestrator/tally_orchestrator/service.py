@@ -6358,6 +6358,34 @@ async def invite_workspace_member_route(
     return {"ok": True, "workspace_id": wid, "user_id": body.user_id, "role": body.role}
 
 
+@app.delete("/workspaces/{wid}/members/{target_user_id}")
+async def remove_workspace_member_route(
+    wid: int,
+    target_user_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: remove a human member.  Admin+ only.  Cannot remove owner."""
+    db: Db = state["db"]
+    target = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, target_user_id),
+    ).fetchone()
+    if target is None:
+        raise HTTPException(404, "member not found")
+    if target[0] == "owner":
+        raise HTTPException(400, "cannot remove the workspace owner")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    db.remove_workspace_member(workspace_id=wid, user_id=target_user_id)
+    return {"ok": True}
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 

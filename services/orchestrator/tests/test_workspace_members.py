@@ -140,3 +140,36 @@ def test_post_workspace_members_invalid_role_returns_400(client):
 def test_post_workspace_members_cannot_invite_as_owner(client):
     r = client.post("/workspaces/1/members", json={"user_id": "bob", "role": "owner"})
     assert r.status_code == 400
+
+
+# ── DELETE /workspaces/{wid}/members/{target_user_id} route tests ─────────────
+
+
+def test_delete_workspace_member_admin_can_remove(client):
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    r = client.delete("/workspaces/1/members/bob")
+    assert r.status_code == 200
+    members = client.get("/workspaces/1/members").json()["members"]
+    assert not any(m.get("user_id") == "bob" for m in members)
+
+
+def test_delete_workspace_member_cannot_remove_owner(client):
+    r = client.delete("/workspaces/1/members/admin")
+    assert r.status_code == 400
+
+
+def test_delete_workspace_member_non_admin_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    client.post("/workspaces/1/members", json={"user_id": "bob", "role": "member"})
+    client.post("/workspaces/1/members", json={"user_id": "charlie", "role": "member"})
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="bob", source="clerk", plan="free", email="b@x.com",
+    )
+    r = client.delete("/workspaces/1/members/charlie")
+    assert r.status_code == 403
+
+
+def test_delete_workspace_member_404_if_not_present(client):
+    r = client.delete("/workspaces/1/members/nonexistent")
+    assert r.status_code == 404
