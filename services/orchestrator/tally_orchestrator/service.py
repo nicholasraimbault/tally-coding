@@ -6670,6 +6670,25 @@ async def patch_workspace_member_role_route(
     return {"ok": True, "role": body.role}
 
 
+@app.get("/workspaces/{wid}/audit-log")
+async def get_workspace_audit_log_route(
+    wid: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    before_id: int | None = Query(default=None, ge=1),
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 51: read the workspace audit log.  Owner + Admin only."""
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (wid, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "owner+admin only")
+    return {"entries": db.list_audit_log(workspace_id=wid, limit=limit, before_id=before_id)}
+
+
 # ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
 
 
