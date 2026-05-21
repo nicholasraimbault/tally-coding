@@ -680,6 +680,16 @@ class PersistentAgentCreateRequest(BaseModel):
     event_triggers: list[dict] | None = None
 
 
+class PersistentAgentPatchRequest(BaseModel):
+    name: str | None = None
+    team_spec: dict | None = None
+    tool_allowlist: dict | None = None
+    model: str | None = None
+    cron_schedule: str | None = None
+    event_triggers: list[dict] | None = None
+    enabled: bool | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6231,6 +6241,49 @@ async def create_persistent_agent_route(
         cron_schedule=body.cron_schedule,
         event_triggers=triggers,
     )
+    return db.get_persistent_agent(pid)
+
+
+@app.get("/persistent_agents")
+async def list_persistent_agents_route(
+    workspace_id: int,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: list active persistent agents in a workspace.
+    Returns empty list if caller isn't a member (workspace-isolation
+    pattern from Sprint 47 GET /channels)."""
+    db: Db = state["db"]
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (workspace_id, user.id),
+    ).fetchone()
+    if not is_member:
+        return {"persistent_agents": []}
+    return {"persistent_agents": db.list_persistent_agents(workspace_id=workspace_id)}
+
+
+@app.patch("/persistent_agents/{pid}")
+async def patch_persistent_agent_route(
+    pid: int,
+    body: PersistentAgentPatchRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 49: partial update.  Owner-only via workspace membership.
+    Recomputes next_scheduled_run_at if cron_schedule changes."""
+    db: Db = state["db"]
+    agent = db.get_persistent_agent(pid)
+    if agent is None or agent.get("deleted_at"):
+        raise HTTPException(404, "persistent agent not found")
+    is_member = db._conn.execute(
+        "SELECT 1 FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human' LIMIT 1",
+        (agent["workspace_id"], user.id),
+    ).fetchone()
+    if not is_member:
+        raise HTTPException(403, "not a member of this workspace")
+    patch = body.model_dump(exclude_unset=True)
+    db.update_persistent_agent(pid, patch=patch)
     return db.get_persistent_agent(pid)
 
 

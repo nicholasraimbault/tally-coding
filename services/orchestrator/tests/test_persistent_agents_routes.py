@@ -94,3 +94,53 @@ def test_post_persistent_agents_non_member_returns_403(client):
         "team_spec": {"nodes": [], "edges": []},
     })
     assert r.status_code == 403
+
+
+def test_get_persistent_agents_returns_list(client):
+    client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    r = client.get("/persistent_agents?workspace_id=1")
+    assert r.status_code == 200
+    body = r.json()
+    assert "persistent_agents" in body
+    assert any(a["name"] == "a" for a in body["persistent_agents"])
+
+
+def test_patch_persistent_agent_renames(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "old", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    r2 = client.patch(f"/persistent_agents/{pid}", json={"name": "new"})
+    assert r2.status_code == 200
+    assert r2.json()["name"] == "new"
+
+
+def test_patch_persistent_agent_cron_recomputes_next_run(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    r2 = client.patch(f"/persistent_agents/{pid}", json={"cron_schedule": "0 9 * * *"})
+    assert r2.status_code == 200
+    assert r2.json()["next_scheduled_run_at"] is not None
+    assert r2.json()["next_scheduled_run_at"] > 0
+
+
+def test_patch_non_member_returns_403(client):
+    r = client.post("/persistent_agents", json={
+        "workspace_id": 1, "name": "a", "role_name": "Tester",
+        "team_spec": {"nodes": [], "edges": []},
+    })
+    pid = r.json()["id"]
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="stranger", source="clerk", plan="free", email="s@x.com",
+    )
+    r2 = client.patch(f"/persistent_agents/{pid}", json={"name": "x"})
+    assert r2.status_code == 403
