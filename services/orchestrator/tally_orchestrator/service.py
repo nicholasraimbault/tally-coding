@@ -1133,12 +1133,24 @@ class Db:
             "UPDATE tasks SET status='completed', result_json=?, updated_at=? WHERE id=?",
             (json.dumps(result), time.time(), task_id),
         )
+        # Sprint 49 A13: reset persistent agent failure counter on success.
+        pa_row = self._conn.execute(
+            "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if pa_row and pa_row[0]:
+            self.reset_persistent_agent_failures(pa_row[0])
 
     def mark_failed(self, task_id: str, error: str) -> None:
         self._conn.execute(
             "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=?",
             (error, time.time(), task_id),
         )
+        # Sprint 49 A13: bump persistent agent failure counter on failure.
+        pa_row = self._conn.execute(
+            "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if pa_row and pa_row[0]:
+            self.bump_persistent_agent_failure(pa_row[0])
 
     def recover_stuck_running(self, _error_unused: str = "") -> int:
         """Move every status='running' row to status='recovering' so the
@@ -1176,7 +1188,15 @@ class Db:
             "WHERE id=? AND status IN ('recovering','running')",
             (json.dumps(result), time.time(), task_id),
         )
-        return (cursor.rowcount or 0) > 0
+        updated = (cursor.rowcount or 0) > 0
+        # Sprint 49 A13: reset persistent agent failure counter on recovery→completed.
+        if updated:
+            pa_row = self._conn.execute(
+                "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if pa_row and pa_row[0]:
+                self.reset_persistent_agent_failures(pa_row[0])
+        return updated
 
     def sweep_recovering(self, older_than_seconds: float, error: str) -> list[str]:
         """Demote any `recovering` row older than `older_than_seconds`
@@ -1189,7 +1209,7 @@ class Db:
         in flight; a typical OpenHands task is ~30s so 5min is plenty."""
         cutoff = time.time() - older_than_seconds
         rows = self._conn.execute(
-            "SELECT id FROM tasks WHERE status='recovering' AND updated_at < ?",
+            "SELECT id, persistent_agent_id FROM tasks WHERE status='recovering' AND updated_at < ?",
             (cutoff,),
         ).fetchall()
         demoted_ids = [r[0] for r in rows]
@@ -1200,6 +1220,10 @@ class Db:
                 f"WHERE id IN ({placeholders})",
                 [error, time.time(), *demoted_ids],
             )
+            # Sprint 49 A13: bump failure counter for each persistent-agent-owned task.
+            for task_id, pa_id in rows:
+                if pa_id:
+                    self.bump_persistent_agent_failure(pa_id)
         return demoted_ids
 
     # ── Sprint 22: agent palette + per-task agent instances ──────────────
@@ -1968,6 +1992,72 @@ class Db:
         self._conn.execute(
             "UPDATE persistent_agents SET deleted_at=?, enabled=0 WHERE id=?",
             (time.time(), pid),
+        )
+
+    # ── Sprint 49 A13: auto-pause on consecutive failures ──────────────────
+
+    PERMANENT_FAILURE_DM_TEMPLATE = (
+        "@{owner} — {agent_name} has failed 3 times in a row. I've paused it. "
+        "See #{channel_name} for the failures. Enable again from settings."
+    )
+
+    def bump_persistent_agent_failure(self, pid: int) -> None:
+        """Sprint 49 A13: increment consecutive_failures; at 3, disable the
+        agent + emit the permanent-failure Tally DM.
+
+        Example::
+
+            db.bump_persistent_agent_failure(pid)
+        """
+        row = self._conn.execute(
+            "SELECT consecutive_failures, workspace_id, name FROM persistent_agents WHERE id=?",
+            (pid,),
+        ).fetchone()
+        if row is None:
+            return
+        new_count = (row[0] or 0) + 1
+        workspace_id, name = row[1], row[2]
+        if new_count >= 3:
+            self._conn.execute(
+                "UPDATE persistent_agents SET consecutive_failures=?, enabled=0 WHERE id=?",
+                (new_count, pid),
+            )
+            owner_row = self._conn.execute(
+                "SELECT owner_user_id FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone()
+            sa_ch_row = self._conn.execute(
+                "SELECT name FROM channels WHERE persistent_agent_id=? AND kind='scheduled_agent'",
+                (pid,),
+            ).fetchone()
+            if owner_row and sa_ch_row:
+                from .channels import ensure_dm_channel, insert_message
+                dm_ch = ensure_dm_channel(
+                    self, workspace_id=workspace_id,
+                    kind_a="human", id_a=owner_row[0],
+                    kind_b="tally", id_b=None,
+                )
+                text = self.PERMANENT_FAILURE_DM_TEMPLATE.format(
+                    owner=owner_row[0], agent_name=name, channel_name=sa_ch_row[0],
+                )
+                insert_message(
+                    self, channel_id=dm_ch, author_kind="tally", kind="text",
+                    payload={"text": text},
+                )
+        else:
+            self._conn.execute(
+                "UPDATE persistent_agents SET consecutive_failures=? WHERE id=?",
+                (new_count, pid),
+            )
+
+    def reset_persistent_agent_failures(self, pid: int) -> None:
+        """Sprint 49 A13: reset consecutive_failures to 0 on task success.
+
+        Example::
+
+            db.reset_persistent_agent_failures(pid)
+        """
+        self._conn.execute(
+            "UPDATE persistent_agents SET consecutive_failures=0 WHERE id=?", (pid,)
         )
 
     # ── Sprint 39: LLM cost accounting ─────────────────────────────────────
