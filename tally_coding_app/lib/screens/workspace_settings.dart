@@ -4,6 +4,7 @@
 // Reached from the channel-rail gear icon.
 import 'package:flutter/material.dart';
 import '../api.dart';
+import 'audit_log.dart';
 
 // Roles a non-owner caller can select from (cannot set owner; cannot touch owner)
 const _kAssignableRoles = ['admin', 'manager', 'member'];
@@ -151,6 +152,7 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
 
   Future<void> _onLeave() async {
     final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -163,12 +165,17 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
       ),
     );
     if (confirmed != true) return;
-    // Self-removal requires a dedicated "leave" endpoint. Deferred to Sprint 51.
-    messenger.showSnackBar(const SnackBar(content: Text('Leave workspace: TODO Sprint 51 dedicated endpoint')));
+    try {
+      await widget.client.leaveWorkspace(id: widget.workspaceId);
+      if (mounted) navigator.pop();
+    } catch (e) {
+      if (mounted) messenger.showSnackBar(SnackBar(content: Text('Leave failed: $e')));
+    }
   }
 
   Future<void> _onDelete() async {
     final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -181,8 +188,12 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
       ),
     );
     if (confirmed != true) return;
-    // Backend has no DELETE /workspaces/{id} route yet. Deferred to Sprint 51.
-    messenger.showSnackBar(const SnackBar(content: Text('Delete workspace: TODO Sprint 51 dedicated endpoint')));
+    try {
+      await widget.client.deleteWorkspace(id: widget.workspaceId);
+      if (mounted) navigator.pop();
+    } catch (e) {
+      if (mounted) messenger.showSnackBar(SnackBar(content: Text('Delete failed: $e')));
+    }
   }
 
   @override
@@ -235,6 +246,24 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
             const Center(child: CircularProgressIndicator())
           else
             ..._members.map((m) => _memberTile(m)),
+
+          const Divider(height: 32),
+
+          // === Activity log ===
+          if (widget.callerRole == 'owner' || widget.callerRole == 'admin')
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('Activity log'),
+              subtitle: const Text('Workspace audit log'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => AuditLogScreen(
+                  client: widget.client,
+                  workspaceId: widget.workspaceId,
+                  workspaceName: widget.workspaceName,
+                ),
+              )),
+            ),
 
           const Divider(height: 32),
 

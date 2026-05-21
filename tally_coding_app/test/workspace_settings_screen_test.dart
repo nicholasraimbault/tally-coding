@@ -29,7 +29,8 @@ void main() {
     expect(find.textContaining('Branding'), findsOneWidget);
     expect(find.textContaining('admin'), findsOneWidget);
     expect(find.textContaining('bob'), findsOneWidget);
-    expect(find.textContaining('Danger zone'), findsOneWidget);
+    expect(find.textContaining('Activity log'), findsOneWidget);
+    expect(find.textContaining('Danger zone', skipOffstage: false), findsOneWidget);
   });
 
   testWidgets('owner sees Delete workspace button', (tester) async {
