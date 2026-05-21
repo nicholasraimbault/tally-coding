@@ -31,8 +31,8 @@ RUN maturin build --release --features python --compatibility linux -o /wheels
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
-LABEL org.opencontainers.image.version=v28
-LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 48: workflow editor + pre-dispatch team confirm — proposed status, approve/cancel/PATCH team_spec routes, nodes_v1 executor)"
+LABEL org.opencontainers.image.version=v29
+LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 49: persistent agents + DMs + escalation chain — croniter loop, HMAC webhooks, Tally DM templates, auto-pause)"
 
 WORKDIR /app
 
