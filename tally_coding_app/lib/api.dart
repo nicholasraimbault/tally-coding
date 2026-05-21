@@ -935,9 +935,9 @@ class TallyOrchClient {
     return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
-  Future<Map<String, dynamic>> patchMessage(
-    int channelId,
-    int messageId, {
+  Future<Map<String, dynamic>> patchMessage({
+    required int channelId,
+    required int messageId,
     String? text,
     Map<String, dynamic>? payload,
   }) async {
@@ -965,7 +965,7 @@ class TallyOrchClient {
       body: jsonEncode({'last_read_message_id': lastReadMessageId}),
     );
     if (resp.statusCode != 200) {
-      throw Exception('POST /channels/$channelId/read ${resp.statusCode}');
+      throw Exception('POST /channels/$channelId/read ${resp.statusCode}: ${resp.body}');
     }
   }
 
