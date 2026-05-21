@@ -9,10 +9,9 @@ from tally_orchestrator.channels import (
 
 
 def test_get_task_channel_id_after_backfill(db: Db):
-    """A task created via the existing path gets a backfilled channel row."""
+    """A task channel exists after approve_task (Sprint 48: no longer relies on backfill)."""
     task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
-    # Re-run backfill so the task gets a channel (until A12 lands inline)
-    db._backfill_workspaces_and_channels()
+    db.approve_task(task_id)
     ch_id = get_task_channel_id(db, task_id)
     assert ch_id is not None
 
@@ -20,7 +19,7 @@ def test_get_task_channel_id_after_backfill(db: Db):
 def test_fetch_user_messages_since(db: Db):
     """Helper returns user messages from a channel since a timestamp."""
     task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
-    db._backfill_workspaces_and_channels()
+    db.approve_task(task_id)
     ch_id = get_task_channel_id(db, task_id)
     assert ch_id is not None
     insert_message(db, channel_id=ch_id, author_kind="human", author_user_id="admin",
@@ -39,7 +38,7 @@ def test_fetch_user_messages_since(db: Db):
 def test_fetch_user_messages_excludes_old(db: Db):
     """Messages with created_at <= since_ts are excluded."""
     task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
-    db._backfill_workspaces_and_channels()
+    db.approve_task(task_id)
     ch_id = get_task_channel_id(db, task_id)
     insert_message(db, channel_id=ch_id, author_kind="human", author_user_id="admin",
                    kind="text", payload={"text": "old"})

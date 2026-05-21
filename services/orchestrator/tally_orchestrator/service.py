@@ -798,7 +798,7 @@ class Db:
         task_rows = self._conn.execute(
             "SELECT t.id, t.user_id, t.status, t.created_at, t.updated_at "
             "FROM tasks t LEFT JOIN channels c ON c.task_id=t.id "
-            "WHERE c.id IS NULL"
+            "WHERE c.id IS NULL AND t.status NOT IN ('proposed', 'cancelled')"
         ).fetchall()
         for task_id, user_id, status, created_at, updated_at in task_rows:
             user_id = user_id or "admin"
@@ -912,6 +912,7 @@ class Db:
         *,
         user_id: str = "legacy-admin",
         project_id: str | None = None,
+        status: str = "proposed",
     ) -> str:
         """Sprint 23: team_spec can be set atomically with task creation so
         the processor loop never sees a `pending` row without its
@@ -923,20 +924,39 @@ class Db:
         persistent workspace.  The orchestrator hydrates the first
         agent's seed_files from the project's HEAD artifact set, and
         merges the task's final artifacts back into HEAD on success.
+
+        Sprint 48: tasks default to status='proposed' (no channel).
+        Call approve_task(task_id) to transition to 'pending' and
+        create the task channel + owner channel_member.
         """
         task_id = uuid.uuid4().hex
         now = time.time()
         self._conn.execute(
             "INSERT INTO tasks (id, description, status, team_spec, created_at, updated_at, user_id, project_id) "
-            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
-            (task_id, description, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, description, status, json.dumps(team_spec) if team_spec else None, now, now, user_id, project_id),
         )
-        # Sprint 47: insert the task's channel + dispatcher's channel_member
-        # immediately so the agent dispatch loop can inject user messages
-        # without waiting for the next backfill cycle.
-        owner_user_id = user_id or "admin"
+        return task_id
+
+    def approve_task(self, task_id: str) -> None:
+        """Sprint 48: transition a proposed task to pending + create its
+        channel + owner channel_member.  Idempotent: returns silently
+        if the task isn't in 'proposed' state.
+        """
+        row = self._conn.execute(
+            "SELECT status, user_id, created_at FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row[0] != "proposed":
+            return
+        _, user_id, _ = row
+        user_id = user_id or "admin"
+        self._conn.execute(
+            "UPDATE tasks SET status='pending', updated_at=? WHERE id=?",
+            (time.time(), task_id),
+        )
         ws_row = self._conn.execute(
-            "SELECT id FROM workspaces WHERE owner_user_id=?", (owner_user_id,)
+            "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
         ).fetchone()
         if ws_row is not None:
             ch_cur = self._conn.execute(
@@ -947,9 +967,8 @@ class Db:
             self._conn.execute(
                 "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
                 "VALUES (?, 'human', ?, ?)",
-                (ch_cur.lastrowid, owner_user_id, time.time()),
+                (ch_cur.lastrowid, user_id, time.time()),
             )
-        return task_id
 
     def get_task(self, task_id: str, *, user_id: str | None = None) -> dict | None:
         """Sprint 32: when user_id is given (non-admin path), the task

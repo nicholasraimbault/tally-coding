@@ -76,24 +76,26 @@ def test_backfill_creates_general_channel(db: Db):
 
 
 def test_backfill_existing_tasks_get_channels(db: Db):
-    """Every existing tasks row gets a channels row of kind='task'."""
-    # Pre-create some tasks (simulating real prod state)
-    db.create_task("test task 1", team_spec=None, user_id="admin")
-    db.create_task("test task 2", team_spec=None, user_id="admin")
+    """Backfill creates channels for approved (pending) tasks that lack them.
+    Sprint 48: proposed/cancelled tasks are skipped by backfill."""
+    # Simulate legacy prod tasks that are already approved (pending status)
+    db.create_task("test task 1", team_spec=None, user_id="admin", status="pending")
+    db.create_task("test task 2", team_spec=None, user_id="admin", status="pending")
     # Re-open Db to trigger backfill on the now-populated tasks table
     db2 = db.__class__(db.path)
 
+    # Only pending tasks should get backfilled channels
+    pending_cnt = db2._conn.execute("SELECT COUNT(*) FROM tasks WHERE status='pending'").fetchone()[0]
     cnt = db2._conn.execute("SELECT COUNT(*) FROM channels WHERE kind='task'").fetchone()[0]
-    tasks_cnt = db2._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    assert cnt == tasks_cnt, f"expected one channel per task; got {cnt} channels for {tasks_cnt} tasks"
+    assert cnt == pending_cnt, f"expected one channel per pending task; got {cnt} channels for {pending_cnt} pending tasks"
 
     member_rows = db2._conn.execute(
         "SELECT cm.user_id FROM channel_members cm "
         "JOIN channels c ON cm.channel_id=c.id "
         "WHERE c.kind='task'"
     ).fetchall()
-    assert len(member_rows) == tasks_cnt, (
-        f"expected one channel_members row per task channel; got {len(member_rows)} for {tasks_cnt} tasks"
+    assert len(member_rows) == pending_cnt, (
+        f"expected one channel_members row per task channel; got {len(member_rows)} for {pending_cnt} tasks"
     )
     assert all(row[0] == "admin" for row in member_rows)
 
@@ -105,10 +107,9 @@ def test_agents_iteration_idx_column(db: Db):
 
 
 def test_new_task_creates_task_channel(db: Db):
-    """When a task is created via Db.create_task, an immediate task channel
-    is inserted (not waiting for next backfill cycle)."""
+    """Sprint 48: task channel is inserted on approve_task, not create_task."""
     task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
-    # Channel should exist immediately
+    db.approve_task(task_id)
     row = db._conn.execute(
         "SELECT id, kind FROM channels WHERE task_id=?", (task_id,)
     ).fetchone()
@@ -117,8 +118,9 @@ def test_new_task_creates_task_channel(db: Db):
 
 
 def test_new_task_creates_task_channel_member(db: Db):
-    """The task owner is auto-joined to the task channel."""
+    """The task owner is auto-joined to the task channel on approve."""
     task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    db.approve_task(task_id)
     row = db._conn.execute(
         "SELECT cm.user_id FROM channel_members cm "
         "JOIN channels c ON cm.channel_id=c.id "
@@ -127,3 +129,41 @@ def test_new_task_creates_task_channel_member(db: Db):
     ).fetchone()
     assert row is not None
     assert row[0] == "admin"
+
+
+def test_create_task_proposed_no_channel(db: Db):
+    """Sprint 48: create_task with status='proposed' (default) creates NO task channel."""
+    task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    row = db._conn.execute(
+        "SELECT id FROM channels WHERE task_id=?", (task_id,)
+    ).fetchone()
+    assert row is None, "task channel should not exist until approve_task"
+
+
+def test_approve_task_creates_channel(db: Db):
+    """Sprint 48: approve_task transitions status + creates the task channel + owner channel_member."""
+    task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    db.approve_task(task_id)
+    status = db._conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    assert status == "pending"
+    row = db._conn.execute(
+        "SELECT id, kind FROM channels WHERE task_id=?", (task_id,)
+    ).fetchone()
+    assert row is not None
+    assert row[1] == "task"
+    mrow = db._conn.execute(
+        "SELECT user_id FROM channel_members cm JOIN channels c ON cm.channel_id=c.id "
+        "WHERE c.task_id=?", (task_id,)
+    ).fetchone()
+    assert mrow is not None
+    assert mrow[0] == "admin"
+
+
+def test_approve_task_idempotent(db: Db):
+    """approve_task on a non-proposed task is a no-op (returns silently)."""
+    task_id = db.create_task("test", team_spec={"agents": [{"role": "Coder"}]}, user_id="admin")
+    db.approve_task(task_id)  # proposed -> pending + creates channel
+    # Calling again on pending status: no-op, no duplicate channel
+    db.approve_task(task_id)
+    cnt = db._conn.execute("SELECT COUNT(*) FROM channels WHERE task_id=?", (task_id,)).fetchone()[0]
+    assert cnt == 1
