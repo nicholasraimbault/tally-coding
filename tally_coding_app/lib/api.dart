@@ -1207,5 +1207,64 @@ class TallyOrchClient {
     if (resp.statusCode != 200) throw Exception('DELETE channel member ${resp.statusCode}: ${resp.body}');
   }
 
+  // ── Sprint 51: audit log + channel archive + workspace lifecycle ─────────
+
+  Future<List<Map<String, dynamic>>> listAuditLog({
+    required int workspaceId,
+    int? beforeId,
+    int limit = 100,
+  }) async {
+    final qs = <String, String>{'limit': '$limit'};
+    if (beforeId != null) qs['before_id'] = '$beforeId';
+    final resp = await _http.get(
+      baseUrl.resolve('/workspaces/$workspaceId/audit-log').replace(queryParameters: qs),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('GET /workspaces/$workspaceId/audit-log ${resp.statusCode}: ${resp.body}');
+    }
+    return List<Map<String, dynamic>>.from(jsonDecode(resp.body)['entries'] as List);
+  }
+
+  Future<void> archiveChannel({required int channelId}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/archive'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /channels/$channelId/archive ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
+  Future<void> unarchiveChannel({required int channelId}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/unarchive'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /channels/$channelId/unarchive ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
+  Future<void> deleteWorkspace({required int id}) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/workspaces/$id'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('DELETE /workspaces/$id ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
+  Future<void> leaveWorkspace({required int id}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/workspaces/$id/leave'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('POST /workspaces/$id/leave ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
   void close() => _http.close();
 }
