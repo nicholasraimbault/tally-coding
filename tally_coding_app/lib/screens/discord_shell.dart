@@ -31,6 +31,7 @@ import 'persistent_agents.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
+import '../widgets/new_dm_modal.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
 /// the architect chat; otherwise it's a task ID.
@@ -281,9 +282,19 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                         ),
                       ),
                     ),
-                    onNewDm: () => ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Direct messages coming in B6')),
-                    ),
+                    onNewDm: () async {
+                      final result = await showDialog<Map<String, dynamic>>(
+                        context: context,
+                        builder: (_) => NewDmModal(
+                          client: widget.client,
+                          workspaceId: 1,
+                        ),
+                      );
+                      if (result != null && mounted) {
+                        // Reload channels so any new DM appears in the rail.
+                        await _fetch();
+                      }
+                    },
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   Expanded(child: _mainPane()),
@@ -356,11 +367,19 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             ),
           );
         },
-        onNewDm: () {
-          Navigator.of(context).pop();
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Direct messages coming in B6')),
+        onNewDm: () async {
+          Navigator.of(context).pop(); // close the drawer first
+          final result = await showDialog<Map<String, dynamic>>(
+            context: context,
+            builder: (_) => NewDmModal(
+              client: widget.client,
+              workspaceId: 1,
+            ),
           );
+          if (result != null && mounted) {
+            // Reload channels so any new DM appears in the rail.
+            await _fetch();
+          }
         },
       ),
       body: SafeArea(
