@@ -33,6 +33,7 @@ import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
 import '../widgets/new_dm_modal.dart';
+import '../widgets/server_rail.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
 /// the architect chat; otherwise it's a task ID or a direct channel id.
@@ -317,6 +318,12 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             Expanded(
               child: Row(
                 children: [
+                  // Sprint 50 B4: workspace-switching rail (far-left column).
+                  ServerRail(
+                    client: widget.client,
+                    activeWorkspaceId: WorkspaceContext.of(context).activeWorkspaceId,
+                    onSelect: WorkspaceContext.of(context).onChange,
+                  ),
                   _ServerRail(
                     onSignOut: () => resetTallyConfig(context),
                     onOpenBilling: () => _openBilling(context),
