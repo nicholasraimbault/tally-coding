@@ -340,6 +340,73 @@ CREATE TABLE IF NOT EXISTS push_devices (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id, enabled);
+
+-- Sprint 47: chat-foundation tables (workspaces, members, channels, messages).
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    plan_slug TEXT NOT NULL DEFAULT 'free',
+    stripe_customer_id TEXT,
+    created_at REAL NOT NULL,
+    settings_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    member_kind TEXT NOT NULL,
+    user_id TEXT,
+    persistent_agent_id INTEGER,
+    role TEXT NOT NULL,
+    joined_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_members ON workspace_members(workspace_id, role);
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id, workspace_id);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    task_id TEXT,
+    persistent_agent_id INTEGER,
+    auto_jump_in_for_tally INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    archived_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_channels_ws ON channels(workspace_id, kind, archived_at);
+CREATE INDEX IF NOT EXISTS idx_channels_task ON channels(task_id) WHERE task_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS channel_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    member_kind TEXT NOT NULL,
+    user_id TEXT,
+    persistent_agent_id INTEGER,
+    task_agent_id INTEGER,
+    role_override TEXT,
+    joined_at REAL NOT NULL,
+    last_read_message_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_channel_members ON channel_members(channel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id, channel_id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    author_kind TEXT NOT NULL,
+    author_user_id TEXT,
+    author_agent_id INTEGER,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    reply_to_id INTEGER,
+    created_at REAL NOT NULL,
+    edited_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_id_desc ON messages(channel_id, id DESC);
 """
 
 # Sprint 46: credit-based plan config.  Replaces Sprint 33's
