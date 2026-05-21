@@ -712,6 +712,26 @@ class WorkspaceMemberRolePatchRequest(BaseModel):
     role: str
 
 
+# Sprint 50: custom channel creation + channel_member CRUD models.
+
+class ChannelMemberSpec(BaseModel):
+    kind: str  # 'human' | 'tally' | 'persistent_agent'
+    id: str | None = None  # user_id or persistent_agent_id; null for tally
+
+
+class CustomChannelCreateRequest(BaseModel):
+    workspace_id: int
+    kind: str  # must be 'custom' in Sprint 50
+    name: str
+    members: list[ChannelMemberSpec]
+
+
+class ChannelMemberAddRequest(BaseModel):
+    member_kind: str
+    user_id: str | None = None
+    persistent_agent_id: int | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -6538,6 +6558,150 @@ async def create_dm_channel(
             kind_b="persistent_agent", id_b=body.target_id,
         )
     return resolve_channel(db, ch_id)
+
+
+@app.post("/channels")
+async def create_custom_channel_route(
+    body: CustomChannelCreateRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: create a custom channel.  Admin+ only.
+
+    Only kind='custom' is accepted; attempting another kind returns 400.
+    Members are inserted atomically in the same transaction.
+
+    Example::
+
+        POST /channels
+        {
+            "workspace_id": 1, "kind": "custom", "name": "code-review",
+            "members": [{"kind": "human", "id": "alice"}, {"kind": "tally"}]
+        }
+    """
+    if body.kind != "custom":
+        raise HTTPException(400, f"Sprint 50 only supports kind='custom'; got {body.kind!r}")
+    db: Db = state["db"]
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (body.workspace_id, user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    now = time.time()
+    cur = db._conn.execute(
+        "INSERT INTO channels (workspace_id, kind, name, created_at) "
+        "VALUES (?, 'custom', ?, ?)",
+        (body.workspace_id, name, now),
+    )
+    ch_id = int(cur.lastrowid or 0)
+    for m in body.members:
+        if m.kind == "human":
+            db._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (ch_id, m.id, now),
+            )
+        elif m.kind == "tally":
+            db._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'tally', NULL, ?)",
+                (ch_id, now),
+            )
+        elif m.kind == "persistent_agent":
+            pa_id = int(m.id) if m.id else None
+            db._conn.execute(
+                "INSERT INTO channel_members "
+                "(channel_id, member_kind, persistent_agent_id, joined_at) "
+                "VALUES (?, 'persistent_agent', ?, ?)",
+                (ch_id, pa_id, now),
+            )
+    from .channels import resolve_channel
+    return resolve_channel(db, ch_id)
+
+
+@app.post("/channels/{channel_id}/members")
+async def add_channel_member_route(
+    channel_id: int,
+    body: ChannelMemberAddRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: add a member to a custom channel.  Admin+ only.
+
+    Returns 400 if the channel is not of kind='custom' (general / task /
+    scheduled_agent channels manage their own membership automatically).
+
+    Example::
+
+        POST /channels/42/members
+        {"member_kind": "human", "user_id": "bob"}
+    """
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind FROM channels WHERE id=? AND archived_at IS NULL",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found")
+    if ch[1] != "custom":
+        raise HTTPException(400, "only custom channels can have members added directly")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    now = time.time()
+    db._conn.execute(
+        "INSERT INTO channel_members "
+        "(channel_id, member_kind, user_id, persistent_agent_id, joined_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (channel_id, body.member_kind, body.user_id, body.persistent_agent_id, now),
+    )
+    return {"ok": True}
+
+
+@app.delete("/channels/{channel_id}/members/{target_user_id}")
+async def remove_channel_member_route(
+    channel_id: int,
+    target_user_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 50: remove a human member from a custom channel.  Admin+ only.
+
+    Returns 400 for non-custom channels, 404 if the member isn't present.
+
+    Example::
+
+        DELETE /channels/42/members/bob
+    """
+    db: Db = state["db"]
+    ch = db._conn.execute(
+        "SELECT workspace_id, kind FROM channels WHERE id=?",
+        (channel_id,),
+    ).fetchone()
+    if ch is None:
+        raise HTTPException(404, "channel not found")
+    if ch[1] != "custom":
+        raise HTTPException(400, "only custom channels support member removal")
+    caller = db._conn.execute(
+        "SELECT role FROM workspace_members "
+        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+        (ch[0], user.id),
+    ).fetchone()
+    if caller is None or caller[0] not in ("owner", "admin"):
+        raise HTTPException(403, "admin+ only")
+    cur = db._conn.execute(
+        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?",
+        (channel_id, target_user_id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "member not in channel")
+    return {"ok": True}
 
 
 @app.post("/channels/{channel_id}/members/{target_user_id}/role_override")
