@@ -4068,6 +4068,50 @@ class Orchestrator:
                 pass
         return task_id
 
+    async def _persistent_agents_tick(self) -> None:
+        """Sprint 49: one iteration of the persistent-agents cron poll.
+        Factored out so tests can call a single tick without the loop."""
+        now = time.time()
+        rows = self.db._conn.execute(
+            "SELECT id, cron_schedule FROM persistent_agents "
+            "WHERE enabled=1 AND deleted_at IS NULL "
+            "AND cron_schedule IS NOT NULL "
+            "AND next_scheduled_run_at IS NOT NULL "
+            "AND next_scheduled_run_at <= ?",
+            (now,),
+        ).fetchall()
+        from croniter import croniter
+        for agent_id, cron in rows:
+            try:
+                await self._fire_persistent_agent(agent_id, trigger="cron")
+            except Exception as exc:
+                logger.exception("persistent agent %s fire failed: %s", agent_id, exc)
+            try:
+                next_fire = float(croniter(cron, now).get_next(float))
+            except Exception as exc:
+                logger.error(
+                    "invalid cron %r for agent %s: %s; disabling", cron, agent_id, exc
+                )
+                self.db._conn.execute(
+                    "UPDATE persistent_agents SET enabled=0 WHERE id=?",
+                    (agent_id,),
+                )
+                continue
+            self.db._conn.execute(
+                "UPDATE persistent_agents SET last_run_at=?, next_scheduled_run_at=? WHERE id=?",
+                (now, next_fire, agent_id),
+            )
+
+    async def _persistent_agents_loop(self) -> None:
+        """Sprint 49: cron poller for persistent agents.  Runs every 30s
+        until self._stopping is True."""
+        while not self._stopping:
+            try:
+                await self._persistent_agents_tick()
+            except Exception as exc:
+                logger.exception("persistent_agents_loop iteration failed: %s", exc)
+            await asyncio.sleep(30)
+
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
 
@@ -4552,10 +4596,15 @@ async def lifespan(app: FastAPI):
     )
     backup_task = asyncio.create_task(run_nightly_backup())  # Sprint 24.5
     state["backup_task"] = backup_task
+    # Sprint 49: cron poller fires due persistent agents every 30s.
+    orchestrator._stopping = False
+    state["persistent_agents_task"] = asyncio.create_task(
+        orchestrator._persistent_agents_loop()
+    )
     state["pool_bootstrap_task"] = asyncio.create_task(_bootstrap_pool_in_background())
     logger.info(
-        "HTTP up; sweeper + nightly backup started; pool bootstrap kicked off "
-        "in background (target=%d)",
+        "HTTP up; sweeper + nightly backup + persistent-agents cron started; "
+        "pool bootstrap kicked off in background (target=%d)",
         target_pool_size,
     )
     try:
@@ -4566,7 +4615,8 @@ async def lifespan(app: FastAPI):
         # Sprint 35: processor_task only exists after pool bootstrap; the
         # bootstrap task itself might still be in flight if shutdown
         # arrives during a redeploy window.  Cancel whatever's set.
-        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task"):
+        orchestrator._stopping = True
+        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task", "persistent_agents_task"):
             t = state.get(key)
             if t is None:
                 continue
