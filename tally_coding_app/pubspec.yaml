@@ -39,6 +39,7 @@ dependencies:
   unifiedpush: ^5.0.0
   flutter_local_notifications: ^17.2.0
   vyuh_node_flow: ^0.27.3
+  flutter_mobx: ^2.3.0
 
 dev_dependencies:
   flutter_test:

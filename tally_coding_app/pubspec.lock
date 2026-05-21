@@ -284,7 +284,7 @@ packages:
     source: sdk
     version: "0.0.0"
   flutter_mobx:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: flutter_mobx
       sha256: ba5e93467866a2991259dc51cffd41ef45f695c667c2b8e7b087bf24118b50fe
