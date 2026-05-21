@@ -34,12 +34,17 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
   bool _loadingMembers = true;
   bool _savingBranding = false;
 
+  // Sprint 51 B5 — archived channels
+  List<Map<String, dynamic>> _archivedChannels = [];
+  bool _loadingArchived = true;
+
   @override
   void initState() {
     super.initState();
     _nameCtrl = TextEditingController(text: widget.workspaceName);
     _iconUrlCtrl = TextEditingController();
     _loadMembers();
+    _loadArchivedChannels(); // Sprint 51
   }
 
   @override
@@ -149,6 +154,43 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
   }
 
   // === Danger zone ===
+
+  // === Archived channels ===
+
+  Future<void> _loadArchivedChannels() async {
+    try {
+      final channels = await widget.client.listChannels(
+        workspaceId: widget.workspaceId, includeArchived: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _archivedChannels = channels
+          .where((c) => c['archived_at'] != null && c['kind'] == 'custom')
+          .toList();
+        _loadingArchived = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loadingArchived = false);
+    }
+  }
+
+  Future<void> _onUnarchive(Map<String, dynamic> ch) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.client.unarchiveChannel(channelId: ch['id'] as int);
+      await _loadArchivedChannels();
+      messenger.showSnackBar(SnackBar(content: Text('Unarchived "${ch['name']}"')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Unarchive failed: $e')));
+    }
+  }
+
+  String _formatArchivedTime(num? ts) {
+    if (ts == null) return '?';
+    final dt = DateTime.fromMillisecondsSinceEpoch((ts * 1000).round());
+    return '${dt.year}-${dt.month.toString().padLeft(2, "0")}-${dt.day.toString().padLeft(2, "0")}';
+  }
 
   Future<void> _onLeave() async {
     final messenger = ScaffoldMessenger.of(context);
@@ -264,6 +306,27 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
                 ),
               )),
             ),
+
+          const Divider(height: 32),
+
+          // === Archived channels ===
+          const Text('Archived channels', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          if (_loadingArchived)
+            const Center(child: CircularProgressIndicator())
+          else if (_archivedChannels.isEmpty)
+            const Text('No archived channels.', style: TextStyle(color: Color(0xFF949BA4), fontSize: 12))
+          else
+            ..._archivedChannels.map((c) => ListTile(
+                  leading: const Icon(Icons.archive, color: Color(0xFF949BA4)),
+                  title: Text(c['name'] as String? ?? '?'),
+                  subtitle: Text('archived ${_formatArchivedTime(c['archived_at'] as num?)}',
+                      style: const TextStyle(fontSize: 11, color: Color(0xFF949BA4))),
+                  trailing: TextButton(
+                    onPressed: () => _onUnarchive(c),
+                    child: const Text('Unarchive'),
+                  ),
+                )),
 
           const Divider(height: 32),
 

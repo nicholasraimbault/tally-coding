@@ -57,4 +57,29 @@ void main() {
     expect(find.text('Leave workspace'), findsOneWidget);
     expect(find.text('Delete workspace'), findsNothing);
   });
+
+  testWidgets('renders Archived channels section with archived channels', (tester) async {
+    final mock = MockClient((req) async {
+      if (req.url.path == '/workspaces/1/members') {
+        return http.Response('{"members":[]}', 200, headers: {'content-type':'application/json'});
+      }
+      if (req.url.path == '/channels') {
+        return http.Response(
+          '{"channels":[{"id":7,"workspace_id":1,"kind":"custom","name":"old-ops","archived_at":1700000000.0}]}',
+          200, headers: {'content-type':'application/json'},
+        );
+      }
+      return http.Response('{}', 200, headers: {'content-type':'application/json'});
+    });
+    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+      client: TallyOrchClient(baseUrl: Uri.parse('http://t'), provider: () async => 't', client: mock),
+      workspaceId: 1,
+      workspaceName: 'x',
+      callerRole: 'owner',
+    )));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Archived channels'), findsAtLeastNWidgets(1));
+    expect(find.textContaining('old-ops'), findsOneWidget);
+    expect(find.text('Unarchive'), findsOneWidget);
+  });
 }
