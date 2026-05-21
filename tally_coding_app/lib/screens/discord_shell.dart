@@ -32,8 +32,10 @@ import 'persistent_agents.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
+import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
 import '../widgets/server_rail.dart';
+import 'workspace_settings.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
 /// the architect chat; otherwise it's a task ID or a direct channel id.
@@ -95,6 +97,8 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   // Sprint 49 B7: DM and scheduled_agent channels loaded from the API.
   List<Map<String, dynamic>> _dmChannels = const [];
   List<Map<String, dynamic>> _scheduledChannels = const [];
+  // Sprint 50 B7: custom channels loaded from the API.
+  List<Map<String, dynamic>> _customChannels = const [];
 
   @override
   void initState() {
@@ -194,9 +198,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       final scheduled = channels
           .where((c) => c['kind'] == 'scheduled_agent')
           .toList();
+      final custom = channels.where((c) => c['kind'] == 'custom').toList();
       setState(() {
         _dmChannels = dms;
         _scheduledChannels = scheduled;
+        _customChannels = custom;
       });
       await _loadEscalationStatus(scheduled);
     } catch (e) {
@@ -342,6 +348,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     onRetry: _fetch,
                     dmChannels: _dmChannels,
                     scheduledChannels: _scheduledChannels,
+                    customChannels: _customChannels,
                     onNewScheduled: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => PersistentAgentsScreen(
@@ -363,6 +370,35 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                         await _fetch();
                         await _fetchDirectChannels();
                       }
+                    },
+                    // Sprint 50 B7: open NewChannelModal; refresh rail on success.
+                    onNewChannel: () async {
+                      final newCh = await showDialog<Map<String, dynamic>>(
+                        context: context,
+                        builder: (_) => NewChannelModal(
+                          client: widget.client,
+                          workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
+                        ),
+                      );
+                      if (newCh != null && mounted) {
+                        await _fetchDirectChannels();
+                      }
+                    },
+                    // Sprint 50 B7: open WorkspaceSettingsScreen from gear icon.
+                    onOpenSettings: () async {
+                      final wsId = WorkspaceContext.of(context).activeWorkspaceId;
+                      final nav = Navigator.of(context);
+                      final myWs = await widget.client.listMyWorkspaces();
+                      final mine = myWs.where((w) => w['id'] == wsId).cast<Map<String, dynamic>?>().firstOrNull ?? const {};
+                      if (mine.isEmpty || !mounted) return;
+                      nav.push(MaterialPageRoute(
+                        builder: (_) => WorkspaceSettingsScreen(
+                          client: widget.client,
+                          workspaceId: wsId,
+                          workspaceName: mine['name'] as String? ?? '?',
+                          callerRole: mine['role'] as String? ?? 'member',
+                        ),
+                      ));
                     },
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
@@ -406,6 +442,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         error: _error,
         dmChannels: _dmChannels,
         scheduledChannels: _scheduledChannels,
+        customChannels: _customChannels,
         onSelect: (sel) {
           setState(() => _selected = sel);
           Navigator.of(context).pop();
@@ -453,6 +490,37 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             await _fetch();
             await _fetchDirectChannels();
           }
+        },
+        // Sprint 50 B7: open NewChannelModal from narrow drawer.
+        onNewChannel: () async {
+          Navigator.of(context).pop();
+          final newCh = await showDialog<Map<String, dynamic>>(
+            context: context,
+            builder: (_) => NewChannelModal(
+              client: widget.client,
+              workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
+            ),
+          );
+          if (newCh != null && mounted) {
+            await _fetchDirectChannels();
+          }
+        },
+        // Sprint 50 B7: open WorkspaceSettingsScreen from narrow drawer gear.
+        onOpenSettings: () async {
+          final wsId = WorkspaceContext.of(context).activeWorkspaceId;
+          final nav = Navigator.of(context);
+          nav.pop();
+          final myWs = await widget.client.listMyWorkspaces();
+          final mine = myWs.where((w) => w['id'] == wsId).cast<Map<String, dynamic>?>().firstOrNull ?? const {};
+          if (mine.isEmpty || !mounted) return;
+          nav.push(MaterialPageRoute(
+            builder: (_) => WorkspaceSettingsScreen(
+              client: widget.client,
+              workspaceId: wsId,
+              workspaceName: mine['name'] as String? ?? '?',
+              callerRole: mine['role'] as String? ?? 'member',
+            ),
+          ));
         },
       ),
       body: SafeArea(
@@ -719,9 +787,14 @@ class _ChannelList extends StatelessWidget {
   final VoidCallback onRetry;
   final VoidCallback onNewScheduled;
   final VoidCallback onNewDm;
+  /// Sprint 50 B7: custom channels + new-channel CTA + settings gear.
+  final VoidCallback onNewChannel;
+  final VoidCallback onOpenSettings;
   /// Sprint 49 B7: DM and scheduled_agent channels from the API.
   final List<Map<String, dynamic>> dmChannels;
   final List<Map<String, dynamic>> scheduledChannels;
+  // Sprint 50 B7: custom channels from the API.
+  final List<Map<String, dynamic>> customChannels;
   /// Sprint 31: when null the list fills its parent (drawer mode);
   /// when set it pins to that width (desktop left rail = 240).
   final double? width;
@@ -734,8 +807,11 @@ class _ChannelList extends StatelessWidget {
     required this.onRetry,
     required this.onNewScheduled,
     required this.onNewDm,
+    required this.onNewChannel,
+    required this.onOpenSettings,
     this.dmChannels = const [],
     this.scheduledChannels = const [],
+    this.customChannels = const [],
     this.width = 240,
   });
 
@@ -748,7 +824,7 @@ class _ChannelList extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 16, 4, 8),
             child: Row(
               children: [
                 Text(
@@ -765,6 +841,15 @@ class _ChannelList extends StatelessWidget {
                     height: 14,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
+                // Sprint 50 B7: gear icon → WorkspaceSettingsScreen.
+                IconButton(
+                  icon: const Icon(Icons.settings, size: 18,
+                      color: Color(0xFF8E9297)),
+                  tooltip: 'Workspace settings',
+                  onPressed: onOpenSettings,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                ),
               ],
             ),
           ),
@@ -785,6 +870,11 @@ class _ChannelList extends StatelessWidget {
           selected: selected is GeneralSelected,
           onTap: () => onSelect(const GeneralSelected()),
         ),
+        // Sprint 50 B7: CHANNELS category — kind='custom' channels.
+        const SizedBox(height: 12),
+        _categoryHeader(context, 'CHANNELS'),
+        ..._directChannelItems(context, customChannels),
+        _NewTile(label: '+ New channel', onTap: onNewChannel),
         const SizedBox(height: 12),
         _categoryHeader(context, 'TASKS'),
         ..._taskItems(context),
@@ -1261,9 +1351,14 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onSignOut;
   final VoidCallback onNewScheduled;
   final VoidCallback onNewDm;
+  // Sprint 50 B7: new channel + settings.
+  final VoidCallback onNewChannel;
+  final VoidCallback onOpenSettings;
   /// Sprint 49 B7: DM and scheduled_agent channels from the API.
   final List<Map<String, dynamic>> dmChannels;
   final List<Map<String, dynamic>> scheduledChannels;
+  // Sprint 50 B7: custom channels from the API.
+  final List<Map<String, dynamic>> customChannels;
   const _NarrowDrawer({
     required this.tasks,
     required this.selected,
@@ -1278,8 +1373,11 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onSignOut,
     required this.onNewScheduled,
     required this.onNewDm,
+    required this.onNewChannel,
+    required this.onOpenSettings,
     this.dmChannels = const [],
     this.scheduledChannels = const [],
+    this.customChannels = const [],
   });
 
   @override
@@ -1299,8 +1397,11 @@ class _NarrowDrawer extends StatelessWidget {
                 onRetry: onRetry,
                 onNewScheduled: onNewScheduled,
                 onNewDm: onNewDm,
+                onNewChannel: onNewChannel,
+                onOpenSettings: onOpenSettings,
                 dmChannels: dmChannels,
                 scheduledChannels: scheduledChannels,
+                customChannels: customChannels,
                 width: null,
               ),
             ),
@@ -1332,6 +1433,12 @@ class _NarrowDrawer extends StatelessWidget {
                     icon: const Icon(Icons.notifications_outlined, size: 18,
                         color: Color(0xFF99AAB5)),
                     onPressed: onOpenNotifications,
+                  ),
+                  IconButton(
+                    tooltip: 'Workspace settings',
+                    icon: const Icon(Icons.settings, size: 18,
+                        color: Color(0xFF99AAB5)),
+                    onPressed: onOpenSettings,
                   ),
                   IconButton(
                     tooltip: 'Sign out / reconnect',
