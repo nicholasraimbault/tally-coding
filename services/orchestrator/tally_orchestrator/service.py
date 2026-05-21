@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -7077,6 +7078,43 @@ async def stripe_webhook(request: Request) -> dict:
     # Stripe from retrying the delivery indefinitely.
     logger.debug("stripe webhook: unhandled event type %s", evt_type)
     return {"ok": True}
+
+
+# ── Sprint 49 A10: persistent-agent HTTP event triggers ───────────────────────
+
+
+@app.post("/webhooks/agents/{trigger_id}")
+async def fire_event_trigger(trigger_id: str, request: Request) -> dict:
+    """Sprint 49 A10: fire a persistent agent via its HTTP event trigger.
+
+    Auth: HMAC-SHA256 over raw request body using the trigger's secret,
+    passed in ``X-Tally-Signature: sha256=<hex>``.  No user session
+    required — callers are external systems (GitHub, Slack, etc.)."""
+    raw_body = await request.body()
+    sig = request.headers.get("X-Tally-Signature", "")
+    db: Db = state["db"]
+    rows = db._conn.execute(
+        "SELECT id, event_triggers_json FROM persistent_agents "
+        "WHERE deleted_at IS NULL AND enabled=1"
+    ).fetchall()
+    for agent_id, triggers_json in rows:
+        triggers = json.loads(triggers_json or "[]")
+        for trig in triggers:
+            if trig.get("id") == trigger_id and trig.get("kind") == "http":
+                expected = "sha256=" + hmac.new(
+                    trig["secret"].encode(),
+                    raw_body,
+                    hashlib.sha256,
+                ).hexdigest()
+                if hmac.compare_digest(sig, expected):
+                    orch: "Orchestrator" = state.get("orchestrator")
+                    if orch is None:
+                        raise HTTPException(503, "orchestrator not ready")
+                    task_id = await orch._fire_persistent_agent(agent_id, trigger="webhook")
+                    return {"ok": True, "agent_id": agent_id, "task_id": task_id}
+                else:
+                    raise HTTPException(401, "invalid signature")
+    raise HTTPException(404, "trigger not found")
 
 
 @app.get("/admin/agent_roles")
