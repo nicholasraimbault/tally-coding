@@ -1,6 +1,6 @@
 services:
   orchestrator:
-    image: ghcr.io/nicholasraimbault/tally-orch:v33
+    image: ghcr.io/nicholasraimbault/tally-orch:v34
     restart: unless-stopped
     # Sprint 24: hosted orchestrator in a Phala CVM. The persistent volume
     # at /data holds the SQLite DB + MLS state + Ed25519 identity — must
