@@ -149,7 +149,6 @@ def test_patch_non_member_returns_403(client):
 # ── Sprint 49 A7: run_now + delete ────────────────────────────────────────────
 
 
-@pytest.mark.skip(reason="A8: needs Orchestrator._fire_persistent_agent")
 def test_run_now_creates_task_with_persistent_agent_id(client):
     import tally_orchestrator.service as svc
     r = client.post("/persistent_agents", json={

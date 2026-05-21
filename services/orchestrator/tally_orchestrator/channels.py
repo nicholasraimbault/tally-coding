@@ -160,6 +160,23 @@ def get_task_channel_id(db: "Db", task_id: str) -> int | None:
     return int(row[0]) if row else None
 
 
+def resolve_task_channel_id(db: "Db", task_id: str) -> int | None:
+    """Sprint 49: prefer the persistent_agent's scheduled_agent channel
+    if the task was fired by a persistent agent; else fall back to the
+    Sprint 47 per-task channel."""
+    row = db._conn.execute(
+        "SELECT persistent_agent_id FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row and row[0]:
+        ch = db._conn.execute(
+            "SELECT id FROM channels WHERE persistent_agent_id=? AND kind='scheduled_agent'",
+            (row[0],),
+        ).fetchone()
+        if ch:
+            return int(ch[0])
+    return get_task_channel_id(db, task_id)
+
+
 def insert_team_proposal_message(
     db: "Db",
     *,

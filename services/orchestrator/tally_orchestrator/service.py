@@ -3124,9 +3124,9 @@ class Orchestrator:
                 # since the last agent step; prepend to this agent's spec so the
                 # LLM sees them as teammate input.  Persists the new
                 # last_user_msg_ts so subsequent steps don't re-include them.
-                from .channels import get_task_channel_id, fetch_user_messages_since
+                from .channels import resolve_task_channel_id, fetch_user_messages_since
                 agent_spec_text = agent["spec"] or ""
-                ch_id = get_task_channel_id(self.db, task["id"])
+                ch_id = resolve_task_channel_id(self.db, task["id"])
                 if ch_id is not None:
                     since_ts = float(agent.get("last_user_msg_ts") or 0)
                     user_msgs = fetch_user_messages_since(
@@ -4027,6 +4027,46 @@ class Orchestrator:
         task = self.pollers.pop(team_id, None)
         if task is not None:
             task.cancel()
+
+    async def _fire_persistent_agent(self, pid: int, *, trigger: str) -> str | None:
+        """Sprint 49: create a tasks row + dispatch.  Returns task_id or
+        None if the agent is disabled / deleted / missing.  trigger is
+        one of 'cron', 'webhook', 'manual'."""
+        agent = self.db.get_persistent_agent(pid)
+        if agent is None or agent.get("deleted_at") or not agent.get("enabled"):
+            return None
+        task_id = uuid.uuid4().hex
+        now = time.time()
+        # Get the workspace owner as the task's user_id
+        owner_row = self.db._conn.execute(
+            "SELECT owner_user_id FROM workspaces WHERE id=?", (agent["workspace_id"],)
+        ).fetchone()
+        owner = owner_row[0] if owner_row else "admin"
+        self.db._conn.execute(
+            "INSERT INTO tasks (id, description, team_spec, status, "
+            "persistent_agent_id, user_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (
+                task_id,
+                f"[persistent: {agent['name']}] {trigger} fire",
+                json.dumps(agent["team_spec"]),
+                pid,
+                owner,
+                now,
+                now,
+            ),
+        )
+        logger.info(
+            "persistent agent %s (%s) fired via %s -> task %s",
+            pid, agent["name"], trigger, task_id[:8],
+        )
+        # Worker poller picks up status='pending' on its next tick.  Kick if available.
+        if hasattr(self, "_kick_poller"):
+            try:
+                asyncio.create_task(self._kick_poller())
+            except Exception:
+                pass
+        return task_id
 
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
