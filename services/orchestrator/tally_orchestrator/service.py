@@ -5283,7 +5283,7 @@ async def admin_alerts() -> dict:
     return {"alerts": alerts, "count": len(alerts)}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health() -> dict:
     """Sprint 35: surface pool readiness alongside basic liveness so
     operators + the Flutter shell can render a "workers warming up"
