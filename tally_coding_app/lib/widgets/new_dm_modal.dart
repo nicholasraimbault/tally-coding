@@ -1,8 +1,8 @@
 // tally_coding_app/lib/widgets/new_dm_modal.dart
 //
-// Sprint 49 B6: "+ New DM" modal.  Three tabs:
-//   - People   (Sprint 50 will list real workspace humans from
-//               GET /workspaces/{id}/members; Sprint 49 shows admin only)
+// Sprint 49 B6 / Sprint 50 B9: "+ New DM" modal.  Three tabs:
+//   - People   (real workspace humans from listWorkspaceMembers filtered to
+//               member_kind='human')
 //   - Tally    (single entry — the workspace assistant)
 //   - Agents   (persistent agents from listPersistentAgents)
 //
@@ -29,12 +29,15 @@ class _NewDmModalState extends State<NewDmModal>
   late TabController _tabs;
   List<Map<String, dynamic>> _agents = [];
   bool _loadingAgents = true;
+  List<Map<String, dynamic>> _humans = [];
+  bool _loadingHumans = true;
 
   @override
   void initState() {
     super.initState();
     _tabs = TabController(length: 3, vsync: this);
     _loadAgents();
+    _loadHumans();
   }
 
   @override
@@ -55,6 +58,21 @@ class _NewDmModalState extends State<NewDmModal>
     } catch (_) {
       if (!mounted) return;
       setState(() => _loadingAgents = false);
+    }
+  }
+
+  Future<void> _loadHumans() async {
+    try {
+      final members = await widget.client
+          .listWorkspaceMembers(workspaceId: widget.workspaceId);
+      if (!mounted) return;
+      setState(() {
+        _humans = members.where((m) => m['member_kind'] == 'human').toList();
+        _loadingHumans = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loadingHumans = false);
     }
   }
 
@@ -79,22 +97,37 @@ class _NewDmModalState extends State<NewDmModal>
   // ---------------------------------------------------------------------------
 
   Widget _peopleTab() {
-    // TODO(Sprint 50): replace with real workspace members from
-    //   GET /workspaces/{id}/members
-    // Production today has only one human ("admin"), so we hardcode it here
-    // rather than add a round-trip for an endpoint that doesn't exist yet.
-    return ListView(
-      children: [
-        ListTile(
-          leading: const CircleAvatar(
-            backgroundColor: Color(0xFF5865F2),
-            child: Text('A', style: TextStyle(color: Colors.white)),
+    if (_loadingHumans) return const Center(child: CircularProgressIndicator());
+    if (_humans.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            'No other people in this workspace yet.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Color(0xFF949BA4)),
           ),
-          title: const Text('admin'),
-          subtitle: const Text('workspace owner'),
-          onTap: () => _open('human', 'admin'),
         ),
-      ],
+      );
+    }
+    return ListView.builder(
+      itemCount: _humans.length,
+      itemBuilder: (_, i) {
+        final m = _humans[i];
+        final uid = m['user_id'] as String? ?? '?';
+        return ListTile(
+          leading: CircleAvatar(
+            backgroundColor: const Color(0xFF5865F2),
+            child: Text(
+              uid.isNotEmpty ? uid[0].toUpperCase() : '?',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+          title: Text(uid),
+          subtitle: Text(m['role'] as String? ?? ''),
+          onTap: () => _open('human', uid),
+        );
+      },
     );
   }
 
