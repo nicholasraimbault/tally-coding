@@ -439,9 +439,14 @@ def _verify_stripe_signature(payload: bytes, sig_header: str) -> dict:
         raise HTTPException(503, "STRIPE_WEBHOOK_SECRET not configured")
     try:
         import stripe
-        return stripe.Webhook.construct_event(payload, sig_header, secret)
+        event = stripe.Webhook.construct_event(payload, sig_header, secret)
     except Exception as exc:
         raise HTTPException(400, f"invalid stripe signature: {exc}")
+    # Sprint 46.5: stripe-python 15.x returns a `StripeObject` whose
+    # custom `__getattr__` shadows the `.get()` dict method.  `to_dict()`
+    # recursively converts the whole tree to plain nested dicts so the
+    # rest of the handler can use familiar `.get(key, default)` access.
+    return event.to_dict()
 
 
 class TaskSubmit(BaseModel):
