@@ -125,3 +125,91 @@ def test_post_channel_read_non_member_returns_403(client):
     )
     r = client.post(f"/channels/{ch_id}/read", json={"last_read_message_id": 1})
     assert r.status_code == 403
+
+
+def test_post_role_override_admin_can_set(client):
+    import tally_orchestrator.service as svc
+    db = svc.state["db"]
+    ch_id = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchone()[0]
+    # Insert another channel member to override
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+        "VALUES (?, 'human', 'guest', 0)",
+        (ch_id,),
+    )
+    # Caller (admin) sets guest's role_override
+    r = client.post(
+        f"/channels/{ch_id}/members/guest/role_override",
+        json={"role_override": "read_only"},
+    )
+    assert r.status_code == 200
+    row = db._conn.execute(
+        "SELECT role_override FROM channel_members WHERE channel_id=? AND user_id='guest'",
+        (ch_id,),
+    ).fetchone()
+    assert row[0] == "read_only"
+
+
+def test_post_role_override_member_returns_403(client):
+    import tally_orchestrator.service as svc
+    from tally_orchestrator.clerk_auth import User as ClerkUser
+    db = svc.state["db"]
+    ch_id = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchone()[0]
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+        "VALUES (?, 'human', 'guest', 0)",
+        (ch_id,),
+    )
+    # Switch caller to a 'member' (not admin)
+    ws_id = db._conn.execute(
+        "SELECT id FROM workspaces WHERE owner_user_id='admin'"
+    ).fetchone()[0]
+    db._conn.execute(
+        "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+        "VALUES (?, 'human', 'plain', 'member', 0)",
+        (ws_id,),
+    )
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+        "VALUES (?, 'human', 'plain', 0)",
+        (ch_id,),
+    )
+    svc.app.dependency_overrides[svc.require_user] = lambda: ClerkUser(
+        id="plain", source="clerk", plan="free", email="p@x.com",
+    )
+    r = client.post(
+        f"/channels/{ch_id}/members/guest/role_override",
+        json={"role_override": "read_only"},
+    )
+    assert r.status_code == 403
+
+
+def test_post_role_override_clear(client):
+    """Setting role_override=null clears the override."""
+    import tally_orchestrator.service as svc
+    db = svc.state["db"]
+    ch_id = db._conn.execute(
+        "SELECT c.id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchone()[0]
+    db._conn.execute(
+        "INSERT INTO channel_members (channel_id, member_kind, user_id, role_override, joined_at) "
+        "VALUES (?, 'human', 'guest', 'read_only', 0)",
+        (ch_id,),
+    )
+    r = client.post(
+        f"/channels/{ch_id}/members/guest/role_override",
+        json={"role_override": None},
+    )
+    assert r.status_code == 200
+    row = db._conn.execute(
+        "SELECT role_override FROM channel_members WHERE channel_id=? AND user_id='guest'",
+        (ch_id,),
+    ).fetchone()
+    assert row[0] is None

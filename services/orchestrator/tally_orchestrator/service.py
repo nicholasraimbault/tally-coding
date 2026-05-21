@@ -5274,6 +5274,36 @@ async def list_workspace_channels(
     }
 
 
+@app.post("/channels/{channel_id}/members/{target_user_id}/role_override")
+async def post_channel_role_override(
+    channel_id: int,
+    target_user_id: str,
+    body: ChannelMemberRoleOverrideRequest,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: set a per-channel role override for `target_user_id`.
+
+    Permission: caller must be workspace Admin or Owner (per
+    `can_manage_members`).  Valid override values: channel_admin,
+    read_only.  Pass null to clear.
+    """
+    db: Db = state["db"]
+    from .channels import resolve_effective_role, can_manage_members
+    caller_role = resolve_effective_role(db, channel_id=channel_id, user_id=user.id)
+    if not can_manage_members(caller_role):
+        raise HTTPException(403, "only Owner/Admin can set role overrides")
+    if body.role_override is not None and body.role_override not in ("channel_admin", "read_only"):
+        raise HTTPException(400, "role_override must be 'channel_admin', 'read_only', or null")
+    cur = db._conn.execute(
+        "UPDATE channel_members SET role_override=? "
+        "WHERE channel_id=? AND user_id=?",
+        (body.role_override, channel_id, target_user_id),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(404, f"{target_user_id} is not a member of channel {channel_id}")
+    return {"ok": True}
+
+
 @app.post("/channels/{channel_id}/read")
 async def post_channel_read(
     channel_id: int,
