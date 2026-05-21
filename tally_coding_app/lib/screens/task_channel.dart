@@ -24,14 +24,23 @@ import 'workflow_editor.dart';
 
 class TaskChannelScreen extends StatefulWidget {
   final TallyOrchClient client;
-  final String taskId;
   final NotificationsWsClient wsClient;
+  /// Sprint 47: task-context path — resolves channel via listChannels(task_id).
+  final String? taskId;
+  /// Sprint 49 B7: direct channel path — bypasses task resolution.
+  /// Used for kind='dm' and kind='scheduled_agent' channels.
+  final int? directChannelId;
+  /// Sprint 49 B7: display title for non-task channels (DMs, scheduled agents).
+  final String? channelTitle;
   const TaskChannelScreen({
     super.key,
     required this.client,
-    required this.taskId,
     required this.wsClient,
-  });
+    this.taskId,
+    this.directChannelId,
+    this.channelTitle,
+  }) : assert(taskId != null || directChannelId != null,
+            'Either taskId or directChannelId must be provided');
 
   @override
   State<TaskChannelScreen> createState() => _TaskChannelScreenState();
@@ -56,9 +65,13 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   @override
   void initState() {
     super.initState();
-    _fetchInitial();
-    _connectStream();
-    _fetchCaps();
+    // Sprint 49 B7: for direct-channel mode (DM / scheduled_agent) skip the
+    // task-fetch, SSE stream, and cap lookup — none make sense without a taskId.
+    if (widget.taskId != null) {
+      _fetchInitial();
+      _connectStream();
+      _fetchCaps();
+    }
     _resolveChannelAndLoad();
   }
 
@@ -81,8 +94,10 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   }
 
   Future<void> _fetchInitial() async {
+    final tid = widget.taskId;
+    if (tid == null) return;
     try {
-      final t = await widget.client.getTask(widget.taskId);
+      final t = await widget.client.getTask(tid);
       if (!mounted) return;
       setState(() => _task = t);
       if (t.isTerminal && _files == null && !_filesLoading) _fetchFiles();
@@ -93,10 +108,11 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   }
 
   Future<void> _fetchFiles() async {
-    if (_filesLoading) return;
+    final tid = widget.taskId;
+    if (tid == null || _filesLoading) return;
     setState(() => _filesLoading = true);
     try {
-      final entries = await widget.client.listFiles(widget.taskId);
+      final entries = await widget.client.listFiles(tid);
       if (!mounted) return;
       setState(() {
         _files = entries;
@@ -115,9 +131,12 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   // Sprint 47 B7: The SSE stream is kept ONLY to drive status_change events
   // (cost ticker chip, cap-abort dialog, task status header). The per-event
   // agent-timeline rendering has been replaced by MessageFeed + WS.
+  // Sprint 49 B7: only called when widget.taskId is set.
   void _connectStream() {
+    final tid = widget.taskId;
+    if (tid == null) return;
     _framesSub?.cancel();
-    _framesSub = widget.client.streamFrames(widget.taskId, sinceSeq: -1).listen(
+    _framesSub = widget.client.streamFrames(tid, sinceSeq: -1).listen(
       (frame) {
         if (!mounted) return;
         setState(() {
@@ -186,6 +205,14 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
 
   Future<void> _resolveChannelAndLoad() async {
     try {
+      // Sprint 49 B7: direct-channel path — no task lookup needed.
+      if (widget.directChannelId != null) {
+        _channelId = widget.directChannelId;
+        await _loadMessages();
+        _subscribeToWs();
+        return;
+      }
+      // Sprint 47: task-channel path — resolve channel from task_id.
       final channels = await widget.client.listChannels(workspaceId: 1);
       final mine = channels.firstWhere(
         (c) => c['task_id'] == widget.taskId,
@@ -247,7 +274,9 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
           constraints: const BoxConstraints(maxWidth: 800, maxHeight: 600),
           child: _FileViewerDialog(
             client: widget.client,
-            taskId: widget.taskId,
+            // _openFileViewer is only reachable in task-context mode,
+            // so widget.taskId is guaranteed non-null here.
+            taskId: widget.taskId!,
             path: path,
           ),
         ),
@@ -258,20 +287,38 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
   @override
   Widget build(BuildContext context) {
     final t = _task;
+    // Sprint 49 B7: direct-channel mode (DM / scheduled_agent) — no task
+    // context, so skip the task header widgets and go straight to the feed.
+    if (widget.directChannelId != null) {
+      return Container(
+        color: const Color(0xFF313338),
+        child: Column(
+          children: [
+            ChannelHeader(
+              glyph: '#',
+              name: widget.channelTitle ?? 'channel',
+              description: '',
+            ),
+            Expanded(child: _directBody()),
+          ],
+        ),
+      );
+    }
+    final tid = widget.taskId!;
     return Container(
       color: const Color(0xFF313338),
       child: Column(
         children: [
           ChannelHeader(
             glyph: '#',
-            name: t?.id.substring(0, 8) ?? widget.taskId.substring(0, 8),
+            name: t?.id.substring(0, 8) ?? tid.substring(0, 8),
             description: t?.description ?? 'Loading…',
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 TaskCostTicker(
                   client: widget.client,
-                  taskId: widget.taskId,
+                  taskId: tid,
                   perTaskCapCredits: _perTaskCap,
                   taskStatus: t?.status ?? 'pending',
                 ),
@@ -291,8 +338,48 @@ class _TaskChannelScreenState extends State<TaskChannelScreen> {
     );
   }
 
+  /// Sprint 49 B7: body for direct-channel mode — MessageFeed + Composer,
+  /// no task status, result card, workspace, or error container.
+  Widget _directBody() {
+    return Column(
+      children: [
+        Expanded(
+          child: MessageFeed(
+            messages: _messages,
+            onAnswerPrompt: (messageId, value) async {
+              if (_channelId == null) return;
+              try {
+                await widget.client.postMessage(
+                  channelId: _channelId!,
+                  kind: 'interactive_prompt_response',
+                  payload: {'value': value},
+                  replyToId: messageId,
+                );
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Answer failed: $e')),
+                  );
+                }
+              }
+            },
+            onTeamProposalAction: (taskId, action) async {
+              // Team proposals are unlikely in DM/scheduled channels,
+              // but wire up a no-op so MessageFeed compiles cleanly.
+            },
+          ),
+        ),
+        MessageComposer(
+          onSend: _send,
+          placeholder: 'Message…',
+        ),
+      ],
+    );
+  }
+
   /// Sprint 41: branch off a completed task — submit a new task whose
   /// first agent inherits the parent's artifacts as seed_files.
+  /// Only called when widget.taskId is non-null (task-context mode).
   Future<void> _promptBranch(Task parent) async {
     final desc = await showDialog<String>(
       context: context,

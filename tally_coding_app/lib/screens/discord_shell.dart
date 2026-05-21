@@ -34,7 +34,7 @@ import 'templates_screen.dart';
 import '../widgets/new_dm_modal.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
-/// the architect chat; otherwise it's a task ID.
+/// the architect chat; otherwise it's a task ID or a direct channel id.
 sealed class ChannelSelection {
   const ChannelSelection();
 }
@@ -46,6 +46,13 @@ class GeneralSelected extends ChannelSelection {
 class TaskSelected extends ChannelSelection {
   final String taskId;
   const TaskSelected(this.taskId);
+}
+
+/// Sprint 49 B7: DM or scheduled_agent channel opened by direct channel id.
+class DirectChannelSelected extends ChannelSelection {
+  final int channelId;
+  final String channelName;
+  const DirectChannelSelected(this.channelId, this.channelName);
 }
 
 class DiscordShellScreen extends StatefulWidget {
@@ -83,6 +90,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   // task mode (legacy behaviour).  Threaded into the composer so newly
   // submitted tasks inherit the project's HEAD artifact set.
   String? _activeProjectId;
+  // Sprint 49 B7: DM and scheduled_agent channels loaded from the API.
+  List<Map<String, dynamic>> _dmChannels = const [];
+  List<Map<String, dynamic>> _scheduledChannels = const [];
 
   @override
   void initState() {
@@ -91,6 +101,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ? TaskSelected(widget.initialTaskId!)
         : const GeneralSelected();
     _fetch();
+    _fetchDirectChannels();
     _pollHealth();
     _refresh = Timer.periodic(const Duration(seconds: 4), (_) => _fetch());
     _healthRefresh = Timer.periodic(
@@ -167,6 +178,51 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     await _fetch();
     if (!mounted) return;
     setState(() => _selected = TaskSelected(t.id));
+  }
+
+  /// Sprint 49 B7: load DM and scheduled_agent channels from the API,
+  /// then check escalation status on each scheduled_agent channel.
+  Future<void> _fetchDirectChannels() async {
+    try {
+      final channels = await widget.client.listChannels(workspaceId: 1);
+      if (!mounted) return;
+      final dms = channels.where((c) => c['kind'] == 'dm').toList();
+      final scheduled = channels
+          .where((c) => c['kind'] == 'scheduled_agent')
+          .toList();
+      setState(() {
+        _dmChannels = dms;
+        _scheduledChannels = scheduled;
+      });
+      await _loadEscalationStatus(scheduled);
+    } catch (e) {
+      debugPrint('discord_shell: failed to load direct channels: $e');
+    }
+  }
+
+  /// Sprint 49 B7: for each scheduled_agent channel, fetch the latest
+  /// message. If it is kind='escalation', mark the channel with an
+  /// '_unread_escalation' flag so the rail can show an orange dot.
+  ///
+  /// This is the Sprint 49 simplest path (N extra GET /messages?limit=1
+  /// calls). Sprint 50+ can add a server-side unread_kinds field.
+  Future<void> _loadEscalationStatus(
+    List<Map<String, dynamic>> scheduledChannels,
+  ) async {
+    var changed = false;
+    for (final ch in scheduledChannels) {
+      try {
+        final msgs = await widget.client.getMessages(
+          channelId: ch['id'] as int,
+          limit: 1,
+        );
+        if (msgs.isNotEmpty && msgs.first['kind'] == 'escalation') {
+          ch['_unread_escalation'] = true;
+          changed = true;
+        }
+      } catch (_) {/* non-critical */}
+    }
+    if (changed && mounted) setState(() {});
   }
 
 /// Sprint 33-rest: server rail 💳 → push the billing screen.
@@ -274,6 +330,8 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     error: _error,
                     onSelect: (sel) => setState(() => _selected = sel),
                     onRetry: _fetch,
+                    dmChannels: _dmChannels,
+                    scheduledChannels: _scheduledChannels,
                     onNewScheduled: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => PersistentAgentsScreen(
@@ -293,6 +351,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                       if (result != null && mounted) {
                         // Reload channels so any new DM appears in the rail.
                         await _fetch();
+                        await _fetchDirectChannels();
                       }
                     },
                   ),
@@ -313,6 +372,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     final channelTitle = switch (_selected) {
       GeneralSelected() => '#general',
       TaskSelected(taskId: final id) => '#${id.substring(0, 8)}',
+      DirectChannelSelected(channelName: final name) => '#$name',
     };
     return Scaffold(
       backgroundColor: const Color(0xFF313338),
@@ -334,6 +394,8 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         selected: _selected,
         loading: _loading && _tasks.isEmpty,
         error: _error,
+        dmChannels: _dmChannels,
+        scheduledChannels: _scheduledChannels,
         onSelect: (sel) {
           setState(() => _selected = sel);
           Navigator.of(context).pop();
@@ -379,6 +441,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           if (result != null && mounted) {
             // Reload channels so any new DM appears in the rail.
             await _fetch();
+            await _fetchDirectChannels();
           }
         },
       ),
@@ -444,10 +507,19 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           activeProjectId: _activeProjectId,
         ),
       TaskSelected(taskId: final id) => TaskChannelScreen(
-          key: ValueKey(id),
+          key: ValueKey('task-$id'),
           client: widget.client,
           taskId: id,
           wsClient: widget.wsClient,
+        ),
+      // Sprint 49 B7: DM / scheduled_agent channels open via directChannelId.
+      DirectChannelSelected(channelId: final cid, channelName: final name) =>
+        TaskChannelScreen(
+          key: ValueKey('ch-$cid'),
+          client: widget.client,
+          wsClient: widget.wsClient,
+          directChannelId: cid,
+          channelTitle: name,
         ),
     };
   }
@@ -637,6 +709,9 @@ class _ChannelList extends StatelessWidget {
   final VoidCallback onRetry;
   final VoidCallback onNewScheduled;
   final VoidCallback onNewDm;
+  /// Sprint 49 B7: DM and scheduled_agent channels from the API.
+  final List<Map<String, dynamic>> dmChannels;
+  final List<Map<String, dynamic>> scheduledChannels;
   /// Sprint 31: when null the list fills its parent (drawer mode);
   /// when set it pins to that width (desktop left rail = 240).
   final double? width;
@@ -649,6 +724,8 @@ class _ChannelList extends StatelessWidget {
     required this.onRetry,
     required this.onNewScheduled,
     required this.onNewDm,
+    this.dmChannels = const [],
+    this.scheduledChannels = const [],
     this.width = 240,
   });
 
@@ -702,16 +779,42 @@ class _ChannelList extends StatelessWidget {
         _categoryHeader(context, 'TASKS'),
         ..._taskItems(context),
         const SizedBox(height: 12),
-        // Sprint 49 B5: Scheduled category
+        // Sprint 49 B7: Scheduled channels from API + new-scheduled CTA.
         _categoryHeader(context, 'SCHEDULED'),
+        ..._directChannelItems(context, scheduledChannels),
         _NewTile(label: '+ New scheduled', onTap: onNewScheduled),
         const SizedBox(height: 12),
-        // Sprint 49 B5: Direct messages category
+        // Sprint 49 B7: DM channels from API + new-DM CTA.
         _categoryHeader(context, 'DIRECT MESSAGES'),
+        ..._directChannelItems(context, dmChannels),
         _NewTile(label: '+ New DM', onTap: onNewDm),
         const SizedBox(height: 8),
       ],
     );
+  }
+
+  /// Sprint 49 B7: render tiles for DM / scheduled_agent channels.
+  /// Shows an orange escalation dot if '_unread_escalation' is set.
+  List<Widget> _directChannelItems(
+    BuildContext context,
+    List<Map<String, dynamic>> channels,
+  ) {
+    return [
+      for (final ch in channels)
+        _ChannelTile(
+          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          label: ch['name'] as String? ?? 'channel',
+          selected: selected is DirectChannelSelected &&
+              (selected as DirectChannelSelected).channelId == ch['id'] as int,
+          onTap: () => onSelect(DirectChannelSelected(
+            ch['id'] as int,
+            ch['name'] as String? ?? 'channel',
+          )),
+          trailing: (ch['_unread_escalation'] == true)
+              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              : null,
+        ),
+    ];
   }
 
   Widget _categoryHeader(BuildContext context, String label) {
@@ -831,12 +934,15 @@ class _ChannelTile extends StatelessWidget {
   final String? subtitle;
   final bool selected;
   final VoidCallback onTap;
+  /// Sprint 49 B7: optional trailing widget (e.g. escalation indicator dot).
+  final Widget? trailing;
   const _ChannelTile({
     required this.icon,
     required this.label,
     this.subtitle,
     required this.selected,
     required this.onTap,
+    this.trailing,
   });
 
   @override
@@ -882,6 +988,11 @@ class _ChannelTile extends StatelessWidget {
                     ],
                   ),
                 ),
+                // Sprint 49 B7: escalation dot or other trailing indicator.
+                if (trailing != null) ...[
+                  const SizedBox(width: 4),
+                  trailing!,
+                ],
               ],
             ),
           ),
@@ -920,6 +1031,7 @@ class _MembersPanel extends StatelessWidget {
               switch (selected) {
                 GeneralSelected() => 'MEMBERS',
                 TaskSelected() => 'AGENTS',
+                DirectChannelSelected() => 'MEMBERS',
               },
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
                     color: const Color(0xFF8E9297),
@@ -935,7 +1047,8 @@ class _MembersPanel extends StatelessWidget {
   }
 
   Widget _body(BuildContext context) {
-    if (selected is GeneralSelected) {
+    // Sprint 49 B7: DM / scheduled_agent channels don't have agent rosters.
+    if (selected is GeneralSelected || selected is DirectChannelSelected) {
       return ListView(
         controller: scrollController,
         children: const [
@@ -1138,6 +1251,9 @@ class _NarrowDrawer extends StatelessWidget {
   final VoidCallback onSignOut;
   final VoidCallback onNewScheduled;
   final VoidCallback onNewDm;
+  /// Sprint 49 B7: DM and scheduled_agent channels from the API.
+  final List<Map<String, dynamic>> dmChannels;
+  final List<Map<String, dynamic>> scheduledChannels;
   const _NarrowDrawer({
     required this.tasks,
     required this.selected,
@@ -1152,6 +1268,8 @@ class _NarrowDrawer extends StatelessWidget {
     required this.onSignOut,
     required this.onNewScheduled,
     required this.onNewDm,
+    this.dmChannels = const [],
+    this.scheduledChannels = const [],
   });
 
   @override
@@ -1171,6 +1289,8 @@ class _NarrowDrawer extends StatelessWidget {
                 onRetry: onRetry,
                 onNewScheduled: onNewScheduled,
                 onNewDm: onNewDm,
+                dmChannels: dmChannels,
+                scheduledChannels: scheduledChannels,
                 width: null,
               ),
             ),
