@@ -1113,5 +1113,99 @@ class TallyOrchClient {
     return Map<String, dynamic>.from(jsonDecode(resp.body));
   }
 
+  // ── Sprint 50: workspaces + members + custom channels ───────────────────
+
+  Future<Map<String, dynamic>> createWorkspace({required String name}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/workspaces'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'name': name}),
+    );
+    if (resp.statusCode != 200) throw Exception('POST /workspaces ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<List<Map<String, dynamic>>> listMyWorkspaces() async {
+    final resp = await _http.get(baseUrl.resolve('/me/workspaces'), headers: await _authHeaders);
+    if (resp.statusCode != 200) throw Exception('GET /me/workspaces ${resp.statusCode}: ${resp.body}');
+    return List<Map<String, dynamic>>.from(jsonDecode(resp.body)['workspaces'] as List);
+  }
+
+  Future<Map<String, dynamic>> updateWorkspace({required int id, required Map<String, dynamic> patch}) async {
+    final resp = await _http.patch(
+      baseUrl.resolve('/workspaces/$id'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(patch),
+    );
+    if (resp.statusCode != 200) throw Exception('PATCH /workspaces/$id ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<List<Map<String, dynamic>>> listWorkspaceMembers({required int workspaceId}) async {
+    final resp = await _http.get(
+      baseUrl.resolve('/workspaces/$workspaceId/members'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) throw Exception('GET /workspaces/$workspaceId/members ${resp.statusCode}: ${resp.body}');
+    return List<Map<String, dynamic>>.from(jsonDecode(resp.body)['members'] as List);
+  }
+
+  Future<Map<String, dynamic>> inviteWorkspaceMember({required int workspaceId, required String userId, required String role}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/workspaces/$workspaceId/members'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'user_id': userId, 'role': role}),
+    );
+    if (resp.statusCode != 200) throw Exception('POST /workspaces/$workspaceId/members ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> removeWorkspaceMember({required int workspaceId, required String userId}) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/workspaces/$workspaceId/members/$userId'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) throw Exception('DELETE workspace member ${resp.statusCode}: ${resp.body}');
+  }
+
+  Future<Map<String, dynamic>> updateWorkspaceMemberRole({required int workspaceId, required String userId, required String role}) async {
+    final resp = await _http.patch(
+      baseUrl.resolve('/workspaces/$workspaceId/members/$userId'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'role': role}),
+    );
+    if (resp.statusCode != 200) throw Exception('PATCH workspace member role ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> createCustomChannel({required int workspaceId, required String name, required List<Map<String, dynamic>> members}) async {
+    final resp = await _http.post(
+      baseUrl.resolve('/channels'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode({'workspace_id': workspaceId, 'kind': 'custom', 'name': name, 'members': members}),
+    );
+    if (resp.statusCode != 200) throw Exception('POST /channels ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<Map<String, dynamic>> addChannelMember({required int channelId, required String memberKind, String? userId, int? persistentAgentId}) async {
+    final body = {'member_kind': memberKind, if (userId != null) 'user_id': userId, if (persistentAgentId != null) 'persistent_agent_id': persistentAgentId};
+    final resp = await _http.post(
+      baseUrl.resolve('/channels/$channelId/members'),
+      headers: {'content-type': 'application/json', ...(await _authHeaders)},
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode != 200) throw Exception('POST /channels/$channelId/members ${resp.statusCode}: ${resp.body}');
+    return Map<String, dynamic>.from(jsonDecode(resp.body));
+  }
+
+  Future<void> removeChannelMember({required int channelId, required String userId}) async {
+    final resp = await _http.delete(
+      baseUrl.resolve('/channels/$channelId/members/$userId'),
+      headers: await _authHeaders,
+    );
+    if (resp.statusCode != 200) throw Exception('DELETE channel member ${resp.statusCode}: ${resp.body}');
+  }
+
   void close() => _http.close();
 }
