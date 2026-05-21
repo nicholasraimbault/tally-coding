@@ -338,6 +338,7 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
                   client: widget.client,
                   workspaceId: widget.workspaceId,
                   workspaceName: widget.workspaceName,
+                  callerRole: widget.callerRole,
                 ),
               )),
             ),

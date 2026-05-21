@@ -12,11 +12,14 @@ class AuditLogScreen extends StatefulWidget {
   final TallyOrchClient client;
   final int workspaceId;
   final String workspaceName;
+  final String callerRole; // 'owner' | 'admin' | 'manager' | 'member'
+
   const AuditLogScreen({
     super.key,
     required this.client,
     required this.workspaceId,
     required this.workspaceName,
+    this.callerRole = 'member',
   });
 
   @override
@@ -263,6 +266,40 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
             tooltip: 'Export CSV',
             onPressed: _onExport,
           ),
+          PopupMenuButton<String>(
+            itemBuilder: (_) => [
+              if (widget.callerRole == 'owner' || widget.callerRole == 'admin')
+                const PopupMenuItem<String>(
+                  value: 'prune',
+                  child: Text('Prune older entries…'),
+                ),
+            ],
+            onSelected: (action) async {
+              if (action != 'prune') return;
+              final messenger = ScaffoldMessenger.of(context);
+              final days = await showDialog<int>(
+                context: context,
+                builder: (_) => _PruneDialog(),
+              );
+              if (days == null) return;
+              try {
+                final result = await widget.client.pruneAuditLog(
+                  workspaceId: widget.workspaceId,
+                  olderThanDays: days,
+                );
+                if (mounted) {
+                  messenger.showSnackBar(
+                    SnackBar(content: Text('Pruned ${result['deleted']} entries')),
+                  );
+                  _loadFirst();
+                }
+              } catch (e) {
+                if (mounted) {
+                  messenger.showSnackBar(SnackBar(content: Text('Prune failed: $e')));
+                }
+              }
+            },
+          ),
         ],
       ),
       body: Column(
@@ -308,6 +345,63 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PruneDialog extends StatefulWidget {
+  @override
+  State<_PruneDialog> createState() => _PruneDialogState();
+}
+
+class _PruneDialogState extends State<_PruneDialog> {
+  final _ctrl = TextEditingController(text: '90');
+  String? _error;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Prune audit log'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'Delete audit entries older than N days.  Minimum: 30 days.',
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _ctrl,
+            decoration: InputDecoration(
+              labelText: 'Older than (days)',
+              errorText: _error,
+            ),
+            keyboardType: TextInputType.number,
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: () {
+            final n = int.tryParse(_ctrl.text.trim());
+            if (n == null || n < 30) {
+              setState(() => _error = 'Must be a number >= 30');
+              return;
+            }
+            Navigator.of(context).pop(n);
+          },
+          child: const Text('Prune'),
+        ),
+      ],
     );
   }
 }

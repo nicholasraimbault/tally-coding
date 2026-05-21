@@ -50,4 +50,59 @@ void main() {
     expect(callCount, 2);
     expect(receivedKind, 'channel_created');
   });
+
+  testWidgets('admin sees Prune option in overflow menu', (tester) async {
+    final mock = MockClient((req) async {
+      return http.Response('{"entries":[]}', 200,
+        headers: {'content-type': 'application/json'});
+    });
+    final client = TallyOrchClient(
+      baseUrl: Uri.parse('http://x.test'),
+      provider: () async => 'tok',
+      client: mock,
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: AuditLogScreen(
+        client: client,
+        workspaceId: 1,
+        workspaceName: 'Test WS',
+        callerRole: 'admin',
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    // Tap the overflow menu (PopupMenuButton)
+    await tester.tap(find.byType(PopupMenuButton<String>));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Prune older entries…'), findsOneWidget);
+  });
+
+  testWidgets('member does not see Prune option', (tester) async {
+    final mock = MockClient((req) async {
+      return http.Response('{"entries":[]}', 200,
+        headers: {'content-type': 'application/json'});
+    });
+    final client = TallyOrchClient(
+      baseUrl: Uri.parse('http://x.test'),
+      provider: () async => 'tok',
+      client: mock,
+    );
+
+    await tester.pumpWidget(MaterialApp(
+      home: AuditLogScreen(
+        client: client,
+        workspaceId: 1,
+        workspaceName: 'Test WS',
+        callerRole: 'member',
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byType(PopupMenuButton<String>));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Prune older entries…'), findsNothing);
+  });
 }
