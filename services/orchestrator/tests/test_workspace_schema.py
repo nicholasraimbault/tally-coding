@@ -45,3 +45,44 @@ def test_migration_idempotent(tmp_db_path: str):
     Db(tmp_db_path)
     Db(tmp_db_path)
     Db(tmp_db_path)
+
+
+def test_backfill_admin_workspace_created(db: Db):
+    """On first Db init, admin user gets a default workspace + owner membership."""
+    rows = db._conn.execute(
+        "SELECT id, name, owner_user_id FROM workspaces WHERE owner_user_id='admin'"
+    ).fetchall()
+    assert len(rows) == 1, f"expected 1 admin workspace, got {len(rows)}"
+    ws_id, ws_name, owner = rows[0]
+    assert owner == "admin"
+    assert "admin" in ws_name.lower()
+
+    members = db._conn.execute(
+        "SELECT user_id, role FROM workspace_members "
+        "WHERE workspace_id=? AND member_kind='human'",
+        (ws_id,),
+    ).fetchall()
+    assert (("admin", "owner")) in [tuple(m) for m in members]
+
+
+def test_backfill_creates_general_channel(db: Db):
+    """Admin workspace gets an auto-created #general channel."""
+    rows = db._conn.execute(
+        "SELECT c.id, c.name, c.kind FROM channels c "
+        "JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE w.owner_user_id='admin' AND c.kind='general'"
+    ).fetchall()
+    assert len(rows) == 1
+
+
+def test_backfill_existing_tasks_get_channels(db: Db):
+    """Every existing tasks row gets a channels row of kind='task'."""
+    # Pre-create some tasks (simulating real prod state)
+    db.create_task("test task 1", team_spec=None, user_id="admin")
+    db.create_task("test task 2", team_spec=None, user_id="admin")
+    # Re-open Db to trigger backfill on the now-populated tasks table
+    db.__class__(db.path)  # second open
+
+    cnt = db._conn.execute("SELECT COUNT(*) FROM channels WHERE kind='task'").fetchone()[0]
+    tasks_cnt = db._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert cnt == tasks_cnt, f"expected one channel per task; got {cnt} channels for {tasks_cnt} tasks"

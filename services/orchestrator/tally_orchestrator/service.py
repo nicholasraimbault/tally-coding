@@ -694,7 +694,77 @@ class Db:
                 self._conn.execute(f"ALTER TABLE quotas ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+        # Sprint 47: backfill workspaces + channels for pre-existing data.
+        # Idempotent — only creates rows when they're missing.
+        self._backfill_workspaces_and_channels()
         self._seed_agent_roles()
+
+    def _backfill_workspaces_and_channels(self) -> None:
+        """Sprint 47: ensure every distinct user_id in tasks/quotas has a
+        workspace + owner membership + a #general channel + a #backlog
+        channel.  Then ensure every existing task has a `task` channel.
+        Idempotent: safe to run on every Db open."""
+        now = time.time()
+        # 1. Discover distinct user_ids that need a workspace.  Sources:
+        #    - tasks.user_id (Sprint 32+)
+        #    - quotas.user_id (Sprint 33+)
+        #    Default user_id 'admin' always gets one (so admin smoke tests
+        #    work on a fresh empty DB).
+        users = {row[0] for row in self._conn.execute(
+            "SELECT DISTINCT user_id FROM tasks WHERE user_id IS NOT NULL"
+        )}
+        users.update(row[0] for row in self._conn.execute(
+            "SELECT DISTINCT user_id FROM quotas WHERE user_id IS NOT NULL"
+        ))
+        users.add("admin")
+        # 2. For each user_id without a workspace, create one + owner membership + general/backlog channels.
+        for user_id in users:
+            existing = self._conn.execute(
+                "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
+            ).fetchone()
+            if existing:
+                continue
+            cur = self._conn.execute(
+                "INSERT INTO workspaces (name, owner_user_id, plan_slug, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (f"{user_id}'s workspace", user_id, "unlimited" if user_id == "admin" else "free", now),
+            )
+            ws_id = cur.lastrowid
+            self._conn.execute(
+                "INSERT INTO workspace_members (workspace_id, member_kind, user_id, role, joined_at) "
+                "VALUES (?, 'human', ?, 'owner', ?)",
+                (ws_id, user_id, now),
+            )
+            for kind, name in (("general", "general"), ("backlog", "backlog")):
+                ch_cur = self._conn.execute(
+                    "INSERT INTO channels (workspace_id, kind, name, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ws_id, kind, name, now),
+                )
+                self._conn.execute(
+                    "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                    "VALUES (?, 'human', ?, ?)",
+                    (ch_cur.lastrowid, user_id, now),
+                )
+        # 3. For each existing task row without a task channel, create one.
+        task_rows = self._conn.execute(
+            "SELECT t.id, t.user_id, t.status, t.created_at, t.updated_at "
+            "FROM tasks t LEFT JOIN channels c ON c.task_id=t.id "
+            "WHERE c.id IS NULL"
+        ).fetchall()
+        for task_id, user_id, status, created_at, updated_at in task_rows:
+            user_id = user_id or "admin"
+            ws_row = self._conn.execute(
+                "SELECT id FROM workspaces WHERE owner_user_id=?", (user_id,)
+            ).fetchone()
+            if ws_row is None:
+                continue  # shouldn't happen given step 2 ran first
+            archived_at = updated_at if status in ("completed", "failed") else None
+            self._conn.execute(
+                "INSERT INTO channels (workspace_id, kind, name, task_id, created_at, archived_at) "
+                "VALUES (?, 'task', ?, ?, ?, ?)",
+                (ws_row[0], f"task-{task_id[:8]}", task_id, created_at, archived_at),
+            )
 
     def _seed_agent_roles(self) -> None:
         """Idempotent seed of the 7-role palette. INSERT OR IGNORE so
