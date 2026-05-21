@@ -29,17 +29,50 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
   bool _hasMore = true;
   String? _error;
 
+  String? _kindFilter;
+  String _actorFilter = '';
+  final _actorCtrl = TextEditingController();
+
+  static const _allKinds = <String>[
+    'workspace_created',
+    'workspace_renamed',
+    'workspace_settings_updated',
+    'workspace_deleted',
+    'workspace_ownership_transferred',
+    'member_invited',
+    'member_removed',
+    'member_left',
+    'member_role_changed',
+    'channel_created',
+    'channel_archived',
+    'channel_unarchived',
+    'persistent_agent_created',
+    'persistent_agent_enabled_toggled',
+    'persistent_agent_deleted',
+    'persistent_agent_auto_paused',
+    'audit_log_pruned',
+  ];
+
   @override
   void initState() {
     super.initState();
     _loadFirst();
   }
 
+  @override
+  void dispose() {
+    _actorCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadFirst() async {
     setState(() { _loading = true; _entries.clear(); _hasMore = true; _error = null; });
     try {
       final page = await widget.client.listAuditLog(
-        workspaceId: widget.workspaceId, limit: _pageSize,
+        workspaceId: widget.workspaceId,
+        limit: _pageSize,
+        kind: _kindFilter,
+        actorUserId: _actorFilter.isEmpty ? null : _actorFilter,
       );
       if (!mounted) return;
       setState(() {
@@ -61,6 +94,8 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
         workspaceId: widget.workspaceId,
         limit: _pageSize,
         beforeId: _entries.last['id'] as int,
+        kind: _kindFilter,
+        actorUserId: _actorFilter.isEmpty ? null : _actorFilter,
       );
       if (!mounted) return;
       setState(() {
@@ -141,46 +176,108 @@ class _AuditLogScreenState extends State<AuditLogScreen> {
     );
   }
 
+  Widget _filterBar() {
+    return ExpansionTile(
+      title: const Text('Filters'),
+      initiallyExpanded: false,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              DropdownButtonFormField<String?>(
+                value: _kindFilter,
+                decoration: const InputDecoration(labelText: 'Kind'),
+                items: [
+                  const DropdownMenuItem<String?>(value: null, child: Text('Any')),
+                  for (final k in _allKinds)
+                    DropdownMenuItem<String?>(value: k, child: Text(k)),
+                ],
+                onChanged: (v) => setState(() => _kindFilter = v),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _actorCtrl,
+                decoration: const InputDecoration(labelText: 'Actor user_id'),
+                onChanged: (v) => _actorFilter = v.trim(),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _kindFilter = null;
+                        _actorFilter = '';
+                        _actorCtrl.clear();
+                      });
+                      _loadFirst();
+                    },
+                    child: const Text('Clear'),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _loadFirst,
+                    child: const Text('Apply'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text('Activity log: ${widget.workspaceName}')),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-              ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text('Error: $_error')))
-              : _entries.isEmpty
-                  ? const Center(child: Padding(
-                      padding: EdgeInsets.all(24),
-                      child: Text('No activity yet.',
-                          style: TextStyle(color: Color(0xFF949BA4))),
-                    ))
-                  : Column(
-                      children: [
-                        Expanded(
-                          child: RefreshIndicator(
-                            onRefresh: _loadFirst,
-                            child: ListView.builder(
-                              itemCount: _entries.length,
-                              itemBuilder: (_, i) => _tile(_entries[i]),
-                            ),
-                          ),
-                        ),
-                        if (_hasMore)
-                          Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: Center(
-                              child: TextButton.icon(
-                                icon: _loadingMore
-                                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                                    : const Icon(Icons.expand_more),
-                                label: Text(_loadingMore ? 'Loading…' : 'Load more'),
-                                onPressed: _loadingMore ? null : _loadMore,
+      body: Column(
+        children: [
+          _filterBar(),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _error != null
+                    ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text('Error: $_error')))
+                    : _entries.isEmpty
+                        ? const Center(child: Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text('No activity yet.',
+                                style: TextStyle(color: Color(0xFF949BA4))),
+                          ))
+                        : Column(
+                            children: [
+                              Expanded(
+                                child: RefreshIndicator(
+                                  onRefresh: _loadFirst,
+                                  child: ListView.builder(
+                                    itemCount: _entries.length,
+                                    itemBuilder: (_, i) => _tile(_entries[i]),
+                                  ),
+                                ),
                               ),
-                            ),
+                              if (_hasMore)
+                                Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Center(
+                                    child: TextButton.icon(
+                                      icon: _loadingMore
+                                          ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                                          : const Icon(Icons.expand_more),
+                                      label: Text(_loadingMore ? 'Loading…' : 'Load more'),
+                                      onPressed: _loadingMore ? null : _loadMore,
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
-                      ],
-                    ),
+          ),
+        ],
+      ),
     );
   }
 }
