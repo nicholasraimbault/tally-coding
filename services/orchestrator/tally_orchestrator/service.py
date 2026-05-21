@@ -6545,20 +6545,26 @@ async def transfer_workspace_ownership_route(
     if target is None:
         raise HTTPException(404, "target user is not a member of this workspace")
     # Atomic transfer: promote target, demote old owner, update workspaces table
-    db._conn.execute(
-        "UPDATE workspace_members SET role='owner' "
-        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
-        (wid, body.new_owner_user_id),
-    )
-    db._conn.execute(
-        "UPDATE workspace_members SET role='admin' "
-        "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
-        (wid, user.id),
-    )
-    db._conn.execute(
-        "UPDATE workspaces SET owner_user_id=? WHERE id=?",
-        (body.new_owner_user_id, wid),
-    )
+    db._conn.execute("BEGIN")
+    try:
+        db._conn.execute(
+            "UPDATE workspace_members SET role='owner' "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (wid, body.new_owner_user_id),
+        )
+        db._conn.execute(
+            "UPDATE workspace_members SET role='admin' "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (wid, user.id),
+        )
+        db._conn.execute(
+            "UPDATE workspaces SET owner_user_id=? WHERE id=?",
+            (body.new_owner_user_id, wid),
+        )
+        db._conn.execute("COMMIT")
+    except Exception:
+        db._conn.execute("ROLLBACK")
+        raise
     try:
         db.audit_log(
             workspace_id=wid, actor_user_id=user.id,
