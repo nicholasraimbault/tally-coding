@@ -5270,6 +5270,9 @@ async def list_workspace_channels(
     }
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
 @app.post("/channels/{channel_id}/messages")
 async def post_message(
     channel_id: int,
@@ -5282,7 +5285,13 @@ async def post_message(
     `can_post_in_channel`.  Returns 403 for non-members or read-only.
     Returns 404 if channel doesn't exist.
 
-    For `kind='text'`, body.text is the required content.
+    For `kind='text'`, body.text is the required content.  If both
+    `body.text` and `body.payload['text']` are provided, `body.text`
+    wins and overwrites the payload field.
+
+    TODO(Sprint 49): when private channels (DMs) land, consider
+    collapsing the 404/403 paths into 403 to avoid leaking channel
+    existence to non-members.
     """
     db: Db = state["db"]
     from .channels import (
@@ -5315,7 +5324,10 @@ async def post_message(
         (msg_id,),
     ).fetchone()
     # Sprint 47 Task A10 will broadcast over WebSocket here.
-    asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+    # Hold a strong reference so the GC cannot collect the task before it runs.
+    t = asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
     return {
         "id": row[0], "channel_id": row[1], "author_kind": row[2],
         "author_user_id": row[3], "author_agent_id": row[4],
