@@ -31,8 +31,8 @@ RUN maturin build --release --features python --compatibility linux -o /wheels
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
-LABEL org.opencontainers.image.version=v32
-LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 52: ownership transfer + Clerk validation + audit log filters/export/prune)"
+LABEL org.opencontainers.image.version=v33
+LABEL org.opencontainers.image.description="Tally Coding orchestrator (post-Sprint 52: add restart: unless-stopped to orchestrator + worker compose)"
 
 WORKDIR /app
 
