@@ -604,6 +604,24 @@ class PushDeviceRequest(BaseModel):
     platform: str | None = None
 
 
+# Sprint 47: channel + message request models.
+
+class ChannelMemberRoleOverrideRequest(BaseModel):
+    role_override: str | None = None  # None to clear, or one of: channel_admin, read_only
+
+
+class MessageCreateRequest(BaseModel):
+    text: str | None = None
+    kind: str = "text"  # text | interactive_prompt_response
+    payload: dict | None = None
+    reply_to_id: int | None = None
+
+
+class MessagePatchRequest(BaseModel):
+    text: str | None = None
+    payload: dict | None = None
+
+
 class Db:
     """Tiny synchronous SQLite wrapper. All access goes through this class."""
 
@@ -5195,6 +5213,51 @@ async def billing_cost(user: ClerkUser = Depends(require_user)) -> dict:
     db: Db = state["db"]
     quota = db.get_or_create_quota(user.id, plan_hint=user.plan)
     return db.cost_summary(user_id=user.id, since_ts=quota["period_start"])
+
+
+# ── Sprint 47 A4: channels routes ─────────────────────────────────────────────
+
+
+@app.get("/channels")
+async def list_workspace_channels(
+    workspace_id: int,
+    include_archived: bool = False,
+    user: ClerkUser = Depends(require_user),
+) -> dict:
+    """Sprint 47: list channels in a workspace, filtered by the caller's
+    visibility.  Only channels where the user is a `channel_members` row
+    are returned (so private custom channels stay hidden)."""
+    db: Db = state["db"]
+    where = ["c.workspace_id=?"]
+    params: list = [workspace_id]
+    if not include_archived:
+        where.append("c.archived_at IS NULL")
+    # Filter to channels where the user is a member OR the channel is
+    # a workspace-wide auto-channel (general / backlog).
+    where.append(
+        "(c.kind IN ('general', 'backlog') OR EXISTS ("
+        "SELECT 1 FROM channel_members cm WHERE cm.channel_id=c.id AND cm.user_id=?))"
+    )
+    params.append(user.id)
+    rows = db._conn.execute(
+        f"SELECT c.id, c.workspace_id, c.kind, c.name, c.task_id, "
+        f"c.persistent_agent_id, c.auto_jump_in_for_tally, "
+        f"c.created_at, c.archived_at "
+        f"FROM channels c WHERE {' AND '.join(where)} "
+        f"ORDER BY c.created_at DESC",
+        params,
+    ).fetchall()
+    return {
+        "channels": [
+            {
+                "id": r[0], "workspace_id": r[1], "kind": r[2], "name": r[3],
+                "task_id": r[4], "persistent_agent_id": r[5],
+                "auto_jump_in_for_tally": bool(r[6]),
+                "created_at": r[7], "archived_at": r[8],
+            }
+            for r in rows
+        ],
+    }
 
 
 # ── Sprint 46 A12: credit balance, caps, checkout, auto-recharge ──────────────
