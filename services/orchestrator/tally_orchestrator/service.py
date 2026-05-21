@@ -1785,6 +1785,162 @@ class Db:
         ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    # ── Sprint 49: persistent agents ────────────────────────────────────────
+
+    def create_persistent_agent(
+        self,
+        *,
+        workspace_id: int,
+        name: str,
+        role_name: str,
+        team_spec: dict,
+        tool_allowlist: dict | None = None,
+        model: str | None = None,
+        cron_schedule: str | None = None,
+        event_triggers: list[dict] | None = None,
+    ) -> int:
+        """Sprint 49: create a persistent agent + its scheduled_agent channel
+        + owner & Tally channel_members.  Computes next_scheduled_run_at
+        from `cron_schedule` if provided."""
+        now = time.time()
+        next_run: float | None = None
+        if cron_schedule:
+            from croniter import croniter
+            next_run = float(croniter(cron_schedule, now).get_next(float))
+        cur = self._conn.execute(
+            "INSERT INTO persistent_agents "
+            "(workspace_id, name, role_name, team_spec_json, tool_allowlist_json, "
+            " model, cron_schedule, event_triggers_json, next_scheduled_run_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace_id, name, role_name,
+                json.dumps(team_spec),
+                json.dumps(tool_allowlist) if tool_allowlist else None,
+                model,
+                cron_schedule,
+                json.dumps(event_triggers or []),
+                next_run,
+                now,
+            ),
+        )
+        pid = int(cur.lastrowid or 0)
+        ch_cur = self._conn.execute(
+            "INSERT INTO channels (workspace_id, kind, name, persistent_agent_id, created_at) "
+            "VALUES (?, 'scheduled_agent', ?, ?, ?)",
+            (workspace_id, name, pid, now),
+        )
+        channel_id = ch_cur.lastrowid
+        owner_row = self._conn.execute(
+            "SELECT owner_user_id FROM workspaces WHERE id=?", (workspace_id,)
+        ).fetchone()
+        if owner_row:
+            self._conn.execute(
+                "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+                "VALUES (?, 'human', ?, ?)",
+                (channel_id, owner_row[0], now),
+            )
+        self._conn.execute(
+            "INSERT INTO channel_members (channel_id, member_kind, user_id, joined_at) "
+            "VALUES (?, 'tally', NULL, ?)",
+            (channel_id, now),
+        )
+        return pid
+
+    def list_persistent_agents(self, *, workspace_id: int) -> list[dict]:
+        """Sprint 49: list active (non-deleted) persistent agents."""
+        rows = self._conn.execute(
+            "SELECT id, workspace_id, name, role_name, team_spec_json, "
+            "tool_allowlist_json, model, cron_schedule, event_triggers_json, "
+            "enabled, last_run_at, next_scheduled_run_at, consecutive_failures, "
+            "created_at "
+            "FROM persistent_agents "
+            "WHERE workspace_id=? AND deleted_at IS NULL "
+            "ORDER BY created_at DESC",
+            (workspace_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "workspace_id": r[1], "name": r[2], "role_name": r[3],
+                "team_spec": json.loads(r[4]) if r[4] else {},
+                "tool_allowlist": json.loads(r[5]) if r[5] else None,
+                "model": r[6], "cron_schedule": r[7],
+                "event_triggers": json.loads(r[8]) if r[8] else [],
+                "enabled": bool(r[9]),
+                "last_run_at": r[10], "next_scheduled_run_at": r[11],
+                "consecutive_failures": r[12], "created_at": r[13],
+            })
+        return out
+
+    def get_persistent_agent(self, pid: int) -> dict | None:
+        """Sprint 49: fetch a single persistent agent by id (including deleted)."""
+        r = self._conn.execute(
+            "SELECT id, workspace_id, name, role_name, team_spec_json, "
+            "tool_allowlist_json, model, cron_schedule, event_triggers_json, "
+            "enabled, last_run_at, next_scheduled_run_at, consecutive_failures, "
+            "created_at, deleted_at "
+            "FROM persistent_agents WHERE id=?",
+            (pid,),
+        ).fetchone()
+        if r is None:
+            return None
+        return {
+            "id": r[0], "workspace_id": r[1], "name": r[2], "role_name": r[3],
+            "team_spec": json.loads(r[4]) if r[4] else {},
+            "tool_allowlist": json.loads(r[5]) if r[5] else None,
+            "model": r[6], "cron_schedule": r[7],
+            "event_triggers": json.loads(r[8]) if r[8] else [],
+            "enabled": bool(r[9]),
+            "last_run_at": r[10], "next_scheduled_run_at": r[11],
+            "consecutive_failures": r[12], "created_at": r[13],
+            "deleted_at": r[14],
+        }
+
+    def update_persistent_agent(self, pid: int, *, patch: dict) -> None:
+        """Sprint 49: partial update.  Recomputes next_scheduled_run_at if
+        cron_schedule changed.  Acceptable fields: name, team_spec,
+        tool_allowlist, model, cron_schedule, event_triggers, enabled."""
+        allowed = {
+            "name", "team_spec", "tool_allowlist", "model",
+            "cron_schedule", "event_triggers", "enabled",
+        }
+        sets: list[str] = []
+        params: list = []
+        for key, val in patch.items():
+            if key not in allowed:
+                continue
+            if key == "team_spec":
+                sets.append("team_spec_json=?")
+                params.append(json.dumps(val))
+            elif key == "tool_allowlist":
+                sets.append("tool_allowlist_json=?")
+                params.append(json.dumps(val) if val else None)
+            elif key == "event_triggers":
+                sets.append("event_triggers_json=?")
+                params.append(json.dumps(val or []))
+            else:
+                sets.append(f"{key}=?")
+                params.append(val)
+        if "cron_schedule" in patch and patch["cron_schedule"]:
+            from croniter import croniter
+            next_run = float(croniter(patch["cron_schedule"], time.time()).get_next(float))
+            sets.append("next_scheduled_run_at=?")
+            params.append(next_run)
+        if not sets:
+            return
+        params.append(pid)
+        self._conn.execute(
+            f"UPDATE persistent_agents SET {', '.join(sets)} WHERE id=?",
+            tuple(params),
+        )
+
+    def delete_persistent_agent(self, pid: int) -> None:
+        """Sprint 49: soft delete; disables future fires."""
+        self._conn.execute(
+            "UPDATE persistent_agents SET deleted_at=?, enabled=0 WHERE id=?",
+            (time.time(), pid),
+        )
+
     # ── Sprint 39: LLM cost accounting ─────────────────────────────────────
 
     def record_cost_event(
