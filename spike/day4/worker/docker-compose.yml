@@ -1,6 +1,7 @@
 services:
   worker:
     image: ghcr.io/nicholasraimbault/tally-spike-day4-worker:v13
+    restart: unless-stopped
     environment:
       - REDPILL_API_KEY=${REDPILL_API_KEY}
       - REDPILL_BASE_URL=${REDPILL_BASE_URL:-https://api.redpill.ai/v1}
