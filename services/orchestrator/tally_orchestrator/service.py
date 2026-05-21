@@ -6450,6 +6450,29 @@ async def patch_workspace_route(
     return {"id": wid}
 
 
+@app.delete("/workspaces/{wid}")
+async def delete_workspace_route(wid: int, user: ClerkUser = Depends(require_user)) -> dict:
+    """Sprint 51: owner-only soft delete.  Sets deleted_at; preserves
+    workspace history.  /me/workspaces filters by deleted_at IS NULL."""
+    db: Db = state["db"]
+    row = db._conn.execute(
+        "SELECT owner_user_id, name FROM workspaces WHERE id=? AND deleted_at IS NULL", (wid,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "workspace not found")
+    if row[0] != user.id:
+        raise HTTPException(403, "owner only")
+    db._conn.execute("UPDATE workspaces SET deleted_at=? WHERE id=?", (time.time(), wid))
+    try:
+        db.audit_log(
+            workspace_id=wid, actor_user_id=user.id,
+            kind="workspace_deleted", payload={"name": row[1]},
+        )
+    except Exception as exc:
+        logger.warning("audit_log workspace_deleted failed: %s", exc)
+    return {"ok": True}
+
+
 @app.get("/me/workspaces")
 async def list_my_workspaces(
     user: ClerkUser = Depends(require_user),
