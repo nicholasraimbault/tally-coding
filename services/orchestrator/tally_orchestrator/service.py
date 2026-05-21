@@ -977,6 +977,65 @@ class Db:
             )
         return ws_id
 
+    def list_workspace_members(self, *, workspace_id: int) -> list[dict]:
+        """Sprint 50: list all members of a workspace."""
+        rows = self._conn.execute(
+            "SELECT id, member_kind, user_id, persistent_agent_id, role, joined_at "
+            "FROM workspace_members WHERE workspace_id=? ORDER BY joined_at ASC",
+            (workspace_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "member_kind": r[1],
+                "user_id": r[2],
+                "persistent_agent_id": r[3],
+                "role": r[4],
+                "joined_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def add_workspace_member(
+        self, *, workspace_id: int, user_id: str, role: str
+    ) -> None:
+        """Sprint 50: add a human user as a workspace_member.
+        Idempotent: silent if (workspace_id, user_id) already exists."""
+        existing = self._conn.execute(
+            "SELECT 1 FROM workspace_members "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, user_id),
+        ).fetchone()
+        if existing:
+            return
+        self._conn.execute(
+            "INSERT INTO workspace_members "
+            "(workspace_id, member_kind, user_id, role, joined_at) "
+            "VALUES (?, 'human', ?, ?, ?)",
+            (workspace_id, user_id, role, time.time()),
+        )
+
+    def update_workspace_member_role(
+        self, *, workspace_id: int, user_id: str, role: str
+    ) -> bool:
+        """Sprint 50: change a human member's role.  Returns True if a
+        row was updated."""
+        cur = self._conn.execute(
+            "UPDATE workspace_members SET role=? "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (role, workspace_id, user_id),
+        )
+        return cur.rowcount > 0
+
+    def remove_workspace_member(self, *, workspace_id: int, user_id: str) -> bool:
+        """Sprint 50: remove a human member.  Returns True if a row was deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM workspace_members "
+            "WHERE workspace_id=? AND user_id=? AND member_kind='human'",
+            (workspace_id, user_id),
+        )
+        return cur.rowcount > 0
+
     def _seed_agent_roles(self) -> None:
         """Idempotent seed of the 7-role palette. INSERT OR IGNORE so
         adding/upgrading a role's prompt requires an explicit migration
