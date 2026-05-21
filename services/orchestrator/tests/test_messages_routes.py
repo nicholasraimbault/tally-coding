@@ -188,3 +188,42 @@ def test_patch_unknown_message_returns_404(client):
     ch_id = _admin_general_channel_id(svc)
     r = client.patch(f"/channels/{ch_id}/messages/99999", json={"text": "x"})
     assert r.status_code == 404
+
+
+def test_patch_message_payload_merges_preserves_existing_keys(client):
+    """PATCH semantics: caller-supplied payload keys merge into existing payload,
+    they don't replace it entirely."""
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    # Post with extra payload keys via direct DB insert (route doesn't expose this path)
+    db = svc.state["db"]
+    db._conn.execute(
+        "INSERT INTO messages (channel_id, author_kind, author_user_id, kind, payload_json, created_at) "
+        "VALUES (?, 'human', 'admin', 'text', ?, 0)",
+        (ch_id, json.dumps({"text": "original", "trace_id": "abc123"})),
+    )
+    msg_id = db._conn.execute(
+        "SELECT id FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1", (ch_id,)
+    ).fetchone()[0]
+    # PATCH with only a new key (no text)
+    r = client.patch(
+        f"/channels/{ch_id}/messages/{msg_id}",
+        json={"payload": {"extra": "added"}},
+    )
+    assert r.status_code == 200
+    payload = json.loads(r.json()["payload_json"])
+    # Existing keys preserved
+    assert payload["text"] == "original"
+    assert payload["trace_id"] == "abc123"
+    # New key added
+    assert payload["extra"] == "added"
+
+
+def test_patch_message_empty_body_returns_400(client):
+    """PATCH with neither text nor payload returns 400 nothing-to-update."""
+    import tally_orchestrator.service as svc
+    ch_id = _admin_general_channel_id(svc)
+    r = client.post(f"/channels/{ch_id}/messages", json={"text": "x"})
+    msg_id = r.json()["id"]
+    r2 = client.patch(f"/channels/{ch_id}/messages/{msg_id}", json={})
+    assert r2.status_code == 400

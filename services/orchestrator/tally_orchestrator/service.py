@@ -5387,7 +5387,9 @@ async def patch_message(
     text = (body.text or "").strip()
     if not text and not body.payload:
         raise HTTPException(400, "nothing to update")
-    payload = dict(body.payload) if body.payload else json.loads(row[1])
+    payload = json.loads(row[1])
+    if body.payload:
+        payload.update(body.payload)
     if text:
         payload["text"] = text
     db._conn.execute(
