@@ -98,13 +98,14 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   List<Map<String, dynamic>> _scheduledChannels = const [];
   // Sprint 50 B7: custom channels loaded from the API.
   List<Map<String, dynamic>> _customChannels = const [];
-  // Sprint 54: gates the initial direct-channels fetch.  Has to move
-  // out of initState because _fetchDirectChannels reads the active
-  // workspace_id from WorkspaceContext via dependOnInheritedWidgetOfExactType,
-  // which throws when called from initState (the widget isn't fully
-  // inserted in the tree yet).  didChangeDependencies is the canonical
-  // place for inherited-widget-dependent setup.
-  bool _initialDirectChannelsFetched = false;
+  // Sprint 54: tracks which workspace's direct channels we last fetched
+  // so didChangeDependencies refetches on workspace switch.  A simple
+  // boolean flag would skip refetches after WorkspaceContext updates
+  // (user switching workspace) and leave the rail showing the old
+  // workspace's channels.  Storing the id and comparing on every
+  // didChangeDependencies call is both the initial-load gate (null !=
+  // <new id>) and the workspace-switch hook (<old id> != <new id>).
+  int? _lastFetchedDirectChannelsWorkspaceId;
 
   @override
   void initState() {
@@ -136,12 +137,17 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Sprint 54: initial direct-channels fetch needs WorkspaceContext;
-    // we read it here (post-initState, post-inherited-widget-resolution)
-    // rather than in initState where the lookup crashes. Guard with a
-    // one-shot flag so subsequent dependency changes don't re-fetch.
-    if (!_initialDirectChannelsFetched) {
-      _initialDirectChannelsFetched = true;
+    // Sprint 54: fetch direct channels here (not initState) because
+    // WorkspaceContext.of(context) crashes if called before the
+    // inherited widget tree is resolved.  Refetch whenever the active
+    // workspace_id changes (initial mount when last id is null, or
+    // user switching workspaces).  The 4-s _fetch() timer only
+    // refreshes tasks, not direct/scheduled/custom channels — so
+    // without this hook the rail would stay stale after a workspace
+    // switch.
+    final ctxId = WorkspaceContext.of(context).activeWorkspaceId;
+    if (_lastFetchedDirectChannelsWorkspaceId != ctxId) {
+      _lastFetchedDirectChannelsWorkspaceId = ctxId;
       _fetchDirectChannels();
     }
   }
