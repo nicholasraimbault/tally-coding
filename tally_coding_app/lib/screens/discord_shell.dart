@@ -222,6 +222,60 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
 
   /// Sprint 49 B7: load DM and scheduled_agent channels from the API,
   /// then check escalation status on each scheduled_agent channel.
+  /// Sprint 54+: resolve the workspace to open settings for, then push
+  /// WorkspaceSettingsScreen.  Replaces a silent-return-on-missing
+  /// handler that left the user tapping the gear icon with no
+  /// feedback when their shared_preferences.active_workspace_id
+  /// pointed at a workspace they're no longer a member of.
+  Future<void> _openSettings({bool popFirst = false}) async {
+    final wsId = WorkspaceContext.of(context).activeWorkspaceId;
+    final nav = Navigator.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    if (popFirst) nav.pop();  // close the narrow drawer first
+
+    final List<Map<String, dynamic>> myWs;
+    try {
+      myWs = await widget.client.listMyWorkspaces();
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(
+          content: Text('Could not load workspaces: $e'),
+        ));
+      }
+      return;
+    }
+    if (!mounted) return;
+    if (myWs.isEmpty) {
+      messenger.showSnackBar(const SnackBar(
+        content: Text('No workspaces available'),
+      ));
+      return;
+    }
+    // Find a match, or fall back to the first available.  Falling
+    // back is better UX than silent-failing — the user clearly wants
+    // to see settings; show them SOMETHING and surface the mismatch.
+    final mine = myWs.firstWhere(
+      (w) => w['id'] == wsId,
+      orElse: () => myWs.first,
+    );
+    if (mine['id'] != wsId) {
+      messenger.showSnackBar(SnackBar(
+        content: Text(
+          'Active workspace #$wsId not in your list — opening settings '
+          'for "${mine['name']}" instead',
+        ),
+      ));
+    }
+    nav.push(MaterialPageRoute(
+      builder: (_) => WorkspaceSettingsScreen(
+        client: widget.client,
+        workspaceId: mine['id'] as int,
+        workspaceName: mine['name'] as String? ?? '?',
+        callerRole: mine['role'] as String? ?? 'member',
+      ),
+    ));
+  }
+
   Future<void> _fetchDirectChannels() async {
     try {
       final channels = await widget.client.listChannels(
@@ -416,22 +470,12 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                         await _fetchDirectChannels();
                       }
                     },
-                    // Sprint 50 B7: open WorkspaceSettingsScreen from gear icon.
-                    onOpenSettings: () async {
-                      final wsId = WorkspaceContext.of(context).activeWorkspaceId;
-                      final nav = Navigator.of(context);
-                      final myWs = await widget.client.listMyWorkspaces();
-                      final mine = myWs.where((w) => w['id'] == wsId).cast<Map<String, dynamic>?>().firstOrNull ?? const {};
-                      if (mine.isEmpty || !mounted) return;
-                      nav.push(MaterialPageRoute(
-                        builder: (_) => WorkspaceSettingsScreen(
-                          client: widget.client,
-                          workspaceId: wsId,
-                          workspaceName: mine['name'] as String? ?? '?',
-                          callerRole: mine['role'] as String? ?? 'member',
-                        ),
-                      ));
-                    },
+                    // Sprint 50 B7 / fixed Sprint 54: gear icon opens
+                    // WorkspaceSettingsScreen via the shared _openSettings
+                    // helper, which handles the "active workspace is
+                    // stale / not in /me/workspaces" edge case the
+                    // earlier silent-return handler swallowed.
+                    onOpenSettings: _openSettings,
                   ),
                   Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   Expanded(child: _mainPane()),
@@ -553,23 +597,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             await _fetchDirectChannels();
           }
         },
-        // Sprint 50 B7: open WorkspaceSettingsScreen from narrow drawer gear.
-        onOpenSettings: () async {
-          final wsId = WorkspaceContext.of(context).activeWorkspaceId;
-          final nav = Navigator.of(context);
-          nav.pop();
-          final myWs = await widget.client.listMyWorkspaces();
-          final mine = myWs.where((w) => w['id'] == wsId).cast<Map<String, dynamic>?>().firstOrNull ?? const {};
-          if (mine.isEmpty || !mounted) return;
-          nav.push(MaterialPageRoute(
-            builder: (_) => WorkspaceSettingsScreen(
-              client: widget.client,
-              workspaceId: wsId,
-              workspaceName: mine['name'] as String? ?? '?',
-              callerRole: mine['role'] as String? ?? 'member',
-            ),
-          ));
-        },
+        // Sprint 50 B7 / fixed Sprint 54: narrow drawer gear.  Pops
+        // the drawer first, then delegates to the shared helper.
+        onOpenSettings: () => _openSettings(popFirst: true),
       ),
       body: SafeArea(
         top: false,
