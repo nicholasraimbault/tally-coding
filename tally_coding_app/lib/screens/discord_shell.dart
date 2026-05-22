@@ -258,7 +258,24 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       (w) => w['id'] == wsId,
       orElse: () => myWs.first,
     );
-    if (mine['id'] != wsId) {
+    final mineId = mine['id'] as int;
+    if (mineId != wsId) {
+      // Update WorkspaceContext so the stale id doesn't keep re-triggering
+      // the fallback on every gear tap (PR #8 review feedback #4).
+      WorkspaceContext.of(context).onChange(mineId);
+    }
+    // Push BEFORE the SnackBar so MaterialApp's ScaffoldMessenger paints
+    // the SnackBar on the destination screen's Scaffold (where the user
+    // is looking) instead of behind the new route (PR #8 review feedback #3).
+    nav.push(MaterialPageRoute(
+      builder: (_) => WorkspaceSettingsScreen(
+        client: widget.client,
+        workspaceId: mineId,
+        workspaceName: mine['name'] as String? ?? '?',
+        callerRole: mine['role'] as String? ?? 'member',
+      ),
+    ));
+    if (mineId != wsId) {
       messenger.showSnackBar(SnackBar(
         content: Text(
           'Active workspace #$wsId not in your list — opening settings '
@@ -266,14 +283,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ),
       ));
     }
-    nav.push(MaterialPageRoute(
-      builder: (_) => WorkspaceSettingsScreen(
-        client: widget.client,
-        workspaceId: mine['id'] as int,
-        workspaceName: mine['name'] as String? ?? '?',
-        callerRole: mine['role'] as String? ?? 'member',
-      ),
-    ));
   }
 
   Future<void> _fetchDirectChannels() async {
