@@ -98,6 +98,14 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   List<Map<String, dynamic>> _scheduledChannels = const [];
   // Sprint 50 B7: custom channels loaded from the API.
   List<Map<String, dynamic>> _customChannels = const [];
+  // Sprint 54: tracks which workspace's direct channels we last fetched
+  // so didChangeDependencies refetches on workspace switch.  A simple
+  // boolean flag would skip refetches after WorkspaceContext updates
+  // (user switching workspace) and leave the rail showing the old
+  // workspace's channels.  Storing the id and comparing on every
+  // didChangeDependencies call is both the initial-load gate (null !=
+  // <new id>) and the workspace-switch hook (<old id> != <new id>).
+  int? _lastFetchedDirectChannelsWorkspaceId;
 
   @override
   void initState() {
@@ -106,7 +114,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ? TaskSelected(widget.initialTaskId!)
         : const GeneralSelected();
     _fetch();
-    _fetchDirectChannels();
+    // _fetchDirectChannels intentionally NOT called here — see
+    // didChangeDependencies. Reading WorkspaceContext from initState
+    // crashes because inherited widgets aren't yet resolved.
     _pollHealth();
     _refresh = Timer.periodic(const Duration(seconds: 4), (_) => _fetch());
     _healthRefresh = Timer.periodic(
@@ -115,6 +125,31 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         if (_poolReady != true) _pollHealth();
       },
     );
+    // Sprint 54: subscribe to channel-created WS events so the rail
+    // refreshes the moment a new channel is created (by another
+    // device, by the API, or by the user's own action processed on
+    // a different replica) — without waiting for the 4-s _fetch poll.
+    widget.wsClient.onChannelCreated = (_, __) {
+      if (mounted) _fetchDirectChannels();
+    };
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Sprint 54: fetch direct channels here (not initState) because
+    // WorkspaceContext.of(context) crashes if called before the
+    // inherited widget tree is resolved.  Refetch whenever the active
+    // workspace_id changes (initial mount when last id is null, or
+    // user switching workspaces).  The 4-s _fetch() timer only
+    // refreshes tasks, not direct/scheduled/custom channels — so
+    // without this hook the rail would stay stale after a workspace
+    // switch.
+    final ctxId = WorkspaceContext.of(context).activeWorkspaceId;
+    if (_lastFetchedDirectChannelsWorkspaceId != ctxId) {
+      _lastFetchedDirectChannelsWorkspaceId = ctxId;
+      _fetchDirectChannels();
+    }
   }
 
   @override

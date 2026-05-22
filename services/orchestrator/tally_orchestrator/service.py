@@ -85,6 +85,13 @@ _CLERK_VALIDATE_TIMEOUT = httpx.Timeout(5.0)
 # fullmatch anchors both ends — match() alone would pass `user_x/../foo`.
 _CLERK_USER_ID_PATTERN = re.compile(r"user_[A-Za-z0-9]+")
 
+# Sprint 53: pool circuit-breaker threshold (seconds).  Read once at module
+# load — the env var is set at process start and shouldn't drift between
+# the lifespan's bootstrap loop and the /health endpoint that both
+# consult it.  30 min default absorbs the worst-case bootstrap cadence
+# (60s + 300s + 900s ≈ 25 min) so cold-starts don't trip it.
+POOL_CIRCUIT_BREAKER_SECONDS = float(os.environ.get("POOL_CIRCUIT_BREAKER_SECONDS", "1800"))
+
 # Sprint 48: task lifecycle statuses
 TASK_STATUS_TERMINAL: frozenset[str] = frozenset({
     "completed", "failed", "aborted",
@@ -4922,19 +4929,25 @@ async def lifespan(app: FastAPI):
         "first_failure_ts": None,
         "circuit_open_logged": False,
     }
-    # Threshold (seconds) at which a sustained failure becomes a
-    # circuit-open event. 30 min default absorbs the worst-case bootstrap
-    # cadence (attempt 1: 60s + attempt 2: 300s + attempt 3: 900s
-    # ≈ 25 min) so cold-starts don't trip it. Tunable per deploy via env.
-    _circuit_breaker_threshold_s = float(os.environ.get("POOL_CIRCUIT_BREAKER_SECONDS", "1800"))
     # Sprint 53: optional channel for orchestrator self-reports.  When set,
     # the bootstrap loop posts text messages to this channel on
     # state-change events (circuit-open transition + recovery).  Posts
     # are best-effort: a failure to write to the ops channel must not
     # break the bootstrap loop itself.  Empty/unset = silent (same
     # pre-Sprint-53 behavior).
-    _ops_channel_id_str = os.environ.get("OPS_CHANNEL_ID", "").strip()
-    _ops_channel_id: int | None = int(_ops_channel_id_str) if _ops_channel_id_str.isdigit() else None
+    _ops_channel_id_raw = os.environ.get("OPS_CHANNEL_ID", "").strip()
+    if _ops_channel_id_raw:
+        try:
+            _ops_channel_id: int | None = int(_ops_channel_id_raw)
+        except ValueError:
+            logger.warning(
+                "OPS_CHANNEL_ID is set but not parseable as int (%r); "
+                "self-report posts disabled",
+                _ops_channel_id_raw,
+            )
+            _ops_channel_id = None
+    else:
+        _ops_channel_id = None
 
     def _post_to_ops_channel(text: str) -> None:
         """Sprint 53: best-effort message post to the ops channel.
@@ -4973,12 +4986,12 @@ async def lifespan(app: FastAPI):
         if ps["first_failure_ts"] is None:
             ps["first_failure_ts"] = time.time()
         elapsed = time.time() - ps["first_failure_ts"]
-        if elapsed > _circuit_breaker_threshold_s and not ps["circuit_open_logged"]:
+        if elapsed > POOL_CIRCUIT_BREAKER_SECONDS and not ps["circuit_open_logged"]:
             logger.error(
                 "POOL CIRCUIT BREAKER OPEN: pool has been unhealthy for "
                 "%ds (threshold=%ds). Bootstrap is still retrying; external "
                 "monitors should be alerting now.",
-                int(elapsed), int(_circuit_breaker_threshold_s),
+                int(elapsed), int(POOL_CIRCUIT_BREAKER_SECONDS),
             )
             ps["circuit_open_logged"] = True
             _post_to_ops_channel(
@@ -5310,8 +5323,7 @@ async def health() -> dict:
         unhealthy_since = int(time.time() - first_failure_ts)
     else:
         unhealthy_since = None
-    threshold = float(os.environ.get("POOL_CIRCUIT_BREAKER_SECONDS", "1800"))
-    circuit_open = unhealthy_since is not None and unhealthy_since > threshold
+    circuit_open = unhealthy_since is not None and unhealthy_since > POOL_CIRCUIT_BREAKER_SECONDS
     return {
         "status": "ok",
         "pool_ready": bool(state.get("pool_ready")),
@@ -7142,6 +7154,12 @@ async def create_custom_channel_route(
                      payload={"channel_id": ch_id, "kind": "custom", "name": name})
     except Exception as exc:
         logger.warning("audit_log channel_created failed: %s", exc)
+    # Sprint 54: real-time push to channel members so the rail updates
+    # without waiting for the 4-second polling refresh.  Best-effort:
+    # WS broadcast failure must not break channel creation itself.
+    t = asyncio.create_task(_broadcast_new_channel(ch_id, body.workspace_id))
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
     from .channels import resolve_channel
     return resolve_channel(db, ch_id)
 
@@ -7484,6 +7502,45 @@ async def patch_message(
         "kind": new_row[5], "payload_json": new_row[6], "reply_to_id": new_row[7],
         "created_at": new_row[8], "edited_at": new_row[9],
     }
+
+
+async def _broadcast_new_channel(channel_id: int, workspace_id: int) -> None:
+    """Sprint 54: send new_channel events to every WebSocket subscribed
+    to the user's notification feed where the user is a member of the
+    newly-created channel.  Mirrors _broadcast_new_message but for
+    channel creation; the client's NotificationsWsClient routes the event
+    to its onChannelCreated callback so the channel rail can refresh
+    without waiting for the 4-second polling interval.
+
+    Why this is a separate helper: channel creation needs a different
+    membership lookup (the channel was just created, we resolve its
+    initial member set) and a different frame type so the client can
+    branch on event type cleanly.
+
+    Frame shape:
+        {"type": "new_channel", "channel_id": int, "workspace_id": int}
+    """
+    from .notifications import _ACTIVE_WS
+    db: Db = state["db"]
+    members = db._conn.execute(
+        "SELECT DISTINCT user_id FROM channel_members "
+        "WHERE channel_id=? AND user_id IS NOT NULL",
+        (channel_id,),
+    ).fetchall()
+    user_ids = {m[0] for m in members}
+    for user_id in user_ids:
+        sockets = list(_ACTIVE_WS.get(user_id) or [])
+        for ws in sockets:
+            try:
+                await ws.send_json({
+                    "type": "new_channel",
+                    "channel_id": channel_id,
+                    "workspace_id": workspace_id,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "ws send_new_channel failed for user=%s: %s", user_id, exc
+                )
 
 
 async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
