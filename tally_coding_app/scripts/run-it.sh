@@ -37,12 +37,25 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
 fi
 
 run_flutter_test() {
+  # Optional: extract the orchestrator's admin token from .env.prod so
+  # integration tests that need real auth can pass it via --dart-define.
+  # If .env.prod isn't present (CI without secrets) we skip the define,
+  # and live tests will see an empty token + mark themselves skipped.
+  local ENV_PROD="$REPO_ROOT/../services/orchestrator/.env.prod"
+  local DART_DEFINES=()
+  if [[ -r "$ENV_PROD" ]]; then
+    local TOKEN
+    TOKEN="$(grep '^TALLY_API_TOKEN=' "$ENV_PROD" | head -1 | cut -d= -f2- | tr -d '"')"
+    if [[ -n "$TOKEN" ]]; then
+      DART_DEFINES+=("--dart-define" "TALLY_TEST_ADMIN_TOKEN=$TOKEN")
+    fi
+  fi
   echo "[run-it] flutter test ${ARGS[*]} -d linux  (DISPLAY=$DISPLAY)"
   # LIBGL_ALWAYS_SOFTWARE forces Mesa's llvmpipe so we don't need a real
   # GPU under Xvfb.  dbus-run-session provides the session bus that
   # Clerk / app_links / shared_preferences expect.
   LIBGL_ALWAYS_SOFTWARE=1 \
-  dbus-run-session -- "$FLUTTER" test "${ARGS[@]}" -d linux
+  dbus-run-session -- "$FLUTTER" test "${ARGS[@]}" -d linux "${DART_DEFINES[@]}"
 }
 
 if [[ "$USE_XVFB" == 1 ]] && command -v Xvfb >/dev/null 2>&1; then
