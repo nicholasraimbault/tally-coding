@@ -53,6 +53,15 @@ void main() {
         markTestSkipped('TALLY_TEST_ADMIN_TOKEN dart-define not set');
         return;
       }
+      // Force the wide-layout breakpoint so the channel rail renders
+      // inline (not inside a Drawer that's offstage until opened).
+      // 1280x800 is comfortably above the 1100 narrow breakpoint.
+      tester.view.physicalSize = const Size(2560, 1600);
+      tester.view.devicePixelRatio = 2.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
 
       final baseUri = Uri.parse(_kOrchUrl);
       final client = TallyOrchClient(
@@ -71,6 +80,11 @@ void main() {
       // Connect the WebSocket BEFORE creating the channel so that any
       // real-time event the server pushes would be received.
       await ws.connect();
+      // Give the WS handshake real wall-clock time to complete before
+      // we start firing actions that would generate events.
+      await tester.runAsync(() => Future<void>.delayed(
+        const Duration(seconds: 2),
+      ));
 
       await tester.pumpWidget(MaterialApp(
         home: WorkspaceContext(
@@ -106,22 +120,35 @@ void main() {
       final channelId = (jsonDecode(createResp.body) as Map)['id'] as int;
 
       try {
-        // Wait LESS than DiscordShellScreen's 4-s poll interval so we're
-        // testing the real-time WebSocket path, not the polling fallback.
-        // If WS propagation works, the channel should appear in well
-        // under 2 s; if only polling works, it'd appear at ~4 s.
-        for (var i = 0; i < 4; i++) {
-          await tester.pump(const Duration(milliseconds: 400));
+        // Poll the widget tree up to 4 s, breaking out the moment the
+        // channel shows up.  We can't use pumpAndSettle (continuous
+        // timers in DiscordShellScreen never settle) and a fixed-duration
+        // pump risks racing against real WS arrival time.  runAsync gives
+        // the stream subscribers real wall-clock to process the event.
+        var found = false;
+        for (var i = 0; i < 20; i++) {
+          await tester.runAsync(() => Future<void>.delayed(
+            const Duration(milliseconds: 200),
+          ));
+          await tester.pump();
+          // skipOffstage: false so we find the channel even if the
+          // rail's ListView has scrolled past it (the new channel
+          // appears at the top but may be below the viewport when
+          // the column is short).
+          if (find
+              .textContaining(channelName,
+                  findRichText: true, skipOffstage: false)
+              .evaluate()
+              .isNotEmpty) {
+            found = true;
+            break;
+          }
         }
 
-        // EXPECTED TO FAIL on current main: orchestrator doesn't
-        // broadcast channel-created events, so the rail stays stale
-        // until the 4-s poll refreshes it.
-        expect(
-          find.textContaining(channelName, findRichText: true),
-          findsAtLeast(1),
-          reason: 'channel "$channelName" should appear in rail via WS push',
-        );
+        expect(found, isTrue,
+            reason:
+                'channel "$channelName" should appear in rail via WS push '
+                'within 4 s of POST /channels');
       } finally {
         // Cleanup: archive the test channel so the workspace doesn't
         // accumulate sync-it-* clutter across runs.
@@ -136,10 +163,12 @@ void main() {
         ws.dispose();
       }
     },
-    // Locked-in regression for the channel-sync bug — orchestrator has no
-    // _broadcast_new_channel helper, so this test FAILS on current main.
-    // Remove `skip: true` when the WS broadcast lands so the test guards
-    // against regression going forward.
-    skip: true,
+    // Live regression — guards against the channel-sync bug we found
+    // while building the test loop.  Orchestrator broadcasts
+    // new_channel WS events from POST /channels (Sprint 54 +
+    // _broadcast_new_channel); the Flutter client subscribes via
+    // NotificationsWsClient.onChannelCreated and DiscordShellScreen
+    // re-fetches its rail.  If a future change drops the broadcast or
+    // the subscription, this test fails.
   );
 }

@@ -31,8 +31,8 @@ RUN maturin build --release --features python --compatibility linux -o /wheels
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source=https://github.com/nicholasraimbault/tally-coding
-LABEL org.opencontainers.image.version=v37
-LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 53: nit cleanup — single-read threshold + warn on bad OPS_CHANNEL_ID)"
+LABEL org.opencontainers.image.version=v38
+LABEL org.opencontainers.image.description="Tally Coding orchestrator (Sprint 54: broadcast new_channel WS events on POST /channels)"
 
 WORKDIR /app
 

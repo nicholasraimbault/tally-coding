@@ -30,6 +30,14 @@ class NotificationsWsClient {
   /// callers can fetch or refresh the relevant message without polling.
   void Function(int channelId, int messageId)? onNewMessage;
 
+  /// Sprint 54: called when a `new_channel` event arrives on the WS.
+  /// Fires after the orchestrator's POST /channels has broadcast a
+  /// channel-created event to every member.  The handler can refetch
+  /// the channel list (or, if it wants to avoid the GET round-trip,
+  /// look up the single channel by id).  Provides [channelId] and
+  /// [workspaceId] from the server frame.
+  void Function(int channelId, int workspaceId)? onChannelCreated;
+
   NotificationsWsClient({
     required this.api,
     required this.wsUrl,
@@ -74,6 +82,10 @@ class NotificationsWsClient {
     if (type == 'hello' || type == 'pong') return;
     if (type == 'new_message') {
       onNewMessage?.call(msg['channel_id'] as int, msg['message_id'] as int);
+      return;
+    }
+    if (type == 'new_channel') {
+      onChannelCreated?.call(msg['channel_id'] as int, msg['workspace_id'] as int);
       return;
     }
     if (type == 'new_notification') {

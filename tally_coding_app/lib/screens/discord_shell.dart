@@ -98,6 +98,13 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   List<Map<String, dynamic>> _scheduledChannels = const [];
   // Sprint 50 B7: custom channels loaded from the API.
   List<Map<String, dynamic>> _customChannels = const [];
+  // Sprint 54: gates the initial direct-channels fetch.  Has to move
+  // out of initState because _fetchDirectChannels reads the active
+  // workspace_id from WorkspaceContext via dependOnInheritedWidgetOfExactType,
+  // which throws when called from initState (the widget isn't fully
+  // inserted in the tree yet).  didChangeDependencies is the canonical
+  // place for inherited-widget-dependent setup.
+  bool _initialDirectChannelsFetched = false;
 
   @override
   void initState() {
@@ -106,7 +113,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ? TaskSelected(widget.initialTaskId!)
         : const GeneralSelected();
     _fetch();
-    _fetchDirectChannels();
+    // _fetchDirectChannels intentionally NOT called here — see
+    // didChangeDependencies. Reading WorkspaceContext from initState
+    // crashes because inherited widgets aren't yet resolved.
     _pollHealth();
     _refresh = Timer.periodic(const Duration(seconds: 4), (_) => _fetch());
     _healthRefresh = Timer.periodic(
@@ -115,6 +124,26 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         if (_poolReady != true) _pollHealth();
       },
     );
+    // Sprint 54: subscribe to channel-created WS events so the rail
+    // refreshes the moment a new channel is created (by another
+    // device, by the API, or by the user's own action processed on
+    // a different replica) — without waiting for the 4-s _fetch poll.
+    widget.wsClient.onChannelCreated = (_, __) {
+      if (mounted) _fetchDirectChannels();
+    };
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Sprint 54: initial direct-channels fetch needs WorkspaceContext;
+    // we read it here (post-initState, post-inherited-widget-resolution)
+    // rather than in initState where the lookup crashes. Guard with a
+    // one-shot flag so subsequent dependency changes don't re-fetch.
+    if (!_initialDirectChannelsFetched) {
+      _initialDirectChannelsFetched = true;
+      _fetchDirectChannels();
+    }
   }
 
   @override
