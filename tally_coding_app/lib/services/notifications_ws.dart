@@ -20,6 +20,14 @@ class NotificationsWsClient {
   Timer? _reconnect;
   StreamSubscription? _sub;
   int _backoffSeconds = 1;
+  // Sprint 54+: consecutive connect failures, used to suppress log spam
+  // during Android's cold-start DNS race.  The first 1-2 connect
+  // attempts after app launch routinely fail with "Failed host lookup"
+  // before the OS resolver is ready for the new process; logging those
+  // floods logcat with what looks like a serious error.  Only emit the
+  // log line after 3+ consecutive failures (a real network outage, not
+  // startup transient).  Resets to 0 on every successful connect.
+  int _consecutiveFailures = 0;
 
   /// Called for every fully-fetched notification payload (after the
   /// REST fetch completes). Callers can set this to update UI state.
@@ -53,13 +61,25 @@ class NotificationsWsClient {
     final uri = wsUrl.replace(queryParameters: {'token': token});
     try {
       _channel = WebSocketChannel.connect(uri);
+      // Await `.ready` so the underlying DNS/TLS handshake errors
+      // surface here as catchable exceptions instead of escaping as
+      // unhandled async errors (the source of the "Failed host lookup"
+      // logcat spam on Android cold-start).
+      await _channel!.ready;
       _sub = _channel!.stream.listen(
         _handleMessage,
         onError: (_) => _scheduleReconnect(),
         onDone: _scheduleReconnect,
       );
       _backoffSeconds = 1; // reset on successful connect
-    } catch (_) {
+      _consecutiveFailures = 0;
+    } catch (e) {
+      _consecutiveFailures++;
+      if (_consecutiveFailures > 3) {
+        // ignore: avoid_print
+        print('[notifications_ws] connect failed '
+            '(attempt $_consecutiveFailures): $e');
+      }
       _scheduleReconnect();
     }
   }
