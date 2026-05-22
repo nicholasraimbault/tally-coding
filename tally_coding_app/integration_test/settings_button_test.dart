@@ -177,6 +177,14 @@ void main() {
       // settings screen AND the explanatory SnackBar should be present.
       expect(find.byType(WorkspaceSettingsScreen), findsOneWidget,
           reason: 'falls back to first workspace + opens its settings');
+      // Strengthen vs. PR #8 review feedback #5 — verify the screen
+      // opened for the FALLBACK workspace, not just any settings.
+      final settings = tester.widget<WorkspaceSettingsScreen>(
+          find.byType(WorkspaceSettingsScreen));
+      expect(settings.workspaceId, 1,
+          reason: 'fallback target = first id in /me/workspaces (1)');
+      expect(settings.workspaceName, 'admin',
+          reason: 'fallback target name matches fixture');
       expect(
         find.textContaining('not in your list'),
         findsOneWidget,

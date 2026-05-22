@@ -116,6 +116,24 @@ def main() -> None:
         lines += ["", "# Preserved from prior .env.prod (operator-set):"]
         for k, v in passthrough:
             lines.append(f"{k}={v}")
+
+    # Safety check (PR #8 review feedback): detect any key in the prior
+    # .env.prod that would NOT appear in the new write.  In the current
+    # logic, every non-managed key flows through passthrough, so the
+    # diff should always be empty — but a future refactor could
+    # regress, and that regression would silently take down prod (as
+    # the original Sprint 26 version did).  Refuse to write unless
+    # --force is passed, so the operator sees the drop in their
+    # terminal before they redeploy.
+    all_writes = managed_keys | {k for k, _ in passthrough}
+    dropped = set(existing.keys()) - all_writes
+    if dropped and "--force" not in sys.argv:
+        raise SystemExit(
+            f"refusing to drop {sorted(dropped)} from {ENV_OUT_PATH}. "
+            f"re-run with --force to confirm, or fix the seed script "
+            f"to add these keys to managed_keys / passthrough."
+        )
+
     ENV_OUT_PATH.write_text("\n".join(lines) + "\n")
     os.chmod(ENV_OUT_PATH, 0o600)
     print(f">>> Wrote {ENV_OUT_PATH} (mode 600).")
