@@ -102,6 +102,71 @@ class PlanningCard extends StatelessWidget {
   }
 }
 
+/// Card for tasks workers are actively executing.
+/// Shows agent avatars + ETA + progress bar.
+class RunningTaskCard extends StatelessWidget {
+  final String title;
+  final List<AgentRole> agents;
+  final double progress;
+  final String? eta;
+  final VoidCallback? onTap;
+
+  const RunningTaskCard({
+    super.key,
+    required this.title,
+    required this.agents,
+    required this.progress,
+    this.eta,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    return BrutalCard(
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: tc.fg,
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              height: 1.3,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Wrap(
+                spacing: 4,
+                children: [
+                  for (final role in agents) AgentAvatar(role: role, size: 20),
+                ],
+              ),
+              if (eta != null)
+                Text(
+                  eta!,
+                  style: TextStyle(
+                    color: tc.fgDim,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          BrutalProgressBar(value: progress),
+        ],
+      ),
+    );
+  }
+}
+
 /// Inline ghost row at the bottom of every kanban column.
 /// Notion mobile pattern: transparent bg, square corners, "+ New task" label.
 class NewTaskRow extends StatefulWidget {

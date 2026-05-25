@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tally_coding_app/theme/theme.dart';
+import 'package:tally_coding_app/widgets/brutal/brutal.dart';
 import 'package:tally_coding_app/widgets/kanban/kanban_cards.dart';
 
 Widget _wrap(Widget child) {
@@ -79,6 +80,70 @@ void main() {
         PlanningCard(title: 't', onTap: () => taps++),
       ));
       await tester.tap(find.byType(PlanningCard));
+      expect(taps, 1);
+    });
+  });
+
+  group('RunningTaskCard', () {
+    testWidgets('renders title', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const RunningTaskCard(
+          title: 'Build email digest worker',
+          agents: [AgentRole.coder],
+          progress: 0.3,
+        ),
+      ));
+      expect(find.text('Build email digest worker'), findsOneWidget);
+    });
+
+    testWidgets('renders agent avatars (coder + tester)', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const RunningTaskCard(
+          title: 't',
+          agents: [AgentRole.coder, AgentRole.tester],
+          progress: 0.5,
+        ),
+      ));
+      expect(find.text('C'), findsOneWidget); // coder monogram
+      expect(find.text('T'), findsOneWidget); // tester monogram
+    });
+
+    testWidgets('renders progress bar', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const RunningTaskCard(
+          title: 't',
+          agents: [AgentRole.coder],
+          progress: 0.6,
+        ),
+      ));
+      expect(find.byType(BrutalProgressBar), findsOneWidget);
+      final bar = tester.widget<BrutalProgressBar>(find.byType(BrutalProgressBar));
+      expect(bar.value, 0.6);
+    });
+
+    testWidgets('renders eta text if provided', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const RunningTaskCard(
+          title: 't',
+          agents: [AgentRole.coder],
+          progress: 0.5,
+          eta: '~5m',
+        ),
+      ));
+      expect(find.text('~5m'), findsOneWidget);
+    });
+
+    testWidgets('invokes onTap when tapped', (tester) async {
+      int taps = 0;
+      await tester.pumpWidget(_wrap(
+        RunningTaskCard(
+          title: 't',
+          agents: const [AgentRole.coder],
+          progress: 0.5,
+          onTap: () => taps++,
+        ),
+      ));
+      await tester.tap(find.byType(RunningTaskCard));
       expect(taps, 1);
     });
   });
