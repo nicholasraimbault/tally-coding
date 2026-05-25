@@ -509,6 +509,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       GeneralSelected() => '#general',
       TaskSelected(taskId: final id) => '#${id.substring(0, 8)}',
       DirectChannelSelected(channelName: final name) => '#$name',
+      BoardSelected() => 'Board',
     };
     return Scaffold(
       backgroundColor: const Color(0xFF313338),
@@ -1135,6 +1136,7 @@ class _MembersPanel extends StatelessWidget {
                 GeneralSelected() => 'MEMBERS',
                 TaskSelected() => 'AGENTS',
                 DirectChannelSelected() => 'MEMBERS',
+                BoardSelected() => 'MEMBERS',
               },
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
                     color: const Color(0xFF8E9297),
@@ -1151,7 +1153,10 @@ class _MembersPanel extends StatelessWidget {
 
   Widget _body(BuildContext context) {
     // Sprint 49 B7: DM / scheduled_agent channels don't have agent rosters.
-    if (selected is GeneralSelected || selected is DirectChannelSelected) {
+    // BoardSelected also has no task-specific roster.
+    if (selected is GeneralSelected ||
+        selected is DirectChannelSelected ||
+        selected is BoardSelected) {
       return ListView(
         controller: scrollController,
         children: const [
