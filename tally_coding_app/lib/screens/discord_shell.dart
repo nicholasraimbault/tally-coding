@@ -878,9 +878,6 @@ class _ChannelList extends StatelessWidget {
         ..._customChannelItems(context, customChannels),
         _NewTile(label: '+ New channel', onTap: onNewChannel),
         const SizedBox(height: 12),
-        _categoryHeader(context, 'TASKS'),
-        ..._taskItems(context),
-        const SizedBox(height: 12),
         // Sprint 49 B7: Scheduled channels from API + new-scheduled CTA.
         _categoryHeader(context, 'SCHEDULED'),
         ..._directChannelItems(context, scheduledChannels),
@@ -961,57 +958,6 @@ class _ChannelList extends StatelessWidget {
     );
   }
 
-  List<Widget> _taskItems(BuildContext context) {
-    if (error != null && tasks.isEmpty) {
-      return [
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              const Icon(Icons.cloud_off, color: Color(0xFF99AAB5)),
-              const SizedBox(height: 8),
-              Text(error!, style: const TextStyle(color: Color(0xFF99AAB5), fontSize: 11)),
-              const SizedBox(height: 8),
-              OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
-            ],
-          ),
-        ),
-      ];
-    }
-    if (tasks.isEmpty) {
-      return const [
-        Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            'No tasks yet.\nType in #general to start one.',
-            style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
-          ),
-        ),
-      ];
-    }
-    return [
-      for (final t in tasks)
-        _ChannelTile(
-          icon: _statusGlyph(t.status),
-          label: t.channelTitle,
-          subtitle: '#${t.id.substring(0, 8)} · ${t.status}',
-          selected: selected is TaskSelected && (selected as TaskSelected).taskId == t.id,
-          onTap: () => onSelect(TaskSelected(t.id)),
-        ),
-    ];
-  }
-
-  Widget _statusGlyph(String status) {
-    final (icon, color) = switch (status) {
-      'running' => (Icons.play_arrow, Color(0xFF5865F2)),
-      'pending' => (Icons.schedule, Color(0xFFFEE75C)),
-      'recovering' => (Icons.refresh, Color(0xFFFAA61A)),
-      'completed' => (Icons.check_circle, Color(0xFF57F287)),
-      'failed' => (Icons.error, Color(0xFFED4245)),
-      _ => (Icons.tag, Color(0xFF8E9297)),
-    };
-    return Icon(icon, color: color, size: 14);
-  }
 }
 
 /// A tappable "+ New" row shown at the bottom of each category section.
