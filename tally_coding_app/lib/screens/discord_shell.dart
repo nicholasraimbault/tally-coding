@@ -31,6 +31,7 @@ import 'persistent_agents.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
+import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
 import '../widgets/server_rail.dart';
@@ -690,7 +691,18 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           directChannelId: cid,
           channelTitle: name,
         ),
+      BoardSelected() => KanbanView(
+          tasks: _filteredTasksForKanban(),
+          onTaskTap: (task) => setState(() => _selected = TaskSelected(task.id)),
+          onNewTask: () => setState(() => _selected = const GeneralSelected()),
+        ),
     };
+  }
+
+  /// Returns tasks filtered to the active project, or all tasks if none selected.
+  List<Task> _filteredTasksForKanban() {
+    if (_activeProjectId == null) return _tasks;
+    return _tasks.where((t) => t.projectId == _activeProjectId).toList();
   }
 }
 
