@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:tally_coding_app/api.dart';
-import 'package:tally_coding_app/widgets/brutal/brutal.dart';
 import 'package:tally_coding_app/widgets/kanban/kanban_cards.dart';
 import 'package:tally_coding_app/widgets/kanban/kanban_column.dart';
 import 'package:tally_coding_app/widgets/kanban/task_status.dart';
@@ -35,7 +34,7 @@ class KanbanView extends StatelessWidget {
 
   Widget _cardForTask(BuildContext context, Task task) {
     final column = mapTaskToColumn(task);
-    final tap = () => onTaskTap(task);
+    void tap() => onTaskTap(task);
     final title = task.channelTitle;
     switch (column) {
       case TaskColumn.toDo:
@@ -70,8 +69,8 @@ class KanbanView extends StatelessWidget {
         KanbanColumn(
           label: _columnLabel(col),
           count: grouped[col]!.length,
-          children: [for (final t in grouped[col]!) _cardForTask(context, t)],
           onNewTask: onNewTask,
+          children: [for (final t in grouped[col]!) _cardForTask(context, t)],
         ),
     ];
   }

@@ -487,7 +487,8 @@ The locked design (v17) drove the Claude Design iteration. Claude Design mockups
 - [x] `writing-plans` skill invoked for the first sub-project (B). Sub-project B was decomposed into B1-B5 sub-plans (B is too large for a single plan).
 - [x] Sub-project B1 (design system + theme picker) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b1-design-system-and-theme-picker.md`
 - [x] Sub-project B1 (design system + theme picker) implemented: 22 tasks shipped, 151 tests passing, brutal terminal widget primitives + 28-theme picker + ThemeController + main.dart wiring + Settings → Appearance section all landed. Subsequent screens (`discord_shell.dart`, `general_channel.dart`, `task_channel.dart`, etc.) still use pre-B1 styling — those refactor under B2/B3/B5 (not yet planned).
-- [ ] Sub-project B2 (5-column kanban + inline +New + tap-to-open) plan written.
+- [x] Sub-project B2 (kanban refactor) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b2-kanban-refactor.md`
+- [x] Sub-project B2 implemented: KanbanView replaces the rail's TASKS section; 5 columns (To do · Planning · Running · Awaiting · Done) with mobile horizontal scroll + desktop side-by-side; inline +New task forwards to #general for goal entry; tap-card-to-open-task-channel works. Rail's other sections (#general, CHANNELS, SCHEDULED, DMs) stay until B3 retires the rail.
 - [ ] Sub-project B3 (mini dash + escalation flow + channels sheet) plan written.
-- [ ] Sub-project B4 (push notifications + Tally narrator) plan written.
-- [ ] Sub-project B5 (desktop sidebar variants) plan written.
+- [x] Sub-project B4 (push notifications + Tally narrator) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b4-push-narrator.md`
+- [x] Sub-project B5 (desktop sidebar variants) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b5-desktop-sidebar.md`

@@ -16,7 +16,7 @@ Task _t({String id = 't', String status = 'running', String desc = 'task',
   });
 }
 
-Widget _wrap(Widget child, {double width = 400}) {
+Widget _wrap(Widget child) {
   final tokens = themeCatalog[defaultThemeSlug]!.tokens;
   return MaterialApp(
     theme: themeFromTokens(tokens),
