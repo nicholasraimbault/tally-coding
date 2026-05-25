@@ -48,4 +48,24 @@ void main() {
     final decoration = outermost.decoration as BoxDecoration;
     expect(decoration.borderRadius, BorderRadius.zero);
   });
+
+  testWidgets('BrutalButton renders at 50% opacity when onPressed is null', (tester) async {
+    await tester.pumpWidget(
+      wrap(const BrutalButton.primary(label: 'disabled', onPressed: null)),
+    );
+    final opacity = tester.widget<Opacity>(
+      find.descendant(of: find.byType(BrutalButton), matching: find.byType(Opacity)),
+    );
+    expect(opacity.opacity, 0.5);
+  });
+
+  testWidgets('BrutalButton renders without Opacity wrapper when enabled', (tester) async {
+    await tester.pumpWidget(
+      wrap(BrutalButton.primary(label: 'enabled', onPressed: () {})),
+    );
+    expect(
+      find.descendant(of: find.byType(BrutalButton), matching: find.byType(Opacity)),
+      findsNothing,
+    );
+  });
 }
