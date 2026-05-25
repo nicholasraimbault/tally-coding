@@ -5,12 +5,14 @@ import 'package:clerk_auth/clerk_auth.dart' as clerk;
 import 'package:clerk_flutter/clerk_flutter.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'screens/discord_shell.dart';
 import 'services/notifications_ws.dart';
 import 'state/workspace_context.dart';
+import 'theme/theme.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
@@ -43,8 +45,16 @@ const _kOrchestratorUrl = String.fromEnvironment(
 );
 
 Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   await clerk.setUpLogging(printer: const _LogPrinter());
-  runApp(const TallyApp());
+  final themeController = ThemeController();
+  await themeController.load();
+  runApp(
+    ChangeNotifierProvider.value(
+      value: themeController,
+      child: const TallyApp(),
+    ),
+  );
 }
 
 class TallyApp extends StatelessWidget {
@@ -84,15 +94,13 @@ class TallyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = ThemeData(
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: const Color(0xFF7C5CFC),
-        brightness: Brightness.dark,
-        surface: const Color(0xFF313338),
-      ),
-      scaffoldBackgroundColor: const Color(0xFF1E1F22),
-      useMaterial3: true,
-      extensions: [ClerkThemeExtension.dark],
+    final controller = context.watch<ThemeController>();
+    final baseTheme = themeFromTokens(controller.activeEntry.tokens);
+    final theme = baseTheme.copyWith(
+      extensions: [
+        ...baseTheme.extensions.values,
+        ClerkThemeExtension.dark,
+      ],
     );
     return ClerkAuth(
       config: ClerkAuthConfig(
