@@ -147,4 +147,36 @@ void main() {
       expect(taps, 1);
     });
   });
+
+  group('AwaitingCard', () {
+    testWidgets('renders title', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const AwaitingCard(
+          title: 'Wire up Stripe webhooks',
+          action: 'Review PR',
+        ),
+      ));
+      expect(find.text('Wire up Stripe webhooks'), findsOneWidget);
+    });
+
+    testWidgets('renders action pill', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const AwaitingCard(title: 't', action: 'Review PR'),
+      ));
+      expect(find.text('REVIEW PR'), findsOneWidget); // BrutalPill uppercase
+    });
+
+    testWidgets('invokes onTap when tapped', (tester) async {
+      int taps = 0;
+      await tester.pumpWidget(_wrap(
+        AwaitingCard(
+          title: 't',
+          action: 'review',
+          onTap: () => taps++,
+        ),
+      ));
+      await tester.tap(find.byType(AwaitingCard));
+      expect(taps, 1);
+    });
+  });
 }

@@ -167,6 +167,46 @@ class RunningTaskCard extends StatelessWidget {
   }
 }
 
+/// Card for tasks waiting on user input (paused agents).
+/// Amber-tinted via tc.red token + action pill.
+class AwaitingCard extends StatelessWidget {
+  final String title;
+  final String action;
+  final VoidCallback? onTap;
+
+  const AwaitingCard({
+    super.key,
+    required this.title,
+    required this.action,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    return BrutalCard(
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: tc.fg,
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              height: 1.3,
+            ),
+          ),
+          const SizedBox(height: 10),
+          BrutalPill(label: action), // default red accent (escalation/needs-you color)
+        ],
+      ),
+    );
+  }
+}
+
 /// Inline ghost row at the bottom of every kanban column.
 /// Notion mobile pattern: transparent bg, square corners, "+ New task" label.
 class NewTaskRow extends StatefulWidget {
