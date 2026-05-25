@@ -53,4 +53,33 @@ void main() {
       expect(taps, 1);
     });
   });
+
+  group('PlanningCard', () {
+    testWidgets('renders title', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const PlanningCard(title: 'Wire up Stripe webhooks'),
+      ));
+      expect(find.text('Wire up Stripe webhooks'), findsOneWidget);
+    });
+
+    testWidgets('renders architect avatar', (tester) async {
+      await tester.pumpWidget(_wrap(const PlanningCard(title: 't')));
+      // Architect monogram is "A"
+      expect(find.text('A'), findsOneWidget);
+    });
+
+    testWidgets('renders PLANNING label', (tester) async {
+      await tester.pumpWidget(_wrap(const PlanningCard(title: 't')));
+      expect(find.text('PLANNING'), findsOneWidget);
+    });
+
+    testWidgets('invokes onTap when tapped', (tester) async {
+      int taps = 0;
+      await tester.pumpWidget(_wrap(
+        PlanningCard(title: 't', onTap: () => taps++),
+      ));
+      await tester.tap(find.byType(PlanningCard));
+      expect(taps, 1);
+    });
+  });
 }

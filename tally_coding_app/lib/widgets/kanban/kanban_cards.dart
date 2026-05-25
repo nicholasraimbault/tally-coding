@@ -51,6 +51,57 @@ class TodoCard extends StatelessWidget {
   }
 }
 
+/// Card for tasks the architect is breaking down (pending + teamSpec != null).
+class PlanningCard extends StatelessWidget {
+  final String title;
+  final VoidCallback? onTap;
+
+  const PlanningCard({
+    super.key,
+    required this.title,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    return BrutalCard(
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: tc.fg,
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              height: 1.3,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const AgentAvatar(role: AgentRole.architect, size: 20),
+              Text(
+                'PLANNING',
+                style: TextStyle(
+                  color: tc.fgXdim,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Inline ghost row at the bottom of every kanban column.
 /// Notion mobile pattern: transparent bg, square corners, "+ New task" label.
 class NewTaskRow extends StatefulWidget {
