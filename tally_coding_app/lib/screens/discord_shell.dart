@@ -116,7 +116,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     super.initState();
     _selected = widget.initialTaskId != null
         ? TaskSelected(widget.initialTaskId!)
-        : const GeneralSelected();
+        : const BoardSelected();
     _fetch();
     // _fetchDirectChannels intentionally NOT called here — see
     // didChangeDependencies. Reading WorkspaceContext from initState
@@ -847,6 +847,12 @@ class _ChannelList extends StatelessWidget {
     return ListView(
       children: [
         const SizedBox(height: 8),
+        _ChannelTile(
+          icon: const Icon(Icons.view_kanban, size: 16, color: Color(0xFF949BA4)),
+          label: 'Board',
+          selected: selected is BoardSelected,
+          onTap: () => onSelect(const BoardSelected()),
+        ),
         _ChannelTile(
           icon: const Text('✨', style: TextStyle(fontSize: 16)),
           label: 'general',
