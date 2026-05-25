@@ -58,6 +58,10 @@ class DirectChannelSelected extends ChannelSelection {
   const DirectChannelSelected(this.channelId, this.channelName);
 }
 
+class BoardSelected extends ChannelSelection {
+  const BoardSelected();
+}
+
 class DiscordShellScreen extends StatefulWidget {
   final TallyOrchClient client;
   final NotificationsWsClient wsClient;
