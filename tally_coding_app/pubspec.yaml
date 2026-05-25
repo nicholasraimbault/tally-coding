@@ -40,6 +40,8 @@ dependencies:
   flutter_local_notifications: ^17.2.0
   vyuh_node_flow: ^0.27.3
   flutter_mobx: ^2.3.0
+  google_fonts: ^6.2.1
+  provider: ^6.1.2
   shared_preferences: ^2.5.5
 
 dev_dependencies:
