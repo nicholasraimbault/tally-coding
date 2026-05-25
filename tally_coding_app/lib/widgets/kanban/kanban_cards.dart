@@ -207,6 +207,70 @@ class AwaitingCard extends StatelessWidget {
   }
 }
 
+/// Card for completed tasks (or failed — distinguishes via the failed flag).
+class DoneCard extends StatelessWidget {
+  final String title;
+  final String shippedAgo;
+  final bool failed;
+  final VoidCallback? onTap;
+
+  const DoneCard({
+    super.key,
+    required this.title,
+    required this.shippedAgo,
+    this.failed = false,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    final accentColor = failed ? tc.red : tc.green;
+    final label = failed ? 'FAILED' : 'SHIPPED';
+    return BrutalCard(
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: tc.fgDim, // dim — done is less salient than active work
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              height: 1.3,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: accentColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
+              ),
+              Text(
+                shippedAgo,
+                style: TextStyle(
+                  color: tc.fgXdim,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Inline ghost row at the bottom of every kanban column.
 /// Notion mobile pattern: transparent bg, square corners, "+ New task" label.
 class NewTaskRow extends StatefulWidget {

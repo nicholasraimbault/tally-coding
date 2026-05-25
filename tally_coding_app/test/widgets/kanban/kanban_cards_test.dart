@@ -179,4 +179,38 @@ void main() {
       expect(taps, 1);
     });
   });
+
+  group('DoneCard', () {
+    testWidgets('renders title', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const DoneCard(title: 'Add refunds CSV export', shippedAgo: '2h ago'),
+      ));
+      expect(find.text('Add refunds CSV export'), findsOneWidget);
+    });
+
+    testWidgets('renders SHIPPED + relative timestamp', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const DoneCard(title: 't', shippedAgo: '2h ago'),
+      ));
+      expect(find.text('SHIPPED'), findsOneWidget);
+      expect(find.text('2h ago'), findsOneWidget);
+    });
+
+    testWidgets('shows FAILED label when failed=true', (tester) async {
+      await tester.pumpWidget(_wrap(
+        const DoneCard(title: 't', shippedAgo: '5m ago', failed: true),
+      ));
+      expect(find.text('FAILED'), findsOneWidget);
+      expect(find.text('SHIPPED'), findsNothing);
+    });
+
+    testWidgets('invokes onTap when tapped', (tester) async {
+      int taps = 0;
+      await tester.pumpWidget(_wrap(
+        DoneCard(title: 't', shippedAgo: '1m', onTap: () => taps++),
+      ));
+      await tester.tap(find.byType(DoneCard));
+      expect(taps, 1);
+    });
+  });
 }
