@@ -49,6 +49,41 @@ Access tokens via `context.tc` (defined as an extension on BuildContext in `tc_t
 - Plan (this sub-project): `../docs/superpowers/plans/2026-05-25-sub-project-b1-design-system-and-theme-picker.md`
 - Visual reference: `../docs/design/claude-design/` (8 reference mockups + tc-shared.jsx)
 
+## Widget previews
+
+For visual iteration on the Brutal Terminal design system, use widget previews instead of running the full app:
+
+```sh
+cd tally_coding_app && flutter widget-preview start
+# Opens a browser at http://localhost:<port> showing all *_preview.dart files
+```
+
+Preview files live alongside their widgets in `lib/widgets/`. Each preview wraps widgets in the Tokyo Night theme via `themeFromTokens(themeCatalog['tokyo-night']!.tokens)`. Compound widgets (EscalationSheet, AmbientMiniDash, kanban cards) include a "column overview" or "all variants" preview for at-a-glance coverage.
+
+Current preview files:
+- `lib/widgets/brutal/brutal_card_preview.dart` — BrutalCard (default, tappable, text, mixed content, 4-theme matrix)
+- `lib/widgets/brutal/brutal_button_preview.dart` — BrutalButton (primary + outline, enabled + disabled, pair)
+- `lib/widgets/brutal/brutal_progress_bar_preview.dart` — BrutalProgressBar at 0/30/50/75/100%
+- `lib/widgets/brutal/tally_avatar_preview.dart` — TallyAvatar online/offline + sizes 18/22/28/38px
+- `lib/widgets/brutal/agent_avatar_preview.dart` — All 4 AgentRole variants, active + inactive
+- `lib/widgets/bottom_sheet/escalation_sheet_preview.dart` — EscalationSheet (2-option, 4-option stacked, queue badge, single)
+- `lib/widgets/bottom_sheet/ambient_mini_dash_preview.dart` — AmbientMiniDash (empty, task rows, narrator, narrator+empty)
+- `lib/widgets/kanban/kanban_card_previews.dart` — All kanban card types + column overview
+
+Add new previews via the Flutter widget-previews skill (`.skills/flutter-add-widget-preview.md`).
+
+## Agent skills
+
+Official Flutter team skills are installed in `.skills/`. These ground agent sessions in framework best practices. Skills auto-discovered by Claude Code, Antigravity, and compatible agents.
+
+| File | Use when |
+|------|----------|
+| `.skills/flutter-apply-architecture-best-practices.md` | Structuring new features or refactoring for scalability (MVVM + Repository pattern) |
+| `.skills/flutter-add-widget-preview.md` | Adding `@Preview` annotations to new widgets |
+| `.skills/flutter-add-integration-test.md` | Adding integration tests for user journeys |
+
+Source: https://github.com/flutter/skills — fetched 2026-05-26. Run `npx skills update` to refresh.
+
 ## What B1 ships vs what's deferred
 
 B1 ships the design system + theme picker. B2/B3/B4/B5 will rewire existing screens (discord_shell.dart, general_channel.dart, task_channel.dart, etc.) to use Brutal primitives — those screens will still look like the old Material-default app after B1 lands. That's by design: B1 is foundation.
