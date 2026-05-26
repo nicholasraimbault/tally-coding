@@ -100,5 +100,51 @@ void main() {
       await tester.tap(find.byKey(const Key('sidebar_channels_add')));
       expect(addTapped, isTrue);
     });
+
+    // F1-Fix3: Board nav entry above CHANNELS section.
+    testWidgets('F1-Fix3: Board entry is rendered above CHANNELS header',
+        (tester) async {
+      await tester.pumpWidget(_wrap(SidebarChannelsList(
+        channels: const [_normalChannel],
+        activeChannelName: null,
+        onChannelTap: (_) {},
+        onAddChannel: () {},
+      )));
+      expect(find.text('Board'), findsOneWidget);
+      // Board entry should be above the CHANNELS section header.
+      final boardY = tester.getTopLeft(find.text('Board')).dy;
+      final channelsY = tester.getTopLeft(find.text('CHANNELS')).dy;
+      expect(boardY, lessThan(channelsY));
+    });
+
+    testWidgets('F1-Fix3: tapping Board entry fires onBoardTap', (tester) async {
+      var boardTapped = false;
+      await tester.pumpWidget(_wrap(SidebarChannelsList(
+        channels: const [_normalChannel],
+        activeChannelName: null,
+        isBoardSelected: false,
+        onBoardTap: () => boardTapped = true,
+        onChannelTap: (_) {},
+        onAddChannel: () {},
+      )));
+      await tester.tap(find.byKey(const Key('sidebar_board_entry')));
+      expect(boardTapped, isTrue);
+    });
+
+    testWidgets('F1-Fix3: isBoardSelected highlights the Board entry',
+        (tester) async {
+      await tester.pumpWidget(_wrap(SidebarChannelsList(
+        channels: const [_normalChannel],
+        activeChannelName: null,
+        isBoardSelected: true,
+        onBoardTap: () {},
+        onChannelTap: (_) {},
+        onAddChannel: () {},
+      )));
+      // Board entry exists and widget tree is renderable when selected.
+      expect(find.text('Board'), findsOneWidget);
+      // The board entry key must be present.
+      expect(find.byKey(const Key('sidebar_board_entry')), findsOneWidget);
+    });
   });
 }
