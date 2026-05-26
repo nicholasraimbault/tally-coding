@@ -47,4 +47,47 @@ void main() {
     )));
     expect(find.text('1 of 3'), findsOneWidget);
   });
+
+  testWidgets('renders one BrutalButton per option', (tester) async {
+    await tester.pumpWidget(_wrap(EscalationSheet(
+      escalation: _esc, queueIndex: 0, queueSize: 1,
+      taskTitle: 't', channelName: 'g',
+      onReply: (_) {}, onSkip: () {}, onOpen: () {},
+    )));
+    expect(find.text('2 DECIMALS'), findsOneWidget);
+    expect(find.text('KEEP 4'), findsOneWidget);
+  });
+
+  testWidgets('tapping a quick reply calls onReply with the option', (tester) async {
+    String? picked;
+    await tester.pumpWidget(_wrap(EscalationSheet(
+      escalation: _esc, queueIndex: 0, queueSize: 1,
+      taskTitle: 't', channelName: 'g',
+      onReply: (opt) => picked = opt, onSkip: () {}, onOpen: () {},
+    )));
+    await tester.tap(find.text('2 DECIMALS'));
+    expect(picked, '2 decimals');
+  });
+
+  testWidgets('Open ghost button calls onOpen', (tester) async {
+    int calls = 0;
+    await tester.pumpWidget(_wrap(EscalationSheet(
+      escalation: _esc, queueIndex: 0, queueSize: 1,
+      taskTitle: 't', channelName: 'g',
+      onReply: (_) {}, onSkip: () {}, onOpen: () => calls++,
+    )));
+    await tester.tap(find.text('OPEN #G'));
+    expect(calls, 1);
+  });
+
+  testWidgets('Skip ghost button calls onSkip', (tester) async {
+    int calls = 0;
+    await tester.pumpWidget(_wrap(EscalationSheet(
+      escalation: _esc, queueIndex: 0, queueSize: 2,
+      taskTitle: 't', channelName: 'g',
+      onReply: (_) {}, onSkip: () => calls++, onOpen: () {},
+    )));
+    await tester.tap(find.text('SKIP'));
+    expect(calls, 1);
+  });
 }

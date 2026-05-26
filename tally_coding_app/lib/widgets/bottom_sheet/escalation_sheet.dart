@@ -142,7 +142,87 @@ class EscalationSheet extends StatelessWidget {
             style: TextStyle(color: tc.fg, fontSize: 13.5, height: 1.4),
           ),
           const SizedBox(height: 14),
-          // Quick reply buttons + bottom row added in Task 7
+          // Quick reply buttons (one per option). 1-2 inline, 3+ stacked.
+          if (escalation.options.length <= 2)
+            Row(
+              children: [
+                for (int i = 0; i < escalation.options.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 8),
+                  Expanded(
+                    child: i == 0
+                        ? BrutalButton.primary(
+                            label: escalation.options[i],
+                            onPressed: () => onReply(escalation.options[i]),
+                          )
+                        : BrutalButton.outline(
+                            label: escalation.options[i],
+                            onPressed: () => onReply(escalation.options[i]),
+                          ),
+                  ),
+                ],
+              ],
+            )
+          else
+            Column(
+              children: [
+                for (int i = 0; i < escalation.options.length; i++) ...[
+                  if (i > 0) const SizedBox(height: 6),
+                  i == 0
+                      ? BrutalButton.primary(
+                          label: escalation.options[i],
+                          onPressed: () => onReply(escalation.options[i]),
+                        )
+                      : BrutalButton.outline(
+                          label: escalation.options[i],
+                          onPressed: () => onReply(escalation.options[i]),
+                        ),
+                ],
+              ],
+            ),
+          const SizedBox(height: 10),
+          // Bottom row: Open #channel ghost + Skip ghost
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              TextButton(
+                onPressed: onOpen,
+                style: TextButton.styleFrom(
+                  foregroundColor: tc.fgXdim,
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  shape: const RoundedRectangleBorder(
+                    borderRadius: BorderRadius.zero,
+                  ),
+                ),
+                child: Text(
+                  'OPEN #${channelName.toUpperCase()}',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+              ),
+              if (queueSize > 1)
+                TextButton(
+                  onPressed: onSkip,
+                  style: TextButton.styleFrom(
+                    foregroundColor: tc.fgXdim,
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    shape: const RoundedRectangleBorder(
+                      borderRadius: BorderRadius.zero,
+                    ),
+                  ),
+                  child: const Text(
+                    'SKIP',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ],
       ),
     );
