@@ -8,12 +8,13 @@
 // in two places. Reconnects with exponential back-off (1 s → 60 s cap).
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../api.dart';
 import 'desktop_notifier.dart';
 
 class NotificationsWsClient {
-  final TallyOrchClient api;
+  final TallyOrchClient? api;
   final Uri wsUrl;
   final Future<String?> Function() bearerProvider;
   WebSocketChannel? _channel;
@@ -45,6 +46,12 @@ class NotificationsWsClient {
   /// look up the single channel by id).  Provides [channelId] and
   /// [workspaceId] from the server frame.
   void Function(int channelId, int workspaceId)? onChannelCreated;
+
+  /// B4: called when a `new_escalation` WebSocket event arrives from the
+  /// orchestrator. Provides [channelId] and [escalationMessageId] so the
+  /// caller can fetch the escalation message (if app is foreground) or
+  /// show the OS notification (if in background/inactive).
+  void Function(int channelId, int escalationMessageId)? onNewEscalation;
 
   NotificationsWsClient({
     required this.api,
@@ -108,11 +115,18 @@ class NotificationsWsClient {
       onChannelCreated?.call(msg['channel_id'] as int, msg['workspace_id'] as int);
       return;
     }
+    if (type == 'new_escalation') {
+      onNewEscalation?.call(
+        msg['channel_id'] as int,
+        msg['escalation_message_id'] as int,
+      );
+      return;
+    }
     if (type == 'new_notification') {
       final id = msg['id'] as int;
       try {
         // Doorbell pattern: signal arrives via WS, fetch content via REST.
-        final items = await api.listNotifications(limit: 1, sinceId: id - 1);
+        final items = await api!.listNotifications(limit: 1, sinceId: id - 1);
         for (final n in items) {
           if (n['id'] == id) {
             onNotification?.call(n);
@@ -130,6 +144,10 @@ class NotificationsWsClient {
       }
     }
   }
+
+  /// Test-only entry point to invoke [_handleMessage] synchronously.
+  @visibleForTesting
+  Future<void> handleMessageForTest(String raw) => _handleMessage(raw);
 
   void dispose() {
     _reconnect?.cancel();

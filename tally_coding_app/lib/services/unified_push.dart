@@ -14,8 +14,10 @@
 //     in place before the distributor can fire NEW_ENDPOINT.
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:unifiedpush/unifiedpush.dart';
+import 'escalation_notifier.dart';
 
 class UnifiedPushManager {
   UnifiedPushManager._();
@@ -53,6 +55,16 @@ class UnifiedPushManager {
       },
       onUnregistered: (String instance) {
         if (!completer.isCompleted) completer.complete(null);
+      },
+      onMessage: (Uint8List message, String instance) async {
+        // B4: escalation push carries a JSON body (not the old empty doorbell).
+        // Parse and show OS notification with inline action buttons.
+        final payload = EscalationPushPayload.fromBytes(message);
+        if (payload != null) {
+          await EscalationNotifier.instance.showEscalationNotification(payload);
+        }
+        // Fall through: empty-body doorbell pushes (kind != escalation) are
+        // handled by the WS notification path; nothing more to do here.
       },
     );
 

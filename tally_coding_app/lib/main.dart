@@ -1,16 +1,21 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:app_links/app_links.dart';
 import 'package:clerk_auth/clerk_auth.dart' as clerk;
 import 'package:clerk_flutter/clerk_flutter.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'screens/discord_shell.dart';
+import 'services/escalation_notifier.dart';
 import 'services/notifications_ws.dart';
 import 'state/workspace_context.dart';
+import 'theme/theme.dart';
+import 'widgets/bottom_sheet/bottom_sheet.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
@@ -43,8 +48,20 @@ const _kOrchestratorUrl = String.fromEnvironment(
 );
 
 Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   await clerk.setUpLogging(printer: const _LogPrinter());
-  runApp(const TallyApp());
+  final themeController = ThemeController();
+  await themeController.load();
+  final bottomSheetController = BottomSheetController();
+  runApp(
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: themeController),
+        ChangeNotifierProvider.value(value: bottomSheetController),
+      ],
+      child: const TallyApp(),
+    ),
+  );
 }
 
 class TallyApp extends StatelessWidget {
@@ -84,15 +101,13 @@ class TallyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = ThemeData(
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: const Color(0xFF7C5CFC),
-        brightness: Brightness.dark,
-        surface: const Color(0xFF313338),
-      ),
-      scaffoldBackgroundColor: const Color(0xFF1E1F22),
-      useMaterial3: true,
-      extensions: [ClerkThemeExtension.dark],
+    final controller = context.watch<ThemeController>();
+    final baseTheme = themeFromTokens(controller.activeEntry.tokens);
+    final theme = baseTheme.copyWith(
+      extensions: [
+        ...baseTheme.extensions.values,
+        ClerkThemeExtension.dark,
+      ],
     );
     return ClerkAuth(
       config: ClerkAuthConfig(
@@ -247,6 +262,59 @@ class _SignedInShellState extends State<_SignedInShell> {
       wsUrl: wsUri,
       bearerProvider: widget.bearerProvider,
     );
+    // B4: initialize EscalationNotifier for inline-action push notifications.
+    unawaited(EscalationNotifier.instance.initialize().then((_) {
+      // Wire onNewEscalation: when a new_escalation WS event arrives,
+      // fetch the message and show an OS notification.
+      _wsClient!.onNewEscalation = (channelId, escalationMessageId) async {
+        try {
+          final messages = await widget.client.getMessages(
+            channelId: channelId,
+            limit: 10,
+            sinceId: escalationMessageId - 1,
+          );
+          for (final msg in messages) {
+            if (msg['id'] == escalationMessageId && msg['kind'] == 'escalation') {
+              // payload_json is a string column in the DB; decode it.
+              final payloadStr = msg['payload_json'] as String? ?? '{}';
+              final payloadMap =
+                  Map<String, dynamic>.from(jsonDecode(payloadStr) as Map);
+              final pushPayload = EscalationPushPayload(
+                escalationMessageId: escalationMessageId,
+                channelId: channelId,
+                question: payloadMap['question'] as String? ?? '',
+                quickReplyOptions: List<String>.from(
+                  (payloadMap['quick_reply_options'] as List?) ?? const [],
+                ),
+              );
+              await EscalationNotifier.instance.showEscalationNotification(pushPayload);
+              break;
+            }
+          }
+        } catch (e) {
+          debugPrint('[EscalationNotifier] fetch+show failed: $e');
+        }
+      };
+      // Wire onActionSelected: quick-reply action buttons post reply to channel.
+      EscalationNotifier.instance.onActionSelected =
+          (channelId, escalationMessageId, actionId) async {
+        if (actionId == 'Open') {
+          // TODO(B4): deep-link to long-term channel when B3 navigator is merged.
+          // B3's navigation controller handles deep links to channels by channelId.
+          debugPrint('[EscalationNotifier] open channel $channelId');
+          return;
+        }
+        try {
+          await widget.client.postMessage(
+            channelId: channelId,
+            text: actionId,
+            replyToId: escalationMessageId,
+          );
+        } catch (e) {
+          debugPrint('[EscalationNotifier] reply post failed: $e');
+        }
+      };
+    }));
     unawaited(_wsClient!.connect());
     unawaited(_loadActiveWorkspace());
   }

@@ -368,3 +368,127 @@ def handle_escalation(db: "Db", *, channel_id: int, message_id: int) -> int | No
         payload={"text": text},
     )
     return dm_ch
+
+
+# ── B4: long-term channel escalation routing ──────────────────────────────────
+
+
+def get_workspace_escalation_channel_id(db: "Db", *, workspace_id: int) -> int | None:
+    """Return the channel_id that escalations should be routed to for a workspace.
+
+    Resolution order:
+    1. workspaces.settings_json["escalation_channel_id"] if set and channel exists.
+    2. The workspace's #general channel (kind='general').
+    3. None if neither exists.
+
+    Example::
+
+        ch = get_workspace_escalation_channel_id(db, workspace_id=1)
+    """
+    # Try settings_json override first.
+    row = db._conn.execute(
+        "SELECT settings_json FROM workspaces WHERE id=? AND deleted_at IS NULL",
+        (workspace_id,),
+    ).fetchone()
+    if row:
+        try:
+            settings = json.loads(row[0] or "{}")
+            override_id = settings.get("escalation_channel_id")
+            if override_id:
+                exists = db._conn.execute(
+                    "SELECT 1 FROM channels WHERE id=? AND archived_at IS NULL",
+                    (int(override_id),),
+                ).fetchone()
+                if exists:
+                    return int(override_id)
+        except (TypeError, ValueError, KeyError):
+            pass
+    # Fall back to #general.
+    gen = db._conn.execute(
+        "SELECT id FROM channels WHERE workspace_id=? AND kind='general' "
+        "AND archived_at IS NULL LIMIT 1",
+        (workspace_id,),
+    ).fetchone()
+    return int(gen[0]) if gen else None
+
+
+def route_escalation_to_long_term_channel(
+    db: "Db",
+    *,
+    task_channel_id: int,
+    message_id: int,
+) -> tuple[int, int] | None:
+    """B4: route a kind='escalation' message from a task channel to the workspace's
+    long-term escalation channel (default #general).
+
+    Inserts a new kind='escalation' message authored by 'tally' in the long-term
+    channel with structured payload:
+        {
+          "question": str,
+          "quick_reply_options": list[str],
+          "task_id": str,
+          "task_name": str,
+          "source_channel_id": int,
+          "source_message_id": int,
+          "queue_position": int,
+        }
+
+    Returns (long_term_channel_id, new_message_id) on success, None if the
+    source message is not an escalation or workspace cannot be resolved.
+
+    Example::
+
+        result = route_escalation_to_long_term_channel(
+            db, task_channel_id=task_ch, message_id=msg_id
+        )
+    """
+    msg_row = db._conn.execute(
+        "SELECT channel_id, kind, payload_json FROM messages WHERE id=? AND kind='escalation'",
+        (message_id,),
+    ).fetchone()
+    if msg_row is None:
+        return None
+
+    payload = json.loads(msg_row[2] or "{}")
+
+    # Resolve workspace + owner from the task channel.
+    src_row = db._conn.execute(
+        "SELECT c.workspace_id, c.task_id, c.name, w.owner_user_id "
+        "FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+        "WHERE c.id=?",
+        (task_channel_id,),
+    ).fetchone()
+    if src_row is None:
+        return None
+    workspace_id, task_id, channel_name, _owner = src_row
+
+    lt_channel_id = get_workspace_escalation_channel_id(db, workspace_id=workspace_id)
+    if lt_channel_id is None:
+        return None
+
+    # Count pending escalations ahead in this channel for queue_position.
+    pending_count = db._conn.execute(
+        "SELECT COUNT(*) FROM messages "
+        "WHERE channel_id=? AND kind='escalation' AND edited_at IS NULL",
+        (lt_channel_id,),
+    ).fetchone()
+    queue_position = int(pending_count[0] or 0) + 1
+
+    task_name = channel_name  # channel name mirrors task description (truncated)
+    new_payload = {
+        "question": payload.get("question") or payload.get("reason") or "Agent needs input.",
+        "quick_reply_options": payload.get("quick_reply_options") or [],
+        "task_id": task_id or "",
+        "task_name": task_name,
+        "source_channel_id": task_channel_id,
+        "source_message_id": message_id,
+        "queue_position": queue_position,
+    }
+    new_msg_id = insert_message(
+        db,
+        channel_id=lt_channel_id,
+        author_kind="tally",
+        kind="escalation",
+        payload=new_payload,
+    )
+    return lt_channel_id, new_msg_id

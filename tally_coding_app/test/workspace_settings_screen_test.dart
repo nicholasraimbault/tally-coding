@@ -2,12 +2,31 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tally_coding_app/api.dart';
 import 'package:tally_coding_app/screens/workspace_settings.dart';
+import 'package:tally_coding_app/theme/theme.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   TallyOrchClient _mockClient(MockClient mockHttp) =>
       TallyOrchClient(baseUrl: Uri.parse('http://test'), provider: () async => 't', client: mockHttp);
+
+  Future<Widget> _wrap(Widget child) async {
+    final controller = ThemeController();
+    await controller.load();
+    return ChangeNotifierProvider.value(
+      value: controller,
+      child: MaterialApp(
+        theme: themeFromTokens(controller.activeEntry.tokens),
+        home: child,
+      ),
+    );
+  }
 
   testWidgets('renders branding section + member list', (tester) async {
     final mock = MockClient((req) async {
@@ -19,7 +38,7 @@ void main() {
       }
       return http.Response('{}', 200, headers: {'content-type': 'application/json'});
     });
-    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+    await tester.pumpWidget(await _wrap(WorkspaceSettingsScreen(
       client: _mockClient(mock),
       workspaceId: 1,
       workspaceName: 'Test WS',
@@ -30,24 +49,30 @@ void main() {
     expect(find.textContaining('admin'), findsOneWidget);
     expect(find.textContaining('bob'), findsOneWidget);
     expect(find.textContaining('Activity log'), findsOneWidget);
-    expect(find.textContaining('Danger zone', skipOffstage: false), findsOneWidget);
+    // Scroll to reveal Danger zone (pushed below fold by the Appearance section)
+    await tester.drag(find.byType(ListView), const Offset(0, -1200));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Danger zone'), findsOneWidget);
   });
 
   testWidgets('owner sees Delete workspace button', (tester) async {
     final mock = MockClient((req) async => http.Response('{"members":[]}', 200, headers: {'content-type':'application/json'}));
-    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+    await tester.pumpWidget(await _wrap(WorkspaceSettingsScreen(
       client: _mockClient(mock),
       workspaceId: 1,
       workspaceName: 'x',
       callerRole: 'owner',
     )));
     await tester.pumpAndSettle();
-    expect(find.text('Delete workspace', skipOffstage: false), findsOneWidget);
+    // Scroll to reveal Delete workspace (pushed below fold by the Appearance section)
+    await tester.drag(find.byType(ListView), const Offset(0, -1200));
+    await tester.pumpAndSettle();
+    expect(find.text('Delete workspace'), findsOneWidget);
   });
 
   testWidgets('non-owner sees Leave workspace button (not Delete)', (tester) async {
     final mock = MockClient((req) async => http.Response('{"members":[]}', 200, headers: {'content-type':'application/json'}));
-    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+    await tester.pumpWidget(await _wrap(WorkspaceSettingsScreen(
       client: _mockClient(mock),
       workspaceId: 1,
       workspaceName: 'x',
@@ -60,7 +85,7 @@ void main() {
 
   testWidgets('owner sees Transfer ownership button', (tester) async {
     final mock = MockClient((req) async => http.Response('{"members":[]}', 200, headers: {'content-type':'application/json'}));
-    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+    await tester.pumpWidget(await _wrap(WorkspaceSettingsScreen(
       client: _mockClient(mock),
       workspaceId: 1,
       workspaceName: 'x',
@@ -83,7 +108,7 @@ void main() {
       }
       return http.Response('{}', 200, headers: {'content-type':'application/json'});
     });
-    await tester.pumpWidget(MaterialApp(home: WorkspaceSettingsScreen(
+    await tester.pumpWidget(await _wrap(WorkspaceSettingsScreen(
       client: TallyOrchClient(baseUrl: Uri.parse('http://t'), provider: () async => 't', client: mock),
       workspaceId: 1,
       workspaceName: 'x',

@@ -3,8 +3,12 @@
 // Sprint 50 B5: workspace branding + members + danger-zone settings.
 // Reached from the channel-rail gear icon.
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../api.dart';
+import '../theme/theme.dart';
+import '../widgets/brutal/brutal.dart';
 import 'audit_log.dart';
+import 'theme_picker_screen.dart';
 
 // Roles a non-owner caller can select from (cannot set owner; cannot touch owner)
 const _kAssignableRoles = ['admin', 'manager', 'member'];
@@ -366,6 +370,13 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
 
           const Divider(height: 32),
 
+          // === Appearance ===
+          const Text('Appearance', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          _AppearanceTab(),
+
+          const Divider(height: 32),
+
           // === Danger zone ===
           const Text(
             'Danger zone',
@@ -440,6 +451,63 @@ class _WorkspaceSettingsScreenState extends State<WorkspaceSettingsScreen> {
               ],
             )
           : null,
+    );
+  }
+}
+
+// === Appearance tab widget ===
+
+/// Inline appearance section displayed in the workspace settings ListView.
+///
+/// Shows the active theme name and description, with a button to navigate
+/// to the full ThemePickerScreen.
+///
+/// Example:
+/// ```dart
+/// _AppearanceTab()
+/// ```
+class _AppearanceTab extends StatelessWidget {
+  const _AppearanceTab();
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    final controller = context.watch<ThemeController>();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'THEME',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.0,
+              color: tc.fgXdim,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            controller.activeEntry.name,
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: tc.fg),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            controller.activeEntry.desc,
+            style: TextStyle(fontSize: 12, color: tc.fgDim),
+          ),
+          const SizedBox(height: 20),
+          BrutalButton.primary(
+            label: 'Open theme picker',
+            onPressed: () {
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => const ThemePickerScreen(),
+              ));
+            },
+          ),
+        ],
+      ),
     );
   }
 }
