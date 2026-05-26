@@ -927,9 +927,10 @@ class _ChannelList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Container(
       width: width,
-      color: const Color(0xFF2B2D31),
+      color: tc.sheet,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -953,8 +954,7 @@ class _ChannelList extends StatelessWidget {
                   ),
                 // Sprint 50 B7: gear icon → WorkspaceSettingsScreen.
                 IconButton(
-                  icon: const Icon(Icons.settings, size: 18,
-                      color: Color(0xFF8E9297)),
+                  icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
                   tooltip: 'Workspace settings',
                   onPressed: onOpenSettings,
                   padding: EdgeInsets.zero,
@@ -963,7 +963,7 @@ class _ChannelList extends StatelessWidget {
               ],
             ),
           ),
-          Container(height: 1, color: const Color(0xFF1E1F22)),
+          Container(height: 1, color: tc.border),
           Expanded(child: _scrollableBody(context)),
         ],
       ),
@@ -975,7 +975,7 @@ class _ChannelList extends StatelessWidget {
       children: [
         const SizedBox(height: 8),
         _ChannelTile(
-          icon: const Icon(Icons.view_kanban, size: 16, color: Color(0xFF949BA4)),
+          icon: Icon(Icons.view_kanban, size: 16, color: context.tc.fgDim),
           label: 'Board',
           selected: selected is BoardSelected,
           onTap: () => onSelect(const BoardSelected()),
@@ -1013,10 +1013,11 @@ class _ChannelList extends StatelessWidget {
     BuildContext context,
     List<Map<String, dynamic>> channels,
   ) {
+    final tc = context.tc;
     return [
       for (final ch in channels)
         _ChannelTile(
-          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
           label: ch['name'] as String? ?? 'channel',
           selected: selected is DirectChannelSelected &&
               (selected as DirectChannelSelected).channelId == ch['id'] as int,
@@ -1025,7 +1026,7 @@ class _ChannelList extends StatelessWidget {
             ch['name'] as String? ?? 'channel',
           )),
           trailing: (ch['_unread_escalation'] == true)
-              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              ? Icon(Icons.circle, color: tc.yellow, size: 8)
               : null,
         ),
     ];
@@ -1038,10 +1039,11 @@ class _ChannelList extends StatelessWidget {
     BuildContext context,
     List<Map<String, dynamic>> channels,
   ) {
+    final tc = context.tc;
     return [
       for (final ch in channels)
         _ChannelTile(
-          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
           label: ch['name'] as String? ?? 'channel',
           selected: selected is DirectChannelSelected &&
               (selected as DirectChannelSelected).channelId == ch['id'] as int,
@@ -1050,7 +1052,7 @@ class _ChannelList extends StatelessWidget {
             ch['name'] as String? ?? 'channel',
           )),
           trailing: (ch['_unread_escalation'] == true)
-              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              ? Icon(Icons.circle, color: tc.yellow, size: 8)
               : null,
           onArchive: onArchiveChannel != null
               ? () => onArchiveChannel!(ch['id'] as int)
@@ -1065,7 +1067,7 @@ class _ChannelList extends StatelessWidget {
       child: Text(
         label,
         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: const Color(0xFF8E9297),
+              color: context.tc.fgDim,
               fontWeight: FontWeight.bold,
               letterSpacing: 1.2,
             ),
@@ -1095,17 +1097,17 @@ class _NewTile extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
             child: Row(
               children: [
-                const SizedBox(
+                SizedBox(
                   width: 20,
                   child: Center(
-                    child: Icon(Icons.add, color: Color(0xFF8E9297), size: 14),
+                    child: Icon(Icons.add, color: context.tc.fgDim, size: 14),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Text(
                   label,
-                  style: const TextStyle(
-                    color: Color(0xFF8E9297),
+                  style: TextStyle(
+                    color: context.tc.fgDim,
                     fontSize: 13,
                     fontWeight: FontWeight.w500,
                   ),
