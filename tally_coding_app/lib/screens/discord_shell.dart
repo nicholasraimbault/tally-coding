@@ -18,12 +18,14 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
 import '../main.dart';
 import '../services/notifications_ws.dart';
 import '../state/workspace_context.dart';
+import '../widgets/bottom_sheet/bottom_sheet.dart';
 import 'billing_screen.dart';
 import 'general_channel.dart';
 import 'notifications_screen.dart';
@@ -111,6 +113,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   // didChangeDependencies call is both the initial-load gate (null !=
   // <new id>) and the workspace-switch hook (<old id> != <new id>).
   int? _lastFetchedDirectChannelsWorkspaceId;
+  // B3a: most-recent Tally narrator text from the WS stream.
+  // Populated in Task 12; null until the first narrator event arrives.
+  String? _latestNarratorText;
 
   @override
   void initState() {
@@ -692,10 +697,33 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           directChannelId: cid,
           channelTitle: name,
         ),
-      BoardSelected() => KanbanView(
-          tasks: _filteredTasksForKanban(),
-          onTaskTap: (task) => setState(() => _selected = TaskSelected(task.id)),
-          onNewTask: () => setState(() => _selected = const GeneralSelected()),
+      // B3a Task 11: wrap kanban in a Stack so the bottom sheet can
+      // overlay at the bottom without pushing kanban content up.
+      BoardSelected() => Stack(
+          children: [
+            Positioned.fill(
+              child: KanbanView(
+                tasks: _filteredTasksForKanban(),
+                onTaskTap: (task) =>
+                    setState(() => _selected = TaskSelected(task.id)),
+                onNewTask: () =>
+                    setState(() => _selected = const GeneralSelected()),
+              ),
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _BoardBottomSheet(
+                tasks: _filteredTasksForKanban(),
+                latestNarratorText: _latestNarratorText,
+                client: widget.client,
+                onOpenChannel: (channelId, name) => setState(() {
+                  _selected = DirectChannelSelected(channelId, name);
+                }),
+              ),
+            ),
+          ],
         ),
     };
   }
@@ -1337,6 +1365,97 @@ class _MemberTile extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// B3a: bottom-sheet overlay for the Board view.
+// ─────────────────────────────────────────────────────────────
+
+/// Reads [BottomSheetController] from the Provider tree and renders
+/// either [AmbientMiniDash] (ambient state) or [EscalationSheet]
+/// (takeover state) depending on controller state.  Hidden when
+/// controller state is [SheetState.hidden].
+class _BoardBottomSheet extends StatelessWidget {
+  final List<Task> tasks;
+  final String? latestNarratorText;
+  final TallyOrchClient client;
+  final void Function(int channelId, String name) onOpenChannel;
+
+  const _BoardBottomSheet({
+    required this.tasks,
+    required this.latestNarratorText,
+    required this.client,
+    required this.onOpenChannel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = context.watch<BottomSheetController>();
+
+    if (controller.state == SheetState.hidden) return const SizedBox.shrink();
+
+    if (controller.state == SheetState.takeover &&
+        controller.activeEscalation != null) {
+      final esc = controller.activeEscalation!;
+      final task = tasks.firstWhere(
+        (t) => t.id == esc.taskId,
+        orElse: () => Task.fromJson({
+          'id': esc.taskId,
+          'description': '(task)',
+          'status': 'recovering',
+          'created_at': 0.0,
+          'updated_at': 0.0,
+        }),
+      );
+      return EscalationSheet(
+        escalation: esc,
+        queueIndex: 0,
+        queueSize: controller.queueSize,
+        taskTitle: task.channelTitle,
+        // B3b will derive channelName from real escalation routing.
+        channelName: 'general',
+        onReply: (option) async {
+          // Quick reply: post the chosen option back, then dequeue.
+          // On failure, leave the escalation in queue so the user can retry.
+          try {
+            await client.postMessage(
+              channelId: esc.channelId,
+              text: option,
+              kind: 'message',
+              payload: {'in_response_to_escalation': esc.id},
+            );
+          } catch (_) {
+            return;
+          }
+          if (context.mounted) {
+            context.read<BottomSheetController>().resolveActive();
+          }
+        },
+        onSkip: controller.skip,
+        onOpen: () => onOpenChannel(esc.channelId, 'general'),
+      );
+    }
+
+    // Ambient state: stat row + running-task progress rows + narrator bubble.
+    final done = tasks
+        .where(
+          (t) => t.status == 'completed' || t.status == 'failed',
+        )
+        .length;
+    final open = tasks.length - done;
+    final running = tasks.where((t) => t.status == 'running').toList();
+
+    return AmbientMiniDash(
+      openCount: open,
+      doneCount: done,
+      taskRows: [
+        for (final t in running.take(2))
+          // Progress placeholder: B3b will wire real per-task progress.
+          MiniTaskRow(title: t.channelTitle, progress: 0.5),
+      ],
+      narratorText: latestNarratorText,
     );
   }
 }
