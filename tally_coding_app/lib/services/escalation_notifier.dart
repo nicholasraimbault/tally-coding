@@ -164,16 +164,24 @@ class EscalationNotifier {
         ),
       );
     } else {
-      // Linux/desktop/web fallback — no action buttons.
+      // Linux/desktop fallback — Linux notifications don't support inline
+      // actions universally. Show the question text with a prompt to open the
+      // app and respond via the in-app escalation sheet.
       details = const NotificationDetails(
         linux: LinuxNotificationDetails(),
       );
     }
 
+    // On Linux the body includes the question + a "Tap to respond" hint since
+    // there are no inline action buttons.
+    final body = (!kIsWeb && !(Platform.isAndroid || Platform.isIOS || Platform.isMacOS))
+        ? '${payload.question}\n\nTap to respond in the app.'
+        : payload.question;
+
     await _plugin.show(
       notifId,
       'Tally needs you',
-      payload.question,
+      body,
       details,
       payload: actionPayloadPrefix,
     );
