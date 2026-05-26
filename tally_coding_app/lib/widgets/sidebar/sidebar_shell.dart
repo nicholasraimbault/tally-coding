@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../../theme/tc_tokens.dart';
 import 'workspace_row.dart';
 import 'sidebar_channels_list.dart';
+import 'sidebar_footer.dart';
 import 'sidebar_mini_dash.dart';
 
 /// The 240 px desktop sidebar that replaces ServerRail + _ChannelList.
@@ -9,7 +10,8 @@ import 'sidebar_mini_dash.dart';
 /// Layout (top to bottom):
 /// 1. [WorkspaceRow] — workspace badge + name + search icon
 /// 2. [SidebarChannelsList] — scrollable compact channel rows (fills remaining space)
-/// 3. [SidebarMiniDash] — docked footer (ambient or escalation takeover)
+/// 3. [SidebarMiniDash] — docked ambient/escalation area
+/// 4. [SidebarFooter] — workspace badge + name + settings gear (F5)
 ///
 /// A 1 px hairline borders the right edge to separate from the main pane.
 ///
@@ -32,6 +34,7 @@ import 'sidebar_mini_dash.dart';
 ///   onQuickReply: (reply) => _resolveEscalation(reply),
 ///   onSkipEscalation: () => _skipEscalation(),
 ///   onOpenChannel: () => _openEscalationChannel(),
+///   onSettingsTap: () => _openSettings(context),
 /// )
 /// ```
 class SidebarShell extends StatelessWidget {
@@ -63,6 +66,10 @@ class SidebarShell extends StatelessWidget {
   final VoidCallback onSkipEscalation;
   final VoidCallback onOpenChannel;
   final int activeEscalationIndex;
+  /// Invoked when the user taps the settings gear in [SidebarFooter].
+  /// Should open [WorkspaceSettingsScreen] — mirrors the gear in the
+  /// narrow AppBar added in F4.
+  final VoidCallback onSettingsTap;
 
   const SidebarShell({
     super.key,
@@ -85,6 +92,7 @@ class SidebarShell extends StatelessWidget {
     required this.onSkipEscalation,
     required this.onOpenChannel,
     this.activeEscalationIndex = 0,
+    required this.onSettingsTap,
   });
 
   @override
@@ -130,6 +138,13 @@ class SidebarShell extends StatelessWidget {
             onSkipEscalation: onSkipEscalation,
             onOpenChannel: onOpenChannel,
             activeEscalationIndex: activeEscalationIndex,
+          ),
+          // Footer: workspace badge + name + settings gear (F5).
+          // Gives desktop users the same settings affordance as the
+          // narrow AppBar gear added in F4.
+          SidebarFooter(
+            workspaceName: workspaceName,
+            onSettingsTap: onSettingsTap,
           ),
         ],
       ),
