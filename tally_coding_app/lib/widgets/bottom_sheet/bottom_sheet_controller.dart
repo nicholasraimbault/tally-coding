@@ -1,17 +1,20 @@
 import 'package:flutter/foundation.dart';
+import 'package:tally_coding_app/widgets/bottom_sheet/channel_model.dart';
 import 'package:tally_coding_app/widgets/bottom_sheet/escalation_model.dart';
 
-enum SheetState { ambient, takeover, hidden }
+enum SheetState { ambient, takeover, channelsExpanded, hidden }
 
 class BottomSheetController extends ChangeNotifier {
   SheetState _state = SheetState.ambient;
   final List<EscalationModel> _queue = [];
+  List<ChannelModel> _channels = [];
 
   SheetState get state => _state;
   List<EscalationModel> get queue => List.unmodifiable(_queue);
   EscalationModel? get activeEscalation =>
       _queue.isEmpty ? null : _queue.first;
   int get queueSize => _queue.length;
+  List<ChannelModel> get channels => List.unmodifiable(_channels);
 
   /// Adds [e] to the queue (deduplicated by id).
   /// If the sheet is ambient, flips to takeover so the escalation is visible.
@@ -54,4 +57,26 @@ class BottomSheetController extends ChangeNotifier {
     _state = _queue.isEmpty ? SheetState.ambient : SheetState.takeover;
     notifyListeners();
   }
+
+  /// Replaces the channel list and notifies listeners.
+  void setChannels(List<ChannelModel> channels) {
+    _channels = List.of(channels);
+    notifyListeners();
+  }
+
+  /// Expands the sheet to the channels list view.
+  void expandChannels() {
+    _state = SheetState.channelsExpanded;
+    notifyListeners();
+  }
+
+  /// Collapses from channelsExpanded back to ambient, or takeover if queue non-empty.
+  void collapseToAmbient() {
+    _state = _queue.isEmpty ? SheetState.ambient : SheetState.takeover;
+    notifyListeners();
+  }
+
+  /// Returns true if any escalation in the queue belongs to [channelId].
+  bool hasEscalationInChannel(int channelId) =>
+      _queue.any((e) => e.channelId == channelId);
 }

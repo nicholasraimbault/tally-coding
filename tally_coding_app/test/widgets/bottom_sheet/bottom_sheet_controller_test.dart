@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tally_coding_app/widgets/bottom_sheet/bottom_sheet_controller.dart';
+import 'package:tally_coding_app/widgets/bottom_sheet/channel_model.dart';
 import 'package:tally_coding_app/widgets/bottom_sheet/escalation_model.dart';
 
 const _e1 = EscalationModel(id: 'e1', question: 'q1', options: ['a','b'], taskId: 't1', channelId: 1);
@@ -78,6 +79,41 @@ void main() {
       var calls = 0;
       c.addListener(() => calls++);
       c.enqueueEscalation(_e1);
+      expect(calls, 1);
+    });
+
+    test('expandChannels flips state to channelsExpanded', () {
+      final c = BottomSheetController();
+      c.expandChannels();
+      expect(c.state, SheetState.channelsExpanded);
+    });
+
+    test('collapseToAmbient returns to ambient (or takeover if queue non-empty)', () {
+      final c = BottomSheetController()..expandChannels();
+      c.collapseToAmbient();
+      expect(c.state, SheetState.ambient);
+
+      c.enqueueEscalation(const EscalationModel(id: 'e1', question: 'q', options: [], taskId: 't', channelId: 7));
+      c.expandChannels();
+      c.collapseToAmbient();
+      expect(c.state, SheetState.takeover); // queue non-empty → back to takeover
+    });
+
+    test('hasEscalationInChannel returns true if any escalation in queue matches', () {
+      final c = BottomSheetController();
+      c.enqueueEscalation(const EscalationModel(id: 'e1', question: 'q', options: [], taskId: 't', channelId: 7));
+      expect(c.hasEscalationInChannel(7), isTrue);
+      expect(c.hasEscalationInChannel(99), isFalse);
+    });
+
+    test('setChannels updates channels list + notifies', () {
+      final c = BottomSheetController();
+      var calls = 0;
+      c.addListener(() => calls++);
+      c.setChannels([
+        const ChannelModel(id: 1, name: 'general', kind: 'custom'),
+      ]);
+      expect(c.channels, hasLength(1));
       expect(calls, 1);
     });
   });
