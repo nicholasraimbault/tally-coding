@@ -122,7 +122,9 @@ void main() {
       await tester.pump();
       // Allow async _loadActiveWorkspaceName() to complete
       await tester.pumpAndSettle();
-      expect(find.text('test'), findsOneWidget);
+      // The workspace name appears in both WorkspaceRow (top) and
+      // SidebarFooter (bottom) — at least one is sufficient.
+      expect(find.text('test'), findsAtLeastNWidgets(1));
     });
 
     // F1-Fix1: _BoardBottomSheet must NOT appear on wide layout.
