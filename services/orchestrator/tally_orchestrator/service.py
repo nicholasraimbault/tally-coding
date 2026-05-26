@@ -7685,6 +7685,41 @@ async def _broadcast_new_channel(channel_id: int, workspace_id: int) -> None:
                 )
 
 
+async def _push_escalation(db: "Db", channel_id: int, message_id: int) -> None:
+    """B4: fan out a push notification for an escalation message.
+
+    Identifies the workspace owner, fetches the escalation payload, then
+    calls emit_escalation_push with the full escalation payload so the mobile client
+    can render inline quick-reply action buttons.
+    """
+    try:
+        msg_row = db._conn.execute(
+            "SELECT payload_json FROM messages WHERE id=? AND kind='escalation'",
+            (message_id,),
+        ).fetchone()
+        if msg_row is None:
+            return
+        payload = json.loads(msg_row[0] or "{}")
+        src_row = db._conn.execute(
+            "SELECT w.owner_user_id FROM channels c JOIN workspaces w ON c.workspace_id=w.id "
+            "WHERE c.id=?",
+            (channel_id,),
+        ).fetchone()
+        if src_row is None:
+            return
+        owner_user_id = src_row[0]
+        from .notifications import emit_escalation_push
+        await emit_escalation_push(
+            db,
+            user_id=owner_user_id,
+            escalation_message_id=message_id,
+            channel_id=channel_id,
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.warning("_push_escalation failed: %s", exc)
+
+
 async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
     """Sprint 47 A10: send new_message events to every WebSocket subscribed
     to the user's notification feed where the user is a member of the channel.
@@ -7716,26 +7751,41 @@ async def _broadcast_new_message(channel_id: int, message_id: int) -> None:
                     "ws send_new_message failed for user=%s: %s", user_id, exc
                 )
 
-    # Sprint 49: Tally escalation responder.  If the broadcast message is
-    # kind='escalation', create a DM with the workspace owner + post the
-    # templated Tally message.
+    # B4: Tally escalation responder.  Route kind='escalation' messages
+    # from task channels to the workspace's long-term escalation channel
+    # (default #general).  The old DM path (Sprint 49) is replaced by
+    # this structured routing — escalations now carry quick_reply_options
+    # so the Flutter client can render inline action buttons.
     try:
         msg_row = db._conn.execute(
-            "SELECT kind FROM messages WHERE id=?", (message_id,)
+            "SELECT kind, payload_json FROM messages WHERE id=?", (message_id,)
         ).fetchone()
         if msg_row and msg_row[0] == "escalation":
-            from .channels import handle_escalation
-            dm_ch = handle_escalation(db, channel_id=channel_id, message_id=message_id)
-            if dm_ch:
-                new_msg = db._conn.execute(
-                    "SELECT id FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT 1",
-                    (dm_ch,),
-                ).fetchone()
-                if new_msg:
-                    # Re-enter broadcast for the DM message.  Bounded:
-                    # the new message is kind='text', not 'escalation',
-                    # so this won't recurse further.
-                    await _broadcast_new_message(dm_ch, new_msg[0])
+            from .channels import route_escalation_to_long_term_channel
+            result = route_escalation_to_long_term_channel(
+                db, task_channel_id=channel_id, message_id=message_id
+            )
+            if result:
+                lt_channel_id, new_msg_id = result
+                # Broadcast the routed escalation to the long-term channel members.
+                # The new message is also kind='escalation' but in a different channel,
+                # so _broadcast_new_message won't recurse (channel_id differs).
+                await _broadcast_new_message(lt_channel_id, new_msg_id)
+                # B4: also fire a push notification for this escalation.
+                asyncio.create_task(
+                    _push_escalation(db, lt_channel_id, new_msg_id)
+                )
+                # Also post a narrator "escalation_needed" update in the
+                # task channel so the mini-dash chat bubble shows the right state.
+                esc_payload = json.loads(msg_row[1] or "{}")
+                task_id = esc_payload.get("task_id") or ""
+                if task_id and (orch := state.get("orchestrator")):
+                    asyncio.create_task(
+                        orch._post_narrator_update(
+                            task_id, "escalation_needed",
+                            context={"question": (esc_payload.get("question") or "")[:80]},
+                        )
+                    )
     except Exception as exc:
         logger.warning("escalation handler failed: %s", exc)
 

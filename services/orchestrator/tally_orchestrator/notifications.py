@@ -202,3 +202,71 @@ async def emit_notification(db: "Db", user_id: str, *, kind: str, severity: str 
     nid = insert_notification(db, user_id, kind=kind, severity=severity, payload=payload, rule_id=rule_id)
     asyncio.create_task(fan_out_push(db, user_id, nid))
     return nid
+
+
+async def emit_escalation_push(
+    db: "Db",
+    *,
+    user_id: str,
+    escalation_message_id: int,
+    channel_id: int,
+    payload: dict,
+) -> None:
+    """B4: fan-out a push for an escalation, carrying the full payload.
+
+    Unlike the existing doorbell push (which sends empty content and has the
+    client fetch), escalation pushes encode question + quick_reply_options
+    directly into the push body. This lets the OS render inline action buttons
+    without requiring the app to be open.
+
+    'Open' is always appended as the last action so the user can always deep-link
+    to the long-term channel.
+
+    The push body is JSON:
+        {
+          "type": "escalation",
+          "escalation_message_id": int,
+          "channel_id": int,
+          "question": str,
+          "quick_reply_options": ["Option A", "Option B", ..., "Open"],
+        }
+    """
+    quick_replies = list(payload.get("quick_reply_options") or [])
+    if "Open" not in quick_replies:
+        quick_replies.append("Open")
+
+    push_body = json.dumps({
+        "type": "escalation",
+        "escalation_message_id": escalation_message_id,
+        "channel_id": channel_id,
+        "question": payload.get("question") or "",
+        "quick_reply_options": quick_replies,
+    }).encode()
+
+    # WebSocket broadcast (best-effort, app may be in foreground).
+    for ws in active_websockets_for_user(user_id):
+        try:
+            await ws.send_json({
+                "type": "new_escalation",
+                "escalation_message_id": escalation_message_id,
+                "channel_id": channel_id,
+            })
+        except Exception as exc:
+            logger.warning("ws escalation send failed for user=%s: %s", user_id, exc)
+
+    # UnifiedPush / push devices (app may be closed).
+    devices = db._conn.execute(
+        "SELECT provider, endpoint_url FROM push_devices WHERE user_id=? AND enabled=1",
+        (user_id,),
+    ).fetchall()
+    for provider, endpoint in devices:
+        if provider == "unifiedpush" and endpoint:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as cli:
+                    await cli.post(endpoint, content=push_body)
+                db._conn.execute(
+                    "UPDATE push_devices SET last_seen_at=? WHERE user_id=? AND endpoint_url=?",
+                    (time.time(), user_id, endpoint),
+                )
+            except Exception as exc:
+                logger.warning("unifiedpush escalation POST failed for %s: %s", endpoint, exc)
