@@ -349,9 +349,27 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         _scheduledChannels = scheduled;
         _customChannels = custom;
       });
+      // B3b Task 9: push the full channel list into BottomSheetController so
+      // ChannelsSheet has up-to-date data on every workspace load/switch.
+      _loadChannelsIntoController(channels);
       await _loadEscalationStatus(scheduled);
     } catch (e) {
       debugPrint('discord_shell: failed to load direct channels: $e');
+    }
+  }
+
+  /// B3b Task 9: converts the raw API channel maps into [ChannelModel]s and
+  /// pushes them into [BottomSheetController].  Called after every
+  /// [_fetchDirectChannels] so the channels sheet always reflects the active
+  /// workspace.
+  void _loadChannelsIntoController(List<Map<String, dynamic>> channels) {
+    try {
+      final models = channels
+          .map((c) => ChannelModel.fromJson(c))
+          .toList();
+      context.read<BottomSheetController>().setChannels(models);
+    } catch (e) {
+      debugPrint('discord_shell: _loadChannelsIntoController failed: $e');
     }
   }
 
