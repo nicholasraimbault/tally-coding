@@ -1144,10 +1144,11 @@ class _ChannelTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
       child: Material(
-        color: selected ? const Color(0xFF404249) : Colors.transparent,
+        color: selected ? tc.cardHov : Colors.transparent,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
@@ -1167,7 +1168,7 @@ class _ChannelTile extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
-                          color: selected ? Colors.white : const Color(0xFFC4C9CE),
+                          color: selected ? tc.fg : tc.fgXdim,
                           fontSize: 13,
                           fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                         ),
@@ -1177,8 +1178,8 @@ class _ChannelTile extends StatelessWidget {
                           subtitle!,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Color(0xFF8E9297),
+                          style: TextStyle(
+                            color: tc.fgDim,
                             fontSize: 10,
                           ),
                         ),
@@ -1195,10 +1196,10 @@ class _ChannelTile extends StatelessWidget {
                   SizedBox(
                     width: 24,
                     child: PopupMenuButton<String>(
-                      icon: const Icon(
+                      icon: Icon(
                         Icons.more_horiz,
                         size: 16,
-                        color: Color(0xFF8E9297),
+                        color: tc.fgDim,
                       ),
                       padding: EdgeInsets.zero,
                       tooltip: 'Channel options',
