@@ -226,7 +226,7 @@ void main() {
       expect(
         find.byWidgetPredicate((w) =>
             w is Container &&
-            w.color?.value == const Color(0x0FF7768E).value),
+            w.color?.toARGB32() == const Color(0x0FF7768E).toARGB32()),
         findsOneWidget,
       );
     });
