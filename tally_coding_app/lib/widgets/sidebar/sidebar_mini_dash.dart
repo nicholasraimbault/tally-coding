@@ -66,7 +66,9 @@ class SidebarMiniDash extends StatelessWidget {
   final int openCount;
   final int doneToday;
   final List<SidebarMiniTaskData> tasks;
-  final String narratorText;
+  /// Narrator text from the WS stream. Null until the first narrator event
+  /// arrives; the bubble is hidden when this is null so no placeholder leaks.
+  final String? narratorText;
   final List<String> narratorEmphasis;
   // Escalation state
   final List<SidebarEscalationData> escalations;
@@ -81,7 +83,7 @@ class SidebarMiniDash extends StatelessWidget {
     required this.openCount,
     required this.doneToday,
     required this.tasks,
-    required this.narratorText,
+    this.narratorText,
     required this.narratorEmphasis,
     required this.escalations,
     required this.onQuickReply,
@@ -122,12 +124,16 @@ class SidebarMiniDash extends StatelessWidget {
               if (i < tasks.length - 1) Container(height: 1, color: tc.border),
             ],
           ],
-          const SizedBox(height: 8),
-          _NarratorBubbleInline(
-            text: narratorText,
-            emphasis: narratorEmphasis,
-            tc: tc,
-          ),
+          // F1-Fix2: only show narrator bubble when text is available
+          // (null = no WS narrator event yet; hide to avoid placeholder leaks).
+          if (narratorText != null) ...[
+            const SizedBox(height: 8),
+            _NarratorBubbleInline(
+              text: narratorText!,
+              emphasis: narratorEmphasis,
+              tc: tc,
+            ),
+          ],
         ],
       ),
     );
