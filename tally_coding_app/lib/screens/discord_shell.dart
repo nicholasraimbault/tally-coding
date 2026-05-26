@@ -36,6 +36,7 @@ import 'templates_screen.dart';
 import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
+import '../theme/tc_tokens.dart';
 import '../widgets/server_rail.dart';
 import '../widgets/sidebar/sidebar.dart';
 import 'workspace_settings.dart';
@@ -599,10 +600,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       DirectChannelSelected(channelName: final name) => '#$name',
       BoardSelected() => 'Board',
     };
+    final tc = context.tc;
     return Scaffold(
-      backgroundColor: const Color(0xFF313338),
+      backgroundColor: tc.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1E1F22),
+        backgroundColor: tc.elev,
         foregroundColor: Colors.white,
         title: Text(channelTitle,
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
@@ -724,7 +726,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   void _showMembersSheet(BuildContext context) {
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: const Color(0xFF2B2D31),
+      backgroundColor: context.tc.sheet,
       isScrollControlled: true,
       builder: (ctx) => DraggableScrollableSheet(
         initialChildSize: 0.6,
@@ -739,7 +741,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                 width: 32,
                 height: 4,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF4F545C),
+                  color: context.tc.fgDimmer,
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
@@ -835,8 +837,9 @@ class _PoolWarmingBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     final hasError = lastError != null;
-    final color = hasError ? const Color(0xFFED4245) : const Color(0xFFFAA61A);
+    final color = hasError ? tc.red : tc.yellow;
     final icon = hasError ? Icons.error_outline : Icons.hourglass_top;
     final headline = hasError
         ? 'Workers offline — orchestrator is retrying.'
@@ -861,15 +864,15 @@ class _PoolWarmingBanner extends StatelessWidget {
                   const SizedBox(height: 2),
                   Text(
                     lastError!,
-                    style: const TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                    style: TextStyle(color: tc.fgXdim, fontSize: 11),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
                 ] else ...[
                   const SizedBox(height: 2),
-                  const Text(
+                  Text(
                     "Task submission will fail until at least one worker joins. Reads + billing keep working.",
-                    style: TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                    style: TextStyle(color: tc.fgXdim, fontSize: 11),
                   ),
                 ],
               ],
@@ -924,9 +927,10 @@ class _ChannelList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Container(
       width: width,
-      color: const Color(0xFF2B2D31),
+      color: tc.sheet,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -950,8 +954,7 @@ class _ChannelList extends StatelessWidget {
                   ),
                 // Sprint 50 B7: gear icon → WorkspaceSettingsScreen.
                 IconButton(
-                  icon: const Icon(Icons.settings, size: 18,
-                      color: Color(0xFF8E9297)),
+                  icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
                   tooltip: 'Workspace settings',
                   onPressed: onOpenSettings,
                   padding: EdgeInsets.zero,
@@ -960,7 +963,7 @@ class _ChannelList extends StatelessWidget {
               ],
             ),
           ),
-          Container(height: 1, color: const Color(0xFF1E1F22)),
+          Container(height: 1, color: tc.border),
           Expanded(child: _scrollableBody(context)),
         ],
       ),
@@ -972,7 +975,7 @@ class _ChannelList extends StatelessWidget {
       children: [
         const SizedBox(height: 8),
         _ChannelTile(
-          icon: const Icon(Icons.view_kanban, size: 16, color: Color(0xFF949BA4)),
+          icon: Icon(Icons.view_kanban, size: 16, color: context.tc.fgDim),
           label: 'Board',
           selected: selected is BoardSelected,
           onTap: () => onSelect(const BoardSelected()),
@@ -1010,10 +1013,11 @@ class _ChannelList extends StatelessWidget {
     BuildContext context,
     List<Map<String, dynamic>> channels,
   ) {
+    final tc = context.tc;
     return [
       for (final ch in channels)
         _ChannelTile(
-          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
           label: ch['name'] as String? ?? 'channel',
           selected: selected is DirectChannelSelected &&
               (selected as DirectChannelSelected).channelId == ch['id'] as int,
@@ -1022,7 +1026,7 @@ class _ChannelList extends StatelessWidget {
             ch['name'] as String? ?? 'channel',
           )),
           trailing: (ch['_unread_escalation'] == true)
-              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              ? Icon(Icons.circle, color: tc.yellow, size: 8)
               : null,
         ),
     ];
@@ -1035,10 +1039,11 @@ class _ChannelList extends StatelessWidget {
     BuildContext context,
     List<Map<String, dynamic>> channels,
   ) {
+    final tc = context.tc;
     return [
       for (final ch in channels)
         _ChannelTile(
-          icon: const Icon(Icons.tag, color: Color(0xFF8E9297), size: 14),
+          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
           label: ch['name'] as String? ?? 'channel',
           selected: selected is DirectChannelSelected &&
               (selected as DirectChannelSelected).channelId == ch['id'] as int,
@@ -1047,7 +1052,7 @@ class _ChannelList extends StatelessWidget {
             ch['name'] as String? ?? 'channel',
           )),
           trailing: (ch['_unread_escalation'] == true)
-              ? const Icon(Icons.circle, color: Color(0xFFFF9800), size: 8)
+              ? Icon(Icons.circle, color: tc.yellow, size: 8)
               : null,
           onArchive: onArchiveChannel != null
               ? () => onArchiveChannel!(ch['id'] as int)
@@ -1062,7 +1067,7 @@ class _ChannelList extends StatelessWidget {
       child: Text(
         label,
         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: const Color(0xFF8E9297),
+              color: context.tc.fgDim,
               fontWeight: FontWeight.bold,
               letterSpacing: 1.2,
             ),
@@ -1092,17 +1097,17 @@ class _NewTile extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
             child: Row(
               children: [
-                const SizedBox(
+                SizedBox(
                   width: 20,
                   child: Center(
-                    child: Icon(Icons.add, color: Color(0xFF8E9297), size: 14),
+                    child: Icon(Icons.add, color: context.tc.fgDim, size: 14),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Text(
                   label,
-                  style: const TextStyle(
-                    color: Color(0xFF8E9297),
+                  style: TextStyle(
+                    color: context.tc.fgDim,
                     fontSize: 13,
                     fontWeight: FontWeight.w500,
                   ),
@@ -1139,10 +1144,11 @@ class _ChannelTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
       child: Material(
-        color: selected ? const Color(0xFF404249) : Colors.transparent,
+        color: selected ? tc.cardHov : Colors.transparent,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
@@ -1162,7 +1168,7 @@ class _ChannelTile extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
-                          color: selected ? Colors.white : const Color(0xFFC4C9CE),
+                          color: selected ? tc.fg : tc.fgXdim,
                           fontSize: 13,
                           fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                         ),
@@ -1172,8 +1178,8 @@ class _ChannelTile extends StatelessWidget {
                           subtitle!,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Color(0xFF8E9297),
+                          style: TextStyle(
+                            color: tc.fgDim,
                             fontSize: 10,
                           ),
                         ),
@@ -1190,10 +1196,10 @@ class _ChannelTile extends StatelessWidget {
                   SizedBox(
                     width: 24,
                     child: PopupMenuButton<String>(
-                      icon: const Icon(
+                      icon: Icon(
                         Icons.more_horiz,
                         size: 16,
-                        color: Color(0xFF8E9297),
+                        color: tc.fgDim,
                       ),
                       padding: EdgeInsets.zero,
                       tooltip: 'Channel options',
@@ -1233,10 +1239,11 @@ class _MembersPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     final isSheet = scrollController != null;
     return Container(
       width: isSheet ? null : 240,
-      color: const Color(0xFF2B2D31),
+      color: tc.sheet,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -1250,7 +1257,7 @@ class _MembersPanel extends StatelessWidget {
                 BoardSelected() => 'MEMBERS',
               },
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: const Color(0xFF8E9297),
+                    color: tc.fgDim,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 1.2,
                   ),
@@ -1263,6 +1270,7 @@ class _MembersPanel extends StatelessWidget {
   }
 
   Widget _body(BuildContext context) {
+    final tc = context.tc;
     // Sprint 49 B7: DM / scheduled_agent channels don't have agent rosters.
     // BoardSelected also has no task-specific roster.
     if (selected is GeneralSelected ||
@@ -1270,11 +1278,11 @@ class _MembersPanel extends StatelessWidget {
         selected is BoardSelected) {
       return ListView(
         controller: scrollController,
-        children: const [
+        children: [
           _MemberTile(
             role: tallyMember,
             status: 'online',
-            statusColor: Color(0xFF57F287),
+            statusColor: tc.green,
           ),
         ],
       );
@@ -1283,11 +1291,11 @@ class _MembersPanel extends StatelessWidget {
     final task = tasks.where((t) => t.id == taskId).cast<Task?>().firstOrNull;
     final agents = _agentListFor(task);
     if (agents.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.all(16),
+      return Padding(
+        padding: const EdgeInsets.all(16),
         child: Text(
           'Tally is still picking the team.',
-          style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+          style: TextStyle(color: tc.fgDim, fontSize: 12),
         ),
       );
     }
@@ -1296,14 +1304,15 @@ class _MembersPanel extends StatelessWidget {
       itemCount: agents.length,
       itemBuilder: (context, i) {
         final a = agents[i];
+        final tc = context.tc;
         return _MemberTile(
           role: agentRoleOf(a.roleName),
           status: a.status,
           statusColor: switch (a.status) {
-            'working' => const Color(0xFF5865F2),
-            'done' => const Color(0xFF57F287),
-            'failed' => const Color(0xFFED4245),
-            _ => const Color(0xFF8E9297),
+            'working' => tc.cyan,
+            'done' => tc.green,
+            'failed' => tc.red,
+            _ => tc.fgDimmer,
           },
           model: a.model,
         );
@@ -1380,6 +1389,7 @@ class _MemberTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
       child: Material(
@@ -1411,7 +1421,9 @@ class _MemberTile extends StatelessWidget {
                       decoration: BoxDecoration(
                         color: statusColor,
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0xFF2B2D31), width: 2),
+                        // ring color matches the panel surface so the dot
+                        // appears to float above the avatar bg.
+                        border: Border.all(color: tc.sheet, width: 2),
                       ),
                     ),
                   ],
@@ -1423,8 +1435,8 @@ class _MemberTile extends StatelessWidget {
                     children: [
                       Text(
                         role.name,
-                        style: const TextStyle(
-                          color: Colors.white,
+                        style: TextStyle(
+                          color: tc.fg,
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
                         ),
@@ -1435,8 +1447,8 @@ class _MemberTile extends StatelessWidget {
                             : role.tagline,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFF8E9297),
+                        style: TextStyle(
+                          color: tc.fgDim,
                           fontSize: 10,
                         ),
                       ),
@@ -1628,8 +1640,9 @@ class _NarrowDrawer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Drawer(
-      backgroundColor: const Color(0xFF2B2D31),
+      backgroundColor: tc.sheet,
       child: SafeArea(
         child: Column(
           children: [
@@ -1653,45 +1666,39 @@ class _NarrowDrawer extends StatelessWidget {
                 width: null,
               ),
             ),
-            Container(height: 1, color: const Color(0xFF1E1F22)),
+            Container(height: 1, color: tc.border),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               child: Row(
                 children: [
                   IconButton(
                     tooltip: 'Projects',
-                    icon: const Icon(Icons.folder_outlined, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.folder_outlined, size: 18, color: tc.fgDim),
                     onPressed: onOpenProjects,
                   ),
                   IconButton(
                     tooltip: 'Saved templates',
-                    icon: const Icon(Icons.bookmark_border, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.bookmark_border, size: 18, color: tc.fgDim),
                     onPressed: onOpenTemplates,
                   ),
                   IconButton(
                     tooltip: 'Billing & usage',
-                    icon: const Icon(Icons.credit_card, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.credit_card, size: 18, color: tc.fgDim),
                     onPressed: onOpenBilling,
                   ),
                   IconButton(
                     tooltip: 'Notifications',
-                    icon: const Icon(Icons.notifications_outlined, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.notifications_outlined, size: 18, color: tc.fgDim),
                     onPressed: onOpenNotifications,
                   ),
                   IconButton(
                     tooltip: 'Workspace settings',
-                    icon: const Icon(Icons.settings, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
                     onPressed: onOpenSettings,
                   ),
                   IconButton(
                     tooltip: 'Sign out / reconnect',
-                    icon: const Icon(Icons.logout, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.logout, size: 18, color: tc.fgDim),
                     onPressed: onSignOut,
                   ),
                 ],
