@@ -3090,6 +3090,8 @@ class Orchestrator:
         # (logged at boot if missing).
         self.redpill_key: str | None = None
         self.redpill_base: str = "https://api.redpill.ai/v1"
+        # B4: Tally narrator spend guard — resets daily, caps LLM spend.
+        self._narrator_guard: "NarratorSpendGuard | None" = None
         # Sprint 26: per-task accumulated artifacts. Each value is a
         # {relative_path: base64_content} dict; agents receive prior
         # agents' files via the `seed_files` field on dispatch, and
@@ -3375,6 +3377,12 @@ class Orchestrator:
                     spec=node.get("spec", ""),
                 )
             self.db.mark_running(task["id"])
+            asyncio.create_task(
+                self._post_narrator_update(
+                    task["id"], "task_started",
+                    context={"team_size": len(agent_nodes)},
+                )
+            )
             await self._publish_status(task["id"], "running", {"team_size": len(agent_nodes)})
             # Determine entry nodes (those with no incoming edge).
             entry_ids = _nodes_v1_entry_nodes(team_spec)
@@ -3423,6 +3431,12 @@ class Orchestrator:
                 spec=a.get("spec", ""),
             )
         self.db.mark_running(task["id"])
+        asyncio.create_task(
+            self._post_narrator_update(
+                task["id"], "task_started",
+                context={"team_size": len(agents_spec)},
+            )
+        )
         await self._publish_status(task["id"], "running", {"team_size": len(agents_spec)})
         stages = _resolve_stages(team_spec.get("stages"), len(agents_spec))
         first_stage_indices = stages[0]
@@ -3616,6 +3630,12 @@ class Orchestrator:
             handle.in_flight_task = task["id"]
             self.db.set_task_worker(task["id"], handle.identity)
             self.db.mark_running(task["id"])
+            asyncio.create_task(
+                self._post_narrator_update(
+                    task["id"], "task_started",
+                    context={"team_size": 1},
+                )
+            )
             await self._publish_status(task["id"], "running")
             logger.info("dispatching task %s to worker %s: %s",
                         task["id"][:8], handle.identity[:8], task["description"][:60])
@@ -4049,6 +4069,12 @@ class Orchestrator:
         # Did this agent fail? Short-circuit the rest of the workflow.
         if result.get("success") is False:
             self.db.mark_failed(task_id, f"agent {target_agent['role']} failed: {result.get('error', '?')}")
+            asyncio.create_task(
+                self._post_narrator_update(
+                    task_id, "task_failed",
+                    context={"error_hint": str(result.get("error", ""))[:80]},
+                )
+            )
             self._task_artifacts.pop(task_id, None)  # Sprint 26: free memory
             self.db.delete_artifacts(task_id)        # Sprint 26.5: free durable copy
             await self._publish_status(
@@ -4233,6 +4259,12 @@ class Orchestrator:
             ],
         }
         self.db.mark_completed(task_id, aggregate)
+        asyncio.create_task(
+            self._post_narrator_update(
+                task_id, "task_completed",
+                context={"success": aggregate["success"]},
+            )
+        )
         # Sprint 37: when the task belongs to a project AND the run
         # succeeded overall, merge its final artifacts back into the
         # project's HEAD before we free the in-memory copy.  Failed
@@ -4263,6 +4295,108 @@ class Orchestrator:
         )
         logger.info("task %s team complete: %d agents, %d artifact(s) accumulated",
                     task_id[:8], len(final_agents), artifact_count)
+
+    async def _post_narrator_update(
+        self,
+        task_id: str,
+        event: str,
+        context: dict | None = None,
+    ) -> None:
+        """B4: generate a narrator update and insert it into the task channel.
+
+        Silently skips when:
+        - redpill_key is not set
+        - narrator spend guard is at cap
+        - task channel cannot be resolved
+
+        Never raises; narrator failures must not affect the task pipeline.
+
+        event values: task_started | agent_stuck | task_completed | task_failed |
+                      escalation_needed | periodic
+        """
+        if not self.redpill_key:
+            return
+        guard = self._narrator_guard
+        # Estimated: narrator calls use ~120 prompt + 60 completion = ~180 tokens
+        if guard is not None and not guard.can_spend(180):
+            logger.warning(
+                "narrator spend guard: daily cap reached, skipping event=%s task=%s",
+                event, task_id[:8],
+            )
+            return
+        from .channels import resolve_task_channel_id, insert_message
+        channel_id = resolve_task_channel_id(self.db, task_id)
+        if channel_id is None:
+            return
+        task_row = self.db.get_task(task_id)
+        if task_row is None:
+            return
+        description = task_row.get("description", "")[:120]
+        try:
+            from .narrator import generate_narrator_update
+            text = await asyncio.to_thread(
+                generate_narrator_update,
+                task_description=description,
+                event=event,
+                context=context or {},
+                redpill_key=self.redpill_key,
+                redpill_base=self.redpill_base,
+            )
+        except Exception as exc:
+            logger.warning("_post_narrator_update generate failed: %s", exc)
+            return
+        if guard is not None:
+            guard.record(180)   # conservative fixed estimate; usage dict not returned here
+        try:
+            msg_id = insert_message(
+                self.db,
+                channel_id=channel_id,
+                author_kind="tally",
+                kind="tally_narrator",
+                payload={"text": text, "event": event},
+            )
+            asyncio.create_task(_broadcast_new_message(channel_id, msg_id))
+            logger.debug(
+                "narrator posted kind=tally_narrator channel=%d task=%s event=%s",
+                channel_id, task_id[:8], event,
+            )
+        except Exception as exc:
+            logger.warning("_post_narrator_update insert failed: %s", exc)
+
+    async def run_narrator_sweeper(self) -> None:
+        """B4: every 5 min, post a narrator update for each task currently `running`.
+
+        This is the periodic arm of the narrator (spec §5.7 "at least every 5 min
+        for tasks in flight"). Event-driven narration (task_started, etc.) covers
+        transitions; this sweep covers the steady-state working period.
+
+        Silently skips when redpill_key is not configured.
+
+        # TODO: cross-task synthesis (a single global Tally status across all
+        # running tasks posted to #general) is a follow-up concern and is not
+        # implemented here. That would require aggregating across task channels.
+        """
+        interval_s = float(os.environ.get("TALLY_NARRATOR_SWEEP_INTERVAL_S", "300"))
+        while True:
+            await asyncio.sleep(interval_s)
+            if not self.redpill_key:
+                continue
+            try:
+                running_tasks = self.db.list_tasks(limit=100)
+                for task in running_tasks:
+                    if task.get("status") != "running":
+                        continue
+                    task_id = task["id"]
+                    asyncio.create_task(
+                        self._post_narrator_update(
+                            task_id, "periodic",
+                            context={"status": "running"},
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("narrator sweeper iteration failed: %s", exc)
 
     async def run_period_rollover_sweeper(self) -> None:
         """Sprint 44: every hour, roll over any quota row whose
@@ -4853,6 +4987,10 @@ async def lifespan(app: FastAPI):
         orchestrator.redpill_base = os.environ.get("REDPILL_BASE_URL", "https://api.redpill.ai/v1")
     if orchestrator.redpill_key:
         logger.info("Tally architect ready (Red Pill at %s)", orchestrator.redpill_base)
+        # B4: narrator guard — cap at env var TALLY_NARRATOR_MAX_TOKENS_PER_DAY
+        from .narrator import NarratorSpendGuard
+        daily_cap = int(os.environ.get("TALLY_NARRATOR_MAX_TOKENS_PER_DAY", "50000"))
+        orchestrator._narrator_guard = NarratorSpendGuard(daily_cap=daily_cap)
     else:
         logger.warning("REDPILL_API_KEY not set; architect will fall back to Solo Coder")
     state["orchestrator"] = orchestrator
@@ -5104,6 +5242,10 @@ async def lifespan(app: FastAPI):
         orchestrator._persistent_agents_loop()
     )
     state["pool_bootstrap_task"] = asyncio.create_task(_bootstrap_pool_in_background())
+    # B4: narrator sweeper — posts periodic narrator updates for in-flight tasks.
+    state["narrator_sweeper_task"] = asyncio.create_task(
+        orchestrator.run_narrator_sweeper()
+    )
     logger.info(
         "HTTP up; sweeper + nightly backup + persistent-agents cron started; "
         "pool bootstrap kicked off in background (target=%d)",
@@ -5118,7 +5260,7 @@ async def lifespan(app: FastAPI):
         # bootstrap task itself might still be in flight if shutdown
         # arrives during a redeploy window.  Cancel whatever's set.
         orchestrator._stopping = True
-        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task", "persistent_agents_task"):
+        for key in ("pool_bootstrap_task", "processor_task", "sweeper_task", "quota_sweeper_task", "backup_task", "persistent_agents_task", "narrator_sweeper_task"):
             t = state.get(key)
             if t is None:
                 continue
