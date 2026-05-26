@@ -492,5 +492,8 @@ The locked design (v17) drove the Claude Design iteration. Claude Design mockups
 - [ ] Sub-project B3 (mini dash + escalation flow + channels sheet) plan written.
 - [x] Sub-project B3a (mini dash + escalation takeover) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b3a-mini-dash-escalation-takeover.md`
 - [x] Sub-project B3a implemented: AmbientMiniDash + EscalationSheet + BottomSheetController; mounts on BoardSelected via Stack overlay; escalations enqueue from NotificationsWs kind='escalation' events; quick replies post back via TallyOrchClient.postMessage; kanban RunningTaskCard gets escalated variant (PAUSED · NEEDS YOU footer). Channels sheet expanded state + inline escalation card deferred to B3b.
+- [x] Sub-project B3b (channels sheet + inline escalation card) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b3b-channels-sheet-inline-escalation.md`
+- [x] Sub-project B3b implemented: ChannelsSheet (swipe-up from mini dash) shows long-term channels with author-avatar snippets + need-attention highlighting; InlineEscalationCard embedded in long-term channel chats; channel highlighting derives from BottomSheetController escalation queue.
+- [x] Sub-project B3 (mini dash + escalation flow + channels sheet) COMPLETE via B3a + B3b sub-plans.
 - [x] Sub-project B4 (push notifications + Tally narrator) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b4-push-narrator.md`
 - [x] Sub-project B5 (desktop sidebar variants) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b5-desktop-sidebar.md`
