@@ -142,10 +142,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     widget.wsClient.onChannelCreated = (_, __) {
       if (mounted) _fetchDirectChannels();
     };
-    // B3a Task 12: subscribe to new_message events to extract
-    // kind='tally_narrator' payloads and update the ambient mini-dash
-    // narrator bubble.  Fetches the message content via REST (same
-    // pattern as task_channel.dart) — WS frame only carries the id.
+    // B3a Task 12+13: subscribe to new_message events to extract
+    // kind='tally_narrator' (narrator bubble) and kind='escalation'
+    // (enqueue into BottomSheetController).  Fetches message content
+    // via REST — WS frame only carries the ids.
     widget.wsClient.onNewMessage = (channelId, messageId) async {
       try {
         final msgs = await widget.client.getMessages(
@@ -157,11 +157,24 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         final msg = msgs.first as Map<String, dynamic>;
         final kind = msg['kind'] as String?;
         if (kind == 'tally_narrator') {
+          // B3a Task 12: update narrator bubble text.
           final text = msg['text'] as String?;
           if (text != null) setState(() => _latestNarratorText = text);
+        } else if (kind == 'escalation') {
+          // B3a Task 13: route escalation payload into the controller.
+          final payload = msg['payload'] as Map?;
+          if (payload != null) {
+            final esc = EscalationModel.fromJson({
+              ...payload.cast<String, dynamic>(),
+              // Prefer channel_id from the WS frame (the channel the
+              // message lives in); fall back to payload if present.
+              'channel_id': channelId,
+            });
+            context.read<BottomSheetController>().enqueueEscalation(esc);
+          }
         }
       } catch (_) {
-        // Non-critical: narrator text stays at its last value.
+        // Non-critical: narrator/escalation stays at last known value.
       }
     };
   }
