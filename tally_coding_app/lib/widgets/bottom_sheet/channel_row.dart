@@ -65,3 +65,82 @@ class CalmChannelRow extends StatelessWidget {
     );
   }
 }
+
+/// A channel row with a 3px coral left accent and amber-wash background,
+/// shown when the channel has one or more pending escalations.
+///
+/// Displays the channel name, an escalation count pill, and calls [onTap]
+/// when tapped.
+///
+/// Example:
+/// ```dart
+/// NeedsAttentionChannelRow(
+///   channel: channel,
+///   escalationCount: 2,
+///   onTap: () {},
+/// )
+/// ```
+class NeedsAttentionChannelRow extends StatelessWidget {
+  final ChannelModel channel;
+  final int escalationCount;
+  final VoidCallback onTap;
+
+  const NeedsAttentionChannelRow({
+    super.key,
+    required this.channel,
+    required this.escalationCount,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    final coral = tc.red;
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: tc.red.withValues(alpha: 0.06), // amber-wash
+          border: Border(
+            left: BorderSide(color: coral, width: 3),
+            bottom: BorderSide(color: tc.border, width: 1),
+          ),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                '#${channel.name}',
+                style: TextStyle(
+                  color: tc.fg,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Inline pill for escalation count
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                border: Border.all(color: coral, width: 1),
+              ),
+              child: Text(
+                escalationCount == 1
+                    ? '1 ESCALATION'
+                    : '$escalationCount ESCALATIONS',
+                style: TextStyle(
+                  color: coral,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
