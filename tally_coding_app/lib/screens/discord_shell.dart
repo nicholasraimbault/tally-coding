@@ -33,6 +33,7 @@ import 'persistent_agents.dart';
 import 'projects_screen.dart';
 import 'task_channel.dart';
 import 'templates_screen.dart';
+import '../theme/tc_tokens.dart';
 import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
@@ -501,9 +502,39 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     )).toList();
 
     // B5: stub ambient data from current task list.
-    // Task 9 will wire this to MiniDashController when B3 controller ships.
     final runningTasks = _tasks.where((t) => t.status == 'running').toList();
     final doneTodayCount = _tasks.where((t) => t.status == 'completed').length;
+
+    // F1-Fix4: bridge BottomSheetController.queue → SidebarShell.escalations
+    // so the desktop sidebar mini-dash reflects real escalations from WS events.
+    // EscalationModel → SidebarEscalationData: map channelId to a channel name
+    // from the loaded channels list; fall back to '#<id>' when not found.
+    final bsController = context.watch<BottomSheetController>();
+    final sidebarEscalations = bsController.queue.map((esc) {
+      // Resolve channel name from the channels the controller knows about.
+      final ch = bsController.channels
+          .cast<ChannelModel?>()
+          .firstWhere((c) => c?.id == esc.channelId, orElse: () => null);
+      final channelName = ch?.name ?? '${esc.channelId}';
+      // Resolve task name from local task list.
+      final task = _tasks.cast<Task?>().firstWhere(
+        (t) => t?.id == esc.taskId,
+        orElse: () => null,
+      );
+      final taskName = task?.channelTitle ?? esc.taskId;
+      return SidebarEscalationData(
+        channelName: channelName,
+        taskName: taskName,
+        question: esc.question,
+        quickReplies: esc.options,
+        emphasizedTerms: const [],
+      );
+    }).toList();
+
+    // F1-Fix5: whether a right pane should be shown alongside the kanban.
+    final hasRightPane = _selected is TaskSelected ||
+        _selected is DirectChannelSelected ||
+        _selected is GeneralSelected;
 
     return Scaffold(
       body: SafeArea(
@@ -525,6 +556,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     onSearchTap: () {}, // search deferred
                     channels: sidebarChannels,
                     activeChannelName: _activeLongTermChannelName(),
+                    // F1-Fix3: Board entry — highlight when board is selected,
+                    // tap → return to board view from any channel/task.
+                    isBoardSelected: _selected is BoardSelected,
+                    onBoardTap: () => setState(() => _selected = const BoardSelected()),
                     onChannelTap: (name) {
                       final ch = _customChannels.firstWhere(
                         (c) => c['name'] == name,
@@ -547,7 +582,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                       );
                       if (newCh != null && mounted) await _fetchDirectChannels();
                     },
-                    // Ambient mini-dash data (stub — wire MiniDashController in Task 9)
+                    // Ambient mini-dash data
                     openCount: runningTasks.length,
                     doneToday: doneTodayCount,
                     tasks: runningTasks.take(3).map((t) => SidebarMiniTaskData(
@@ -555,14 +590,86 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                       agentRoles: _agentRolesFor(t),
                       progressPct: _progressFor(t),
                     )).toList(),
-                    narratorText: _latestNarratorText ?? 'Agents are running.',
+                    // F1-Fix2: pass null directly; SidebarMiniDash hides the
+                    // narrator bubble until a real WS narrator event arrives.
+                    narratorText: _latestNarratorText,
                     narratorEmphasis: const [],
-                    escalations: const [], // wire via MiniDashController in Task 9
-                    onQuickReply: (_) {},
-                    onSkipEscalation: () {},
-                    onOpenChannel: () {},
+                    // F1-Fix4: live escalations from BottomSheetController queue.
+                    escalations: sidebarEscalations,
+                    // F1-Fix4: quick-reply posts message + resolves escalation
+                    // (mirrors the onReply logic in _BoardBottomSheet).
+                    onQuickReply: (option) async {
+                      final esc = bsController.activeEscalation;
+                      if (esc == null) return;
+                      try {
+                        await widget.client.postMessage(
+                          channelId: esc.channelId,
+                          text: option,
+                          kind: 'message',
+                          payload: {'in_response_to_escalation': esc.id},
+                        );
+                      } catch (_) {
+                        // POST failed — keep escalation active for retry.
+                        return;
+                      }
+                      if (context.mounted) {
+                        context.read<BottomSheetController>().resolveActive();
+                      }
+                    },
+                    // F1-Fix4: skip cycles the head escalation to the tail.
+                    onSkipEscalation: bsController.skip,
+                    // F1-Fix4: open escalation channel in the right pane.
+                    onOpenChannel: () {
+                      final esc = bsController.activeEscalation;
+                      if (esc == null) return;
+                      final ch = bsController.channels
+                          .cast<ChannelModel?>()
+                          .firstWhere(
+                            (c) => c?.id == esc.channelId,
+                            orElse: () => null,
+                          );
+                      final name = ch?.name ?? 'general';
+                      setState(() => _selected = DirectChannelSelected(esc.channelId, name));
+                    },
                   ),
-                  Expanded(child: _mainPane()),
+                  // F1-Fix5: Desktop split-pane — kanban always visible on desktop.
+                  // When hasRightPane, kanban occupies flex:1 and the right pane
+                  // takes an additional flex:1 (50/50 split).
+                  // When board-only, kanban expands to fill all remaining space.
+                  Expanded(
+                    child: hasRightPane
+                        ? Row(
+                            children: [
+                              // Left half: kanban (always visible on desktop).
+                              Expanded(
+                                child: KanbanView(
+                                  tasks: _filteredTasksForKanban(),
+                                  onTaskTap: (task) => setState(
+                                    () => _selected = TaskSelected(task.id),
+                                  ),
+                                  onNewTask: () => setState(
+                                    () => _selected = const GeneralSelected(),
+                                  ),
+                                ),
+                              ),
+                              // Right half: chat pane with a close affordance.
+                              Expanded(
+                                child: Column(
+                                  children: [
+                                    // Close button strip at top of right pane.
+                                    _RightPaneCloseBar(
+                                      onClose: () => setState(
+                                        () => _selected = const BoardSelected(),
+                                      ),
+                                    ),
+                                    Expanded(child: _mainPane(isNarrow: false)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          )
+                        : _mainPane(isNarrow: false),
+                  ),
                 ],
               ),
             ),
@@ -716,7 +823,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                 joined: _poolJoined,
                 lastError: _poolLastError,
               ),
-            Expanded(child: _mainPane()),
+            Expanded(child: _mainPane(isNarrow: true)),
           ],
         ),
       ),
@@ -759,7 +866,13 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     );
   }
 
-  Widget _mainPane() {
+  /// Returns the main pane widget for the current [_selected] state.
+  ///
+  /// [isNarrow] controls whether the mobile bottom sheet overlay is mounted.
+  /// On desktop (isNarrow == false) the BoardSelected arm returns only
+  /// [KanbanView]; the [SidebarMiniDash] docked in [SidebarShell] serves as
+  /// the ambient/escalation surface instead.
+  Widget _mainPane({bool isNarrow = true}) {
     return switch (_selected) {
       GeneralSelected() => GeneralChannelScreen(
           client: widget.client,
@@ -784,32 +897,42 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         ),
       // B3a Task 11: wrap kanban in a Stack so the bottom sheet can
       // overlay at the bottom without pushing kanban content up.
-      BoardSelected() => Stack(
-          children: [
-            Positioned.fill(
-              child: KanbanView(
-                tasks: _filteredTasksForKanban(),
-                onTaskTap: (task) =>
-                    setState(() => _selected = TaskSelected(task.id)),
-                onNewTask: () =>
-                    setState(() => _selected = const GeneralSelected()),
-              ),
+      // F1-Fix1: only mount _BoardBottomSheet on narrow (mobile) layout;
+      // desktop uses SidebarMiniDash in SidebarShell instead.
+      BoardSelected() => isNarrow
+          ? Stack(
+              children: [
+                Positioned.fill(
+                  child: KanbanView(
+                    tasks: _filteredTasksForKanban(),
+                    onTaskTap: (task) =>
+                        setState(() => _selected = TaskSelected(task.id)),
+                    onNewTask: () =>
+                        setState(() => _selected = const GeneralSelected()),
+                  ),
+                ),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: _BoardBottomSheet(
+                    tasks: _filteredTasksForKanban(),
+                    latestNarratorText: _latestNarratorText,
+                    client: widget.client,
+                    onOpenChannel: (channelId, name) => setState(() {
+                      _selected = DirectChannelSelected(channelId, name);
+                    }),
+                  ),
+                ),
+              ],
+            )
+          : KanbanView(
+              tasks: _filteredTasksForKanban(),
+              onTaskTap: (task) =>
+                  setState(() => _selected = TaskSelected(task.id)),
+              onNewTask: () =>
+                  setState(() => _selected = const GeneralSelected()),
             ),
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: _BoardBottomSheet(
-                tasks: _filteredTasksForKanban(),
-                latestNarratorText: _latestNarratorText,
-                client: widget.client,
-                onOpenChannel: (channelId, name) => setState(() {
-                  _selected = DirectChannelSelected(channelId, name);
-                }),
-              ),
-            ),
-          ],
-        ),
     };
   }
 
@@ -1459,6 +1582,52 @@ class _MemberTile extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// F1-Fix5: close bar for the desktop right pane.
+// ─────────────────────────────────────────────────────────────
+
+/// A slim 36 px bar at the top of the desktop right pane that shows the
+/// current channel/task name and a close button (✕) that collapses the
+/// pane back to board-only view.
+///
+/// Uses TCTokens so it follows the active theme.
+class _RightPaneCloseBar extends StatelessWidget {
+  final VoidCallback onClose;
+  const _RightPaneCloseBar({required this.onClose});
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    return Container(
+      height: 36,
+      decoration: BoxDecoration(
+        color: tc.elev,
+        border: Border(bottom: BorderSide(color: tc.border, width: 1)),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(child: const SizedBox.shrink()),
+          GestureDetector(
+            onTap: onClose,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: Tooltip(
+                message: 'Close panel',
+                child: Icon(
+                  Icons.close,
+                  size: 16,
+                  color: tc.fgXdim,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

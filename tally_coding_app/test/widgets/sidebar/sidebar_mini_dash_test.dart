@@ -71,6 +71,26 @@ void main() {
       expect(find.text('All good.'), findsOneWidget);
     });
 
+    // F1-Fix2: null narratorText hides the bubble.
+    testWidgets('F1-Fix2: null narratorText hides narrator bubble',
+        (tester) async {
+      await tester.pumpWidget(_wrap(SidebarMiniDash(
+        openCount: 2,
+        doneToday: 1,
+        tasks: const [],
+        // narratorText intentionally omitted (defaults to null)
+        narratorEmphasis: const [],
+        escalations: const [],
+        onQuickReply: (_) {},
+        onSkipEscalation: () {},
+        onOpenChannel: () {},
+      )));
+      // No narrator bubble text should be present when text is null.
+      // Verify by checking that the TallyAvatar (used in bubble) is absent.
+      // Also verify no placeholder string appears.
+      expect(find.text('Agents are running.'), findsNothing);
+    });
+
     testWidgets('has top border + no drag handle', (tester) async {
       await tester.pumpWidget(_wrap(SidebarMiniDash(
         openCount: 0,

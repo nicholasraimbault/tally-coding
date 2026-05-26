@@ -42,13 +42,20 @@ class SidebarShell extends StatelessWidget {
   // SidebarChannelsList props
   final List<SidebarChannelEntry> channels;
   final String? activeChannelName;
+  /// When true, the Board nav entry in [SidebarChannelsList] is highlighted.
+  final bool isBoardSelected;
+  /// Invoked when the user taps the Board entry. Wired from [_buildWide] in
+  /// discord_shell.dart to set [_selected = const BoardSelected()].
+  final VoidCallback? onBoardTap;
   final void Function(String name) onChannelTap;
   final VoidCallback onAddChannel;
   // SidebarMiniDash props (ambient)
   final int openCount;
   final int doneToday;
   final List<SidebarMiniTaskData> tasks;
-  final String narratorText;
+  /// Narrator text from the WS stream. Null = no narrator event yet;
+  /// [SidebarMiniDash] hides the bubble when this is null.
+  final String? narratorText;
   final List<String> narratorEmphasis;
   // SidebarMiniDash props (escalation)
   final List<SidebarEscalationData> escalations;
@@ -64,12 +71,14 @@ class SidebarShell extends StatelessWidget {
     required this.onSearchTap,
     required this.channels,
     required this.activeChannelName,
+    this.isBoardSelected = false,
+    this.onBoardTap,
     required this.onChannelTap,
     required this.onAddChannel,
     required this.openCount,
     required this.doneToday,
     required this.tasks,
-    required this.narratorText,
+    this.narratorText,
     required this.narratorEmphasis,
     required this.escalations,
     required this.onQuickReply,
@@ -102,6 +111,8 @@ class SidebarShell extends StatelessWidget {
               child: SidebarChannelsList(
                 channels: channels,
                 activeChannelName: activeChannelName,
+                isBoardSelected: isBoardSelected,
+                onBoardTap: onBoardTap,
                 onChannelTap: onChannelTap,
                 onAddChannel: onAddChannel,
               ),
