@@ -25,4 +25,23 @@ void main() {
     )));
     expect(find.byKey(const ValueKey('drag-handle')), findsOneWidget);
   });
+
+  testWidgets('renders MiniTaskRow children inside body', (tester) async {
+    await tester.pumpWidget(_wrap(const AmbientMiniDash(
+      openCount: 1, doneCount: 0,
+      taskRows: [
+        MiniTaskRow(title: 'Fix daily-deals', progress: 0.6),
+      ],
+      narratorText: null,
+    )));
+    expect(find.text('Fix daily-deals'), findsOneWidget);
+  });
+
+  testWidgets('MiniTaskRow renders progress', (tester) async {
+    await tester.pumpWidget(_wrap(const Padding(
+      padding: EdgeInsets.all(16),
+      child: MiniTaskRow(title: 'x', progress: 0.7),
+    )));
+    expect(find.byType(MiniTaskRow), findsOneWidget);
+  });
 }

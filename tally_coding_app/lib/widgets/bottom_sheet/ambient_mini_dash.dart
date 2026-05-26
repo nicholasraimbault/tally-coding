@@ -101,3 +101,54 @@ class _StatLabel extends StatelessWidget {
     );
   }
 }
+
+class MiniTaskRow extends StatelessWidget {
+  final String title;
+  final double progress;
+
+  const MiniTaskRow({super.key, required this.title, required this.progress});
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = context.tc;
+    final clamped = progress.clamp(0.0, 1.0);
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              title,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: tc.fgDim, fontSize: 13),
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 60,
+            height: 3,
+            child: Container(
+              color: tc.border,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: FractionallySizedBox(
+                  widthFactor: clamped,
+                  child: Container(color: tc.green),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '${(clamped * 100).round()}%',
+            style: TextStyle(
+              color: tc.fgXdim,
+              fontSize: 11,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
