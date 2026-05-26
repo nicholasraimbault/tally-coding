@@ -142,6 +142,28 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     widget.wsClient.onChannelCreated = (_, __) {
       if (mounted) _fetchDirectChannels();
     };
+    // B3a Task 12: subscribe to new_message events to extract
+    // kind='tally_narrator' payloads and update the ambient mini-dash
+    // narrator bubble.  Fetches the message content via REST (same
+    // pattern as task_channel.dart) — WS frame only carries the id.
+    widget.wsClient.onNewMessage = (channelId, messageId) async {
+      try {
+        final msgs = await widget.client.getMessages(
+          channelId: channelId,
+          limit: 1,
+          sinceId: messageId - 1,
+        );
+        if (msgs.isEmpty || !mounted) return;
+        final msg = msgs.first as Map<String, dynamic>;
+        final kind = msg['kind'] as String?;
+        if (kind == 'tally_narrator') {
+          final text = msg['text'] as String?;
+          if (text != null) setState(() => _latestNarratorText = text);
+        }
+      } catch (_) {
+        // Non-critical: narrator text stays at its last value.
+      }
+    };
   }
 
   @override
@@ -166,6 +188,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   void dispose() {
     _refresh?.cancel();
     _healthRefresh?.cancel();
+    // B3a Task 12: clear the WS message callback to avoid callbacks
+    // firing after the shell is unmounted.
+    widget.wsClient.onNewMessage = null;
     super.dispose();
   }
 
