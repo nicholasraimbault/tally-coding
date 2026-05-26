@@ -1434,6 +1434,24 @@ class _BoardBottomSheet extends StatelessWidget {
 
     if (controller.state == SheetState.hidden) return const SizedBox.shrink();
 
+    // B3b Task 8: channels-expanded state — full channel list sheet.
+    if (controller.state == SheetState.channelsExpanded) {
+      return ChannelsSheet(
+        channels: controller.channels,
+        needsAttention: {
+          for (final e in controller.queue) e.channelId,
+        },
+        escalationCountByChannel: {
+          for (final e in controller.queue)
+            e.channelId: (controller.queue
+                    .where((q) => q.channelId == e.channelId)
+                    .length),
+        },
+        onChannelTap: (ch) => onOpenChannel(ch.id, ch.name),
+        onCollapse: controller.collapseToAmbient,
+      );
+    }
+
     if (controller.state == SheetState.takeover &&
         controller.activeEscalation != null) {
       final esc = controller.activeEscalation!;
@@ -1491,15 +1509,24 @@ class _BoardBottomSheet extends StatelessWidget {
     final open = tasks.length - done;
     final running = tasks.where((t) => t.status == 'running').toList();
 
-    return AmbientMiniDash(
-      openCount: open,
-      doneCount: done,
-      taskRows: [
-        for (final t in running.take(2))
-          // Progress placeholder: B3b will wire real per-task progress.
-          MiniTaskRow(title: t.channelTitle, progress: 0.5),
-      ],
-      narratorText: latestNarratorText,
+    // B3b Task 8: swipe-up on ambient dash expands to channels sheet.
+    return GestureDetector(
+      onVerticalDragEnd: (details) {
+        // Negative primaryVelocity = upward swipe.
+        if ((details.primaryVelocity ?? 0) < -200) {
+          context.read<BottomSheetController>().expandChannels();
+        }
+      },
+      child: AmbientMiniDash(
+        openCount: open,
+        doneCount: done,
+        taskRows: [
+          for (final t in running.take(2))
+            // Progress placeholder: B3b will wire real per-task progress.
+            MiniTaskRow(title: t.channelTitle, progress: 0.5),
+        ],
+        narratorText: latestNarratorText,
+      ),
     );
   }
 }
