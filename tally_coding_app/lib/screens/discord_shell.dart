@@ -605,7 +605,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         backgroundColor: const Color(0xFF1E1F22),
         foregroundColor: Colors.white,
         title: Text(channelTitle,
-            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+            style: const TextStyle(
+              fontFamily: 'JetBrainsMono',
+              fontWeight: FontWeight.w600,
+              fontSize: 16,
+            )),
         actions: [
           IconButton(
             tooltip: 'Members / agents',

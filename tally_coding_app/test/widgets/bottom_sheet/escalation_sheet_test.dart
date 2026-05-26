@@ -39,13 +39,14 @@ void main() {
     expect(find.textContaining('needs you'), findsOneWidget);
   });
 
-  testWidgets('shows queue badge "1 of N" when queueSize > 1', (tester) async {
+  testWidgets('shows queue badge "1/N" when queueSize > 0', (tester) async {
     await tester.pumpWidget(_wrap(EscalationSheet(
       escalation: _esc, queueIndex: 0, queueSize: 3,
       taskTitle: 't', channelName: 'g',
       onReply: (_) {}, onSkip: () {}, onOpen: () {},
     )));
-    expect(find.text('1 of 3'), findsOneWidget);
+    // Compact "1/3" format per mockup (was "1 of 3").
+    expect(find.text('1/3'), findsOneWidget);
   });
 
   testWidgets('renders one BrutalButton per option', (tester) async {
