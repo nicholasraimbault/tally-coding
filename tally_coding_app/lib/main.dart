@@ -13,6 +13,7 @@ import 'screens/discord_shell.dart';
 import 'services/notifications_ws.dart';
 import 'state/workspace_context.dart';
 import 'theme/theme.dart';
+import 'widgets/bottom_sheet/bottom_sheet.dart';
 
 /// Sprint 32.5: Clerk publishable key (compile-time via --dart-define).
 /// The dart-define is mandatory; we fail loudly at boot rather than
@@ -49,9 +50,13 @@ Future<void> main() async {
   await clerk.setUpLogging(printer: const _LogPrinter());
   final themeController = ThemeController();
   await themeController.load();
+  final bottomSheetController = BottomSheetController();
   runApp(
-    ChangeNotifierProvider.value(
-      value: themeController,
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: themeController),
+        ChangeNotifierProvider.value(value: bottomSheetController),
+      ],
       child: const TallyApp(),
     ),
   );
