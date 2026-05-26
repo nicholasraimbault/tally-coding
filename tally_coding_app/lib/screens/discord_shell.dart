@@ -22,23 +22,14 @@ import 'package:provider/provider.dart';
 
 import '../agent_roles.dart';
 import '../api.dart';
-import '../main.dart';
 import '../services/notifications_ws.dart';
 import '../state/workspace_context.dart';
 import '../widgets/bottom_sheet/bottom_sheet.dart';
-import 'billing_screen.dart';
 import 'general_channel.dart';
-import 'notifications_screen.dart';
-import 'persistent_agents.dart';
-import 'projects_screen.dart';
 import 'task_channel.dart';
-import 'templates_screen.dart';
 import '../theme/tc_tokens.dart';
 import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
-import '../widgets/new_dm_modal.dart';
-import '../theme/tc_tokens.dart';
-import '../widgets/server_rail.dart';
 import '../widgets/sidebar/sidebar.dart';
 import 'workspace_settings.dart';
 
@@ -87,8 +78,6 @@ class DiscordShellScreen extends StatefulWidget {
 
 class _DiscordShellScreenState extends State<DiscordShellScreen> {
   List<Task> _tasks = const [];
-  bool _loading = true;
-  String? _error;
   Timer? _refresh;
   Timer? _healthRefresh;
   late ChannelSelection _selected;
@@ -103,9 +92,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   // task mode (legacy behaviour).  Threaded into the composer so newly
   // submitted tasks inherit the project's HEAD artifact set.
   String? _activeProjectId;
-  // Sprint 49 B7: DM and scheduled_agent channels loaded from the API.
-  List<Map<String, dynamic>> _dmChannels = const [];
-  List<Map<String, dynamic>> _scheduledChannels = const [];
   // Sprint 50 B7: custom channels loaded from the API.
   List<Map<String, dynamic>> _customChannels = const [];
   // Sprint 54: tracks which workspace's direct channels we last fetched
@@ -160,7 +146,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           sinceId: messageId - 1,
         );
         if (msgs.isEmpty || !mounted) return;
-        final msg = msgs.first as Map<String, dynamic>;
+        final msg = msgs.first;
         final kind = msg['kind'] as String?;
         if (kind == 'tally_narrator') {
           // B3a Task 12: update narrator bubble text.
@@ -220,15 +206,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       if (!mounted) return;
       setState(() {
         _tasks = _sortForChannelList(tasks);
-        _loading = false;
-        _error = null;
       });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = e.toString();
-      });
+    } catch (_) {
+      // Non-critical: keep showing last known task list.
     }
   }
 
@@ -282,11 +262,10 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   /// handler that left the user tapping the gear icon with no
   /// feedback when their shared_preferences.active_workspace_id
   /// pointed at a workspace they're no longer a member of.
-  Future<void> _openSettings({bool popFirst = false}) async {
+  Future<void> _openSettings() async {
     final wsId = WorkspaceContext.of(context).activeWorkspaceId;
     final nav = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
-    if (popFirst) nav.pop();  // close the narrow drawer first
 
     final List<Map<String, dynamic>> myWs;
     try {
@@ -346,14 +325,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         workspaceId: WorkspaceContext.activeIdOrDefault(context),
       );
       if (!mounted) return;
-      final dms = channels.where((c) => c['kind'] == 'dm').toList();
       final scheduled = channels
           .where((c) => c['kind'] == 'scheduled_agent')
           .toList();
       final custom = channels.where((c) => c['kind'] == 'custom').toList();
       setState(() {
-        _dmChannels = dms;
-        _scheduledChannels = scheduled;
         _customChannels = custom;
       });
       // B3b Task 9: push the full channel list into BottomSheetController so
@@ -426,51 +402,6 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     } catch (_) {
       // silent: badge shows 'workspace' as fallback
     }
-  }
-
-/// Sprint 33-rest: server rail 💳 → push the billing screen.
-  Future<void> _openBilling(BuildContext context) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => BillingScreen(
-          client: widget.client,
-        ),
-      ),
-    );
-  }
-
-  /// Sprint 34: server rail 📋 → saved templates catalogue.
-  Future<void> _openTemplates(BuildContext context) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => TemplatesScreen(client: widget.client),
-      ),
-    );
-  }
-
-  /// Sprint 37: server rail 📁 → projects catalogue.  Setting an active
-  /// project re-renders the composer with the project context so new
-  /// tasks inherit its HEAD artifact set.
-  Future<void> _openProjects(BuildContext context) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => ProjectsScreen(
-          client: widget.client,
-          activeProjectId: _activeProjectId,
-          onSelectActive: (id) => setState(() => _activeProjectId = id),
-        ),
-      ),
-    );
-  }
-
-  /// Sprint 46 B7: server rail 🔔 → notifications screen (inbox + rules +
-  /// devices).
-  Future<void> _openNotifications(BuildContext context) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => NotificationsScreen(client: widget.client),
-      ),
-    );
   }
 
   /// Sprint 31: width threshold below which the shell collapses from
@@ -717,102 +648,20 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
         actions: [
           IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings),
+            onPressed: () => _openSettings(),
+          ),
+          IconButton(
             tooltip: 'Members / agents',
             icon: const Icon(Icons.people),
             onPressed: () => _showMembersSheet(context),
           ),
         ],
       ),
-      drawer: _NarrowDrawer(
-        tasks: _tasks,
-        selected: _selected,
-        loading: _loading && _tasks.isEmpty,
-        error: _error,
-        dmChannels: _dmChannels,
-        scheduledChannels: _scheduledChannels,
-        customChannels: _customChannels,
-        // Sprint 51 B4: archive a custom channel from the narrow drawer.
-        onArchiveChannel: (channelId) async {
-          Navigator.of(context).pop(); // close drawer
-          final messenger = ScaffoldMessenger.of(context);
-          try {
-            await widget.client.archiveChannel(channelId: channelId);
-            await _fetchDirectChannels();
-            messenger.showSnackBar(
-              const SnackBar(content: Text('Channel archived')),
-            );
-          } catch (e) {
-            messenger.showSnackBar(
-              SnackBar(content: Text('Archive failed: $e')),
-            );
-          }
-        },
-        onSelect: (sel) {
-          setState(() => _selected = sel);
-          Navigator.of(context).pop();
-        },
-        onRetry: _fetch,
-        onOpenBilling: () {
-          Navigator.of(context).pop();
-          _openBilling(context);
-        },
-        onOpenTemplates: () {
-          Navigator.of(context).pop();
-          _openTemplates(context);
-        },
-        onOpenProjects: () {
-          Navigator.of(context).pop();
-          _openProjects(context);
-        },
-        onOpenNotifications: () {
-          Navigator.of(context).pop();
-          _openNotifications(context);
-        },
-        onSignOut: () => resetTallyConfig(context),
-        onNewScheduled: () {
-          Navigator.of(context).pop();
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => PersistentAgentsScreen(
-                client: widget.client,
-                workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-              ),
-            ),
-          );
-        },
-        onNewDm: () async {
-          Navigator.of(context).pop(); // close the drawer first
-          final result = await showDialog<Map<String, dynamic>>(
-            context: context,
-            builder: (_) => NewDmModal(
-              client: widget.client,
-              workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-            ),
-          );
-          if (result != null && mounted) {
-            // Reload channels so any new DM appears in the rail.
-            await _fetch();
-            await _fetchDirectChannels();
-          }
-        },
-        // Sprint 50 B7: open NewChannelModal from narrow drawer.
-        onNewChannel: () async {
-          Navigator.of(context).pop();
-          final newCh = await showDialog<Map<String, dynamic>>(
-            context: context,
-            builder: (_) => NewChannelModal(
-              client: widget.client,
-              workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-            ),
-          );
-          if (newCh != null && mounted) {
-            await _fetchDirectChannels();
-          }
-        },
-        // Sprint 50 B7 / fixed Sprint 54: narrow drawer gear.  Pops
-        // the drawer first, then delegates to the shared helper.
-        onOpenSettings: () => _openSettings(popFirst: true),
-      ),
+      // No drawer: all channels live in the bottom sheet's expanded state.
+      // The hamburger drawer has been removed per F4 (Claude Design mockups
+      // Screens 1 + 3 show no hamburger on mobile).
       body: SafeArea(
         top: false,
         child: Column(
@@ -895,20 +744,32 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           directChannelId: cid,
           channelTitle: name,
         ),
-      // B3a Task 11: wrap kanban in a Stack so the bottom sheet can
+      // B3a Task 11 / F4: wrap kanban in a Stack so the bottom sheet can
       // overlay at the bottom without pushing kanban content up.
       // F1-Fix1: only mount _BoardBottomSheet on narrow (mobile) layout;
       // desktop uses SidebarMiniDash in SidebarShell instead.
+      // F4: the kanban layer is wrapped in a Consumer so a tap on the kanban
+      // area (when the sheet is expanded) collapses the sheet back to ambient.
       BoardSelected() => isNarrow
           ? Stack(
               children: [
                 Positioned.fill(
-                  child: KanbanView(
-                    tasks: _filteredTasksForKanban(),
-                    onTaskTap: (task) =>
-                        setState(() => _selected = TaskSelected(task.id)),
-                    onNewTask: () =>
-                        setState(() => _selected = const GeneralSelected()),
+                  child: Consumer<BottomSheetController>(
+                    builder: (context, bsc, child) => GestureDetector(
+                      // Tap on kanban behind when sheet is expanded → collapse.
+                      onTap: bsc.state == SheetState.channelsExpanded
+                          ? bsc.collapseToAmbient
+                          : null,
+                      behavior: HitTestBehavior.translucent,
+                      child: child,
+                    ),
+                    child: KanbanView(
+                      tasks: _filteredTasksForKanban(),
+                      onTaskTap: (task) =>
+                          setState(() => _selected = TaskSelected(task.id)),
+                      onNewTask: () =>
+                          setState(() => _selected = const GeneralSelected()),
+                    ),
                   ),
                 ),
                 Positioned(
@@ -1007,344 +868,7 @@ class _PoolWarmingBanner extends StatelessWidget {
   }
 }
 
-/// Channel list (column 2).
-class _ChannelList extends StatelessWidget {
-  final List<Task> tasks;
-  final ChannelSelection selected;
-  final bool loading;
-  final String? error;
-  final ValueChanged<ChannelSelection> onSelect;
-  final VoidCallback onRetry;
-  final VoidCallback onNewScheduled;
-  final VoidCallback onNewDm;
-  /// Sprint 50 B7: custom channels + new-channel CTA + settings gear.
-  final VoidCallback onNewChannel;
-  final VoidCallback onOpenSettings;
-  /// Sprint 49 B7: DM and scheduled_agent channels from the API.
-  final List<Map<String, dynamic>> dmChannels;
-  final List<Map<String, dynamic>> scheduledChannels;
-  // Sprint 50 B7: custom channels from the API.
-  final List<Map<String, dynamic>> customChannels;
-  /// Sprint 51 B4: archive a custom channel by id.
-  final void Function(int channelId)? onArchiveChannel;
-  /// Sprint 31: when null the list fills its parent (drawer mode);
-  /// when set it pins to that width (desktop left rail = 240).
-  final double? width;
-  const _ChannelList({
-    required this.tasks,
-    required this.selected,
-    required this.loading,
-    required this.error,
-    required this.onSelect,
-    required this.onRetry,
-    required this.onNewScheduled,
-    required this.onNewDm,
-    required this.onNewChannel,
-    required this.onOpenSettings,
-    this.dmChannels = const [],
-    this.scheduledChannels = const [],
-    this.customChannels = const [],
-    this.onArchiveChannel,
-    this.width = 240,
-  });
 
-  @override
-  Widget build(BuildContext context) {
-    final tc = context.tc;
-    return Container(
-      width: width,
-      color: tc.sheet,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 4, 8),
-            child: Row(
-              children: [
-                Text(
-                  'My Team',
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                ),
-                const Spacer(),
-                if (loading)
-                  const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                // Sprint 50 B7: gear icon → WorkspaceSettingsScreen.
-                IconButton(
-                  icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
-                  tooltip: 'Workspace settings',
-                  onPressed: onOpenSettings,
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                ),
-              ],
-            ),
-          ),
-          Container(height: 1, color: tc.border),
-          Expanded(child: _scrollableBody(context)),
-        ],
-      ),
-    );
-  }
-
-  Widget _scrollableBody(BuildContext context) {
-    return ListView(
-      children: [
-        const SizedBox(height: 8),
-        _ChannelTile(
-          icon: Icon(Icons.view_kanban, size: 16, color: context.tc.fgDim),
-          label: 'Board',
-          selected: selected is BoardSelected,
-          onTap: () => onSelect(const BoardSelected()),
-        ),
-        _ChannelTile(
-          icon: const Text('✨', style: TextStyle(fontSize: 16)),
-          label: 'general',
-          selected: selected is GeneralSelected,
-          onTap: () => onSelect(const GeneralSelected()),
-        ),
-        // Sprint 50 B7: CHANNELS category — kind='custom' channels.
-        // Sprint 51 B4: custom tiles get an archive context menu.
-        const SizedBox(height: 12),
-        _categoryHeader(context, 'CHANNELS'),
-        ..._customChannelItems(context, customChannels),
-        _NewTile(label: '+ New channel', onTap: onNewChannel),
-        const SizedBox(height: 12),
-        // Sprint 49 B7: Scheduled channels from API + new-scheduled CTA.
-        _categoryHeader(context, 'SCHEDULED'),
-        ..._directChannelItems(context, scheduledChannels),
-        _NewTile(label: '+ New scheduled', onTap: onNewScheduled),
-        const SizedBox(height: 12),
-        // Sprint 49 B7: DM channels from API + new-DM CTA.
-        _categoryHeader(context, 'DIRECT MESSAGES'),
-        ..._directChannelItems(context, dmChannels),
-        _NewTile(label: '+ New DM', onTap: onNewDm),
-        const SizedBox(height: 8),
-      ],
-    );
-  }
-
-  /// Sprint 49 B7: render tiles for DM / scheduled_agent channels.
-  /// Shows an orange escalation dot if '_unread_escalation' is set.
-  List<Widget> _directChannelItems(
-    BuildContext context,
-    List<Map<String, dynamic>> channels,
-  ) {
-    final tc = context.tc;
-    return [
-      for (final ch in channels)
-        _ChannelTile(
-          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
-          label: ch['name'] as String? ?? 'channel',
-          selected: selected is DirectChannelSelected &&
-              (selected as DirectChannelSelected).channelId == ch['id'] as int,
-          onTap: () => onSelect(DirectChannelSelected(
-            ch['id'] as int,
-            ch['name'] as String? ?? 'channel',
-          )),
-          trailing: (ch['_unread_escalation'] == true)
-              ? Icon(Icons.circle, color: tc.yellow, size: 8)
-              : null,
-        ),
-    ];
-  }
-
-  /// Sprint 51 B4: render tiles for kind='custom' channels.
-  /// Identical to [_directChannelItems] but also wires [onArchive] so each
-  /// tile shows a 3-dot context menu with an "Archive" action.
-  List<Widget> _customChannelItems(
-    BuildContext context,
-    List<Map<String, dynamic>> channels,
-  ) {
-    final tc = context.tc;
-    return [
-      for (final ch in channels)
-        _ChannelTile(
-          icon: Icon(Icons.tag, color: tc.fgDim, size: 14),
-          label: ch['name'] as String? ?? 'channel',
-          selected: selected is DirectChannelSelected &&
-              (selected as DirectChannelSelected).channelId == ch['id'] as int,
-          onTap: () => onSelect(DirectChannelSelected(
-            ch['id'] as int,
-            ch['name'] as String? ?? 'channel',
-          )),
-          trailing: (ch['_unread_escalation'] == true)
-              ? Icon(Icons.circle, color: tc.yellow, size: 8)
-              : null,
-          onArchive: onArchiveChannel != null
-              ? () => onArchiveChannel!(ch['id'] as int)
-              : null,
-        ),
-    ];
-  }
-
-  Widget _categoryHeader(BuildContext context, String label) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-      child: Text(
-        label,
-        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: context.tc.fgDim,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 1.2,
-            ),
-      ),
-    );
-  }
-
-}
-
-/// A tappable "+ New" row shown at the bottom of each category section.
-class _NewTile extends StatelessWidget {
-  final String label;
-  final VoidCallback onTap;
-  const _NewTile({required this.label, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(6),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(6),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 20,
-                  child: Center(
-                    child: Icon(Icons.add, color: context.tc.fgDim, size: 14),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: TextStyle(
-                    color: context.tc.fgDim,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _ChannelTile extends StatelessWidget {
-  final Widget icon;
-  final String label;
-  final String? subtitle;
-  final bool selected;
-  final VoidCallback onTap;
-  /// Sprint 49 B7: optional trailing widget (e.g. escalation indicator dot).
-  final Widget? trailing;
-  /// Sprint 51 B4: when non-null, renders a trailing 3-dot menu with
-  /// "Archive". Only passed for kind='custom' channels.
-  final VoidCallback? onArchive;
-  const _ChannelTile({
-    required this.icon,
-    required this.label,
-    this.subtitle,
-    required this.selected,
-    required this.onTap,
-    this.trailing,
-    this.onArchive,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final tc = context.tc;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
-      child: Material(
-        color: selected ? tc.cardHov : Colors.transparent,
-        borderRadius: BorderRadius.circular(6),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(6),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-            child: Row(
-              children: [
-                SizedBox(width: 20, child: Center(child: icon)),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: selected ? tc.fg : tc.fgXdim,
-                          fontSize: 13,
-                          fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                        ),
-                      ),
-                      if (subtitle != null)
-                        Text(
-                          subtitle!,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: tc.fgDim,
-                            fontSize: 10,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                // Sprint 49 B7: escalation dot or other trailing indicator.
-                if (trailing != null) ...[
-                  const SizedBox(width: 4),
-                  trailing!,
-                ],
-                // Sprint 51 B4: 3-dot context menu for custom channels.
-                if (onArchive != null)
-                  SizedBox(
-                    width: 24,
-                    child: PopupMenuButton<String>(
-                      icon: Icon(
-                        Icons.more_horiz,
-                        size: 16,
-                        color: tc.fgDim,
-                      ),
-                      padding: EdgeInsets.zero,
-                      tooltip: 'Channel options',
-                      onSelected: (action) {
-                        if (action == 'archive') onArchive!();
-                      },
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(
-                          value: 'archive',
-                          child: Text('Archive'),
-                        ),
-                      ],
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
 
 /// Rightmost members panel.
 class _MembersPanel extends StatelessWidget {
@@ -1634,14 +1158,41 @@ class _RightPaneCloseBar extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────
-// B3a: bottom-sheet overlay for the Board view.
+// F4: draggable bottom-sheet overlay for the Board view.
 // ─────────────────────────────────────────────────────────────
 
-/// Reads [BottomSheetController] from the Provider tree and renders
-/// either [AmbientMiniDash] (ambient state) or [EscalationSheet]
-/// (takeover state) depending on controller state.  Hidden when
-/// controller state is [SheetState.hidden].
-class _BoardBottomSheet extends StatelessWidget {
+/// Collapsed height — just the ambient mini-dash content.
+const double _sheetCollapsedHeight = 152.0;
+
+/// Expanded height as a fraction of the viewport (matches mockup Screen 3).
+const double _sheetExpandedFraction = 0.76;
+
+/// Draggable bottom sheet overlay for the Board view (mobile narrow layout).
+///
+/// Snaps between two heights:
+///   - collapsed: [_sheetCollapsedHeight] px — shows [AmbientMiniDash]
+///   - expanded:  [_sheetExpandedFraction] × viewport — shows [ChannelsSheet]
+///
+/// During takeover (escalation) the sheet is locked-height — user must resolve
+/// or skip the escalation before dragging is re-enabled.
+///
+/// Gesture rules:
+///   - While dragging: sheet follows finger 1:1 within [collapsed, expanded].
+///   - On release: velocity < −200 → snap to expanded; > 200 → snap to
+///     collapsed; otherwise snap to nearest.
+///   - Tap on drag handle in collapsed state → expand; in expanded → collapse.
+///   - Tap on kanban behind (when expanded) → collapse.
+///
+/// Example:
+/// ```dart
+/// _BoardBottomSheet(
+///   tasks: kanbanTasks,
+///   latestNarratorText: narrator,
+///   client: orchClient,
+///   onOpenChannel: (id, name) => setState(() => _selected = DirectChannelSelected(id, name)),
+/// )
+/// ```
+class _BoardBottomSheet extends StatefulWidget {
   final List<Task> tasks;
   final String? latestNarratorText;
   final TallyOrchClient client;
@@ -1655,33 +1206,50 @@ class _BoardBottomSheet extends StatelessWidget {
   });
 
   @override
+  State<_BoardBottomSheet> createState() => _BoardBottomSheetState();
+}
+
+class _BoardBottomSheetState extends State<_BoardBottomSheet> {
+  /// Non-null while the user is actively dragging.
+  /// null = controller drives height via AnimatedContainer.
+  double? _dragHeight;
+
+  double _expandedHeight(BuildContext context) =>
+      MediaQuery.of(context).size.height * _sheetExpandedFraction;
+
+  /// Picks the nearest snap point given current height and velocity.
+  double _snapTarget(double currentHeight, double velocity, BuildContext context) {
+    final expanded = _expandedHeight(context);
+    if (velocity < -200) return expanded;       // fast upward → expand
+    if (velocity > 200) return _sheetCollapsedHeight;  // fast downward → collapse
+    // No strong velocity — snap to nearest.
+    final midpoint = (_sheetCollapsedHeight + expanded) / 2;
+    return currentHeight >= midpoint ? expanded : _sheetCollapsedHeight;
+  }
+
+  void _snapAndUpdateController(double target, BuildContext context) {
+    final controller = context.read<BottomSheetController>();
+    setState(() => _dragHeight = null);
+    if (target >= _expandedHeight(context) * 0.9) {
+      controller.expandChannels();
+    } else {
+      controller.collapseToAmbient();
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final controller = context.watch<BottomSheetController>();
 
     if (controller.state == SheetState.hidden) return const SizedBox.shrink();
 
-    // B3b Task 8: channels-expanded state — full channel list sheet.
-    if (controller.state == SheetState.channelsExpanded) {
-      return ChannelsSheet(
-        channels: controller.channels,
-        needsAttention: {
-          for (final e in controller.queue) e.channelId,
-        },
-        escalationCountByChannel: {
-          for (final e in controller.queue)
-            e.channelId: (controller.queue
-                    .where((q) => q.channelId == e.channelId)
-                    .length),
-        },
-        onChannelTap: (ch) => onOpenChannel(ch.id, ch.name),
-        onCollapse: controller.collapseToAmbient,
-      );
-    }
+    final expanded = _expandedHeight(context);
 
+    // Takeover state — locked height, no drag allowed.
     if (controller.state == SheetState.takeover &&
         controller.activeEscalation != null) {
       final esc = controller.activeEscalation!;
-      final task = tasks.firstWhere(
+      final task = widget.tasks.firstWhere(
         (t) => t.id == esc.taskId,
         orElse: () => Task.fromJson({
           'id': esc.taskId,
@@ -1696,25 +1264,16 @@ class _BoardBottomSheet extends StatelessWidget {
         queueIndex: 0,
         queueSize: controller.queueSize,
         taskTitle: task.channelTitle,
-        // B3b will derive channelName from real escalation routing
-        // (channel_id lookup).  For B3a, all escalations default to
-        // the 'general' long-term channel.
         channelName: 'general',
-        // B3a Task 14: post the chosen quick-reply option back to the
-        // long-term channel where the escalation lives, then resolve
-        // the active escalation so the sheet returns to ambient.
-        // If the POST fails, leave the escalation in the queue so the
-        // user can retry — don't silently drop it.
         onReply: (option) async {
           try {
-            await client.postMessage(
+            await widget.client.postMessage(
               channelId: esc.channelId,
               text: option,
               kind: 'message',
               payload: {'in_response_to_escalation': esc.id},
             );
           } catch (_) {
-            // POST failed — keep escalation active for retry.
             return;
           }
           if (context.mounted) {
@@ -1722,160 +1281,90 @@ class _BoardBottomSheet extends StatelessWidget {
           }
         },
         onSkip: controller.skip,
-        onOpen: () => onOpenChannel(esc.channelId, 'general'),
+        onOpen: () => widget.onOpenChannel(esc.channelId, 'general'),
       );
     }
 
-    // Ambient state: stat row + running-task progress rows + narrator bubble.
-    final done = tasks
-        .where(
-          (t) => t.status == 'completed' || t.status == 'failed',
-        )
-        .length;
-    final open = tasks.length - done;
-    final running = tasks.where((t) => t.status == 'running').toList();
+    // Determine target height driven by the controller when not dragging.
+    final controllerHeight = controller.state == SheetState.channelsExpanded
+        ? expanded
+        : _sheetCollapsedHeight;
 
-    // B3b Task 8: swipe-up on ambient dash expands to channels sheet.
+    // Current display height: drag-driven when the user is holding the finger,
+    // controller-driven otherwise.
+    final displayHeight = _dragHeight ?? controllerHeight;
+
+    // Build sheet content.  At intermediate drag positions show both ambient
+    // content (mini-dash) regardless of state so the drag handle is always
+    // visible.  The channels list fades in as the sheet rises.
+    final done = widget.tasks
+        .where((t) => t.status == 'completed' || t.status == 'failed')
+        .length;
+    final open = widget.tasks.length - done;
+    final running = widget.tasks.where((t) => t.status == 'running').toList();
+
+    // Fraction from collapsed to expanded — used to decide which content to show.
+    final fraction = ((displayHeight - _sheetCollapsedHeight) /
+            (expanded - _sheetCollapsedHeight))
+        .clamp(0.0, 1.0);
+    // Show channels list when the sheet is more than halfway up.
+    final showChannels = fraction > 0.5;
+
     return GestureDetector(
+      // Drag start: capture current height so we can delta from it.
+      onVerticalDragUpdate: (details) {
+        final current = _dragHeight ?? controllerHeight;
+        setState(() {
+          _dragHeight = (current - details.delta.dy)
+              .clamp(_sheetCollapsedHeight, expanded);
+        });
+      },
       onVerticalDragEnd: (details) {
-        // Negative primaryVelocity = upward swipe.
-        if ((details.primaryVelocity ?? 0) < -200) {
-          context.read<BottomSheetController>().expandChannels();
+        final current = _dragHeight ?? controllerHeight;
+        final velocity = details.primaryVelocity ?? 0;
+        final target = _snapTarget(current, velocity, context);
+        _snapAndUpdateController(target, context);
+      },
+      // Tap on the handle band — toggle between expanded / collapsed.
+      onTap: () {
+        if (controller.state == SheetState.channelsExpanded) {
+          _snapAndUpdateController(_sheetCollapsedHeight, context);
+        } else {
+          _snapAndUpdateController(expanded, context);
         }
       },
-      child: AmbientMiniDash(
-        openCount: open,
-        doneCount: done,
-        taskRows: [
-          for (final t in running.take(2))
-            // Progress placeholder: B3b will wire real per-task progress.
-            MiniTaskRow(title: t.channelTitle, progress: 0.5),
-        ],
-        narratorText: latestNarratorText,
-      ),
-    );
-  }
-}
-
-/// Sprint 31: drawer variant of the channel list for narrow layouts.
-/// Wraps `_ChannelList` with a footer of the server-rail actions
-/// (builder + sign-out) so all design-time + admin entry points stay
-/// reachable on a phone.
-class _NarrowDrawer extends StatelessWidget {
-  final List<Task> tasks;
-  final ChannelSelection selected;
-  final bool loading;
-  final String? error;
-  final ValueChanged<ChannelSelection> onSelect;
-  final VoidCallback onRetry;
-  final VoidCallback onOpenBilling;
-  final VoidCallback onOpenTemplates;
-  final VoidCallback onOpenProjects;
-  final VoidCallback onOpenNotifications;
-  final VoidCallback onSignOut;
-  final VoidCallback onNewScheduled;
-  final VoidCallback onNewDm;
-  // Sprint 50 B7: new channel + settings.
-  final VoidCallback onNewChannel;
-  final VoidCallback onOpenSettings;
-  /// Sprint 49 B7: DM and scheduled_agent channels from the API.
-  final List<Map<String, dynamic>> dmChannels;
-  final List<Map<String, dynamic>> scheduledChannels;
-  // Sprint 50 B7: custom channels from the API.
-  final List<Map<String, dynamic>> customChannels;
-  /// Sprint 51 B4: archive a custom channel by id.
-  final void Function(int channelId)? onArchiveChannel;
-  const _NarrowDrawer({
-    required this.tasks,
-    required this.selected,
-    required this.loading,
-    required this.error,
-    required this.onSelect,
-    required this.onRetry,
-    required this.onOpenBilling,
-    required this.onOpenTemplates,
-    required this.onOpenProjects,
-    required this.onOpenNotifications,
-    required this.onSignOut,
-    required this.onNewScheduled,
-    required this.onNewDm,
-    required this.onNewChannel,
-    required this.onOpenSettings,
-    this.dmChannels = const [],
-    this.scheduledChannels = const [],
-    this.customChannels = const [],
-    this.onArchiveChannel,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final tc = context.tc;
-    return Drawer(
-      backgroundColor: tc.sheet,
-      child: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: _ChannelList(
-                tasks: tasks,
-                selected: selected,
-                loading: loading,
-                error: error,
-                onSelect: onSelect,
-                onRetry: onRetry,
-                onNewScheduled: onNewScheduled,
-                onNewDm: onNewDm,
-                onNewChannel: onNewChannel,
-                onOpenSettings: onOpenSettings,
-                dmChannels: dmChannels,
-                scheduledChannels: scheduledChannels,
-                customChannels: customChannels,
-                // Sprint 51 B4: thread archive callback through to the inner list.
-                onArchiveChannel: onArchiveChannel,
-                width: null,
-              ),
-            ),
-            Container(height: 1, color: tc.border),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-              child: Row(
-                children: [
-                  IconButton(
-                    tooltip: 'Projects',
-                    icon: Icon(Icons.folder_outlined, size: 18, color: tc.fgDim),
-                    onPressed: onOpenProjects,
-                  ),
-                  IconButton(
-                    tooltip: 'Saved templates',
-                    icon: Icon(Icons.bookmark_border, size: 18, color: tc.fgDim),
-                    onPressed: onOpenTemplates,
-                  ),
-                  IconButton(
-                    tooltip: 'Billing & usage',
-                    icon: Icon(Icons.credit_card, size: 18, color: tc.fgDim),
-                    onPressed: onOpenBilling,
-                  ),
-                  IconButton(
-                    tooltip: 'Notifications',
-                    icon: Icon(Icons.notifications_outlined, size: 18, color: tc.fgDim),
-                    onPressed: onOpenNotifications,
-                  ),
-                  IconButton(
-                    tooltip: 'Workspace settings',
-                    icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
-                    onPressed: onOpenSettings,
-                  ),
-                  IconButton(
-                    tooltip: 'Sign out / reconnect',
-                    icon: Icon(Icons.logout, size: 18, color: tc.fgDim),
-                    onPressed: onSignOut,
-                  ),
+      // Tap outside is handled by the parent Stack — see [_mainPane].
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+        height: displayHeight,
+        child: showChannels
+            ? ChannelsSheet(
+                channels: controller.channels,
+                needsAttention: {
+                  for (final e in controller.queue) e.channelId,
+                },
+                escalationCountByChannel: {
+                  for (final e in controller.queue)
+                    e.channelId: (controller.queue
+                            .where((q) => q.channelId == e.channelId)
+                            .length),
+                },
+                onChannelTap: (ch) => widget.onOpenChannel(ch.id, ch.name),
+                onCollapse: () =>
+                    _snapAndUpdateController(_sheetCollapsedHeight, context),
+              )
+            : AmbientMiniDash(
+                openCount: open,
+                doneCount: done,
+                taskRows: [
+                  for (final t in running.take(2))
+                    MiniTaskRow(title: t.channelTitle, progress: 0.5),
                 ],
+                narratorText: widget.latestNarratorText,
               ),
-            ),
-          ],
-        ),
       ),
     );
   }
 }
+
