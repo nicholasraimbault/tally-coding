@@ -1640,8 +1640,9 @@ class _NarrowDrawer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Drawer(
-      backgroundColor: const Color(0xFF2B2D31),
+      backgroundColor: tc.sheet,
       child: SafeArea(
         child: Column(
           children: [
@@ -1665,45 +1666,39 @@ class _NarrowDrawer extends StatelessWidget {
                 width: null,
               ),
             ),
-            Container(height: 1, color: const Color(0xFF1E1F22)),
+            Container(height: 1, color: tc.border),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               child: Row(
                 children: [
                   IconButton(
                     tooltip: 'Projects',
-                    icon: const Icon(Icons.folder_outlined, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.folder_outlined, size: 18, color: tc.fgDim),
                     onPressed: onOpenProjects,
                   ),
                   IconButton(
                     tooltip: 'Saved templates',
-                    icon: const Icon(Icons.bookmark_border, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.bookmark_border, size: 18, color: tc.fgDim),
                     onPressed: onOpenTemplates,
                   ),
                   IconButton(
                     tooltip: 'Billing & usage',
-                    icon: const Icon(Icons.credit_card, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.credit_card, size: 18, color: tc.fgDim),
                     onPressed: onOpenBilling,
                   ),
                   IconButton(
                     tooltip: 'Notifications',
-                    icon: const Icon(Icons.notifications_outlined, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.notifications_outlined, size: 18, color: tc.fgDim),
                     onPressed: onOpenNotifications,
                   ),
                   IconButton(
                     tooltip: 'Workspace settings',
-                    icon: const Icon(Icons.settings, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.settings, size: 18, color: tc.fgDim),
                     onPressed: onOpenSettings,
                   ),
                   IconButton(
                     tooltip: 'Sign out / reconnect',
-                    icon: const Icon(Icons.logout, size: 18,
-                        color: Color(0xFF99AAB5)),
+                    icon: Icon(Icons.logout, size: 18, color: tc.fgDim),
                     onPressed: onSignOut,
                   ),
                 ],
