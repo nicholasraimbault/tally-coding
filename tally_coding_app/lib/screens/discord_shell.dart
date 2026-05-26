@@ -36,6 +36,7 @@ import 'templates_screen.dart';
 import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
+import '../theme/tc_tokens.dart';
 import '../widgets/server_rail.dart';
 import '../widgets/sidebar/sidebar.dart';
 import 'workspace_settings.dart';
@@ -599,10 +600,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       DirectChannelSelected(channelName: final name) => '#$name',
       BoardSelected() => 'Board',
     };
+    final tc = context.tc;
     return Scaffold(
-      backgroundColor: const Color(0xFF313338),
+      backgroundColor: tc.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1E1F22),
+        backgroundColor: tc.elev,
         foregroundColor: Colors.white,
         title: Text(channelTitle,
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
@@ -724,7 +726,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   void _showMembersSheet(BuildContext context) {
     showModalBottomSheet<void>(
       context: context,
-      backgroundColor: const Color(0xFF2B2D31),
+      backgroundColor: context.tc.sheet,
       isScrollControlled: true,
       builder: (ctx) => DraggableScrollableSheet(
         initialChildSize: 0.6,
@@ -739,7 +741,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                 width: 32,
                 height: 4,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF4F545C),
+                  color: context.tc.fgDimmer,
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
