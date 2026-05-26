@@ -837,8 +837,9 @@ class _PoolWarmingBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     final hasError = lastError != null;
-    final color = hasError ? const Color(0xFFED4245) : const Color(0xFFFAA61A);
+    final color = hasError ? tc.red : tc.yellow;
     final icon = hasError ? Icons.error_outline : Icons.hourglass_top;
     final headline = hasError
         ? 'Workers offline — orchestrator is retrying.'
@@ -863,15 +864,15 @@ class _PoolWarmingBanner extends StatelessWidget {
                   const SizedBox(height: 2),
                   Text(
                     lastError!,
-                    style: const TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                    style: TextStyle(color: tc.fgXdim, fontSize: 11),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
                 ] else ...[
                   const SizedBox(height: 2),
-                  const Text(
+                  Text(
                     "Task submission will fail until at least one worker joins. Reads + billing keep working.",
-                    style: TextStyle(color: Color(0xFFC4C9CE), fontSize: 11),
+                    style: TextStyle(color: tc.fgXdim, fontSize: 11),
                   ),
                 ],
               ],
