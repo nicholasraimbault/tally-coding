@@ -1452,11 +1452,16 @@ class _BoardBottomSheet extends StatelessWidget {
         queueIndex: 0,
         queueSize: controller.queueSize,
         taskTitle: task.channelTitle,
-        // B3b will derive channelName from real escalation routing.
+        // B3b will derive channelName from real escalation routing
+        // (channel_id lookup).  For B3a, all escalations default to
+        // the 'general' long-term channel.
         channelName: 'general',
+        // B3a Task 14: post the chosen quick-reply option back to the
+        // long-term channel where the escalation lives, then resolve
+        // the active escalation so the sheet returns to ambient.
+        // If the POST fails, leave the escalation in the queue so the
+        // user can retry — don't silently drop it.
         onReply: (option) async {
-          // Quick reply: post the chosen option back, then dequeue.
-          // On failure, leave the escalation in queue so the user can retry.
           try {
             await client.postMessage(
               channelId: esc.channelId,
@@ -1465,6 +1470,7 @@ class _BoardBottomSheet extends StatelessWidget {
               payload: {'in_response_to_escalation': esc.id},
             );
           } catch (_) {
+            // POST failed — keep escalation active for retry.
             return;
           }
           if (context.mounted) {
