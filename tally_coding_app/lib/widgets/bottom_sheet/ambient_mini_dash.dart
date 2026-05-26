@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:tally_coding_app/theme/tc_tokens.dart';
+import 'package:tally_coding_app/widgets/brutal/brutal.dart';
 
 class AmbientMiniDash extends StatelessWidget {
   final int openCount;
@@ -57,7 +58,30 @@ class AmbientMiniDash extends StatelessWidget {
           ),
           // Per-task rows (added in Task 4)
           ...taskRows,
-          // Narrator bubble (added in Task 5)
+          // Narrator bubble
+          if (narratorText != null) ...[
+            const SizedBox(height: 14),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const TallyAvatar(size: 28, online: false),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: tc.bubble,
+                      border: Border.all(color: tc.border, width: 1),
+                    ),
+                    child: Text(
+                      narratorText!,
+                      style: TextStyle(color: tc.fg, fontSize: 12.5, height: 1.4),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );

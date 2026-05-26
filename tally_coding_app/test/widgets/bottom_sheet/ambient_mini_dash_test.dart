@@ -44,4 +44,22 @@ void main() {
     )));
     expect(find.byType(MiniTaskRow), findsOneWidget);
   });
+
+  testWidgets('renders Tally narrator bubble when narratorText provided', (tester) async {
+    await tester.pumpWidget(_wrap(const AmbientMiniDash(
+      openCount: 0, doneCount: 0, taskRows: [],
+      narratorText: 'Diagnosed the daily-deals bug.',
+    )));
+    expect(find.text('Diagnosed the daily-deals bug.'), findsOneWidget);
+    // Tally avatar 'T' should appear
+    expect(find.text('T'), findsOneWidget);
+  });
+
+  testWidgets('omits narrator bubble when narratorText is null', (tester) async {
+    await tester.pumpWidget(_wrap(const AmbientMiniDash(
+      openCount: 0, doneCount: 0, taskRows: [], narratorText: null,
+    )));
+    // No 'T' should appear when narrator is null
+    expect(find.text('T'), findsNothing);
+  });
 }
