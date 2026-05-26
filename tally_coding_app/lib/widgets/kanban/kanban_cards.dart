@@ -103,13 +103,15 @@ class PlanningCard extends StatelessWidget {
 }
 
 /// Card for tasks workers are actively executing.
-/// Shows agent avatars + ETA + progress bar.
-/// When [escalated] is true, a coral "PAUSED · NEEDS YOU" footer is shown
-/// to signal that this task is awaiting operator input via the bottom sheet.
+/// Shows agent avatars + ETA + progress bar (optional — null hides bar).
+/// When [escalated] is true: coral border + coral wash bg + "PAUSED · NEEDS YOU"
+/// footer, signaling that this task is awaiting operator input via bottom sheet.
 class RunningTaskCard extends StatelessWidget {
   final String title;
   final List<AgentRole> agents;
-  final double progress;
+
+  /// Progress value 0.0–1.0. Null means progress is unknown — bar is hidden.
+  final double? progress;
   final String? eta;
   final bool escalated;
   final VoidCallback? onTap;
@@ -118,7 +120,7 @@ class RunningTaskCard extends StatelessWidget {
     super.key,
     required this.title,
     required this.agents,
-    required this.progress,
+    this.progress,
     this.eta,
     this.escalated = false,
     this.onTap,
@@ -127,8 +129,23 @@ class RunningTaskCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tc = context.tc;
-    return BrutalCard(
-      onTap: onTap,
+    final coral = tc.red;
+    // When escalated: coral wash bg + coral border override the normal card chrome.
+    final decoration = escalated
+        ? BoxDecoration(
+            color: Color.alphaBlend(coral.withValues(alpha: 0.05), tc.card),
+            border: Border.all(color: coral.withValues(alpha: 0.45), width: 1),
+            borderRadius: BorderRadius.zero,
+          )
+        : null;
+    Widget card = Container(
+      padding: const EdgeInsets.all(13),
+      decoration: decoration ??
+          BoxDecoration(
+            color: tc.card,
+            border: Border.all(color: tc.border, width: 1),
+            borderRadius: BorderRadius.zero,
+          ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
@@ -163,14 +180,17 @@ class RunningTaskCard extends StatelessWidget {
                 ),
             ],
           ),
-          const SizedBox(height: 8),
-          BrutalProgressBar(value: progress),
+          if (progress != null) ...[
+            const SizedBox(height: 8),
+            BrutalProgressBar(value: progress!),
+          ],
           if (escalated) ...[
             const SizedBox(height: 8),
             Text(
               'PAUSED · NEEDS YOU',
               style: TextStyle(
-                color: tc.red,
+                color: coral,
+                fontFamily: 'JetBrainsMono',
                 fontSize: 10,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 0.8,
@@ -180,6 +200,10 @@ class RunningTaskCard extends StatelessWidget {
         ],
       ),
     );
+    if (onTap != null) {
+      card = GestureDetector(onTap: onTap, child: card);
+    }
+    return card;
   }
 }
 
