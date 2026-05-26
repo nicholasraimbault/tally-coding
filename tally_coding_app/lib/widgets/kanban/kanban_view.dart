@@ -76,6 +76,10 @@ class KanbanView extends StatelessWidget {
           label: _columnLabel(col),
           count: grouped[col]!.length,
           onNewTask: onNewTask,
+          // Only the To do column shows +New task — tasks enter the board here
+          // and the system promotes them rightward. Users cannot legitimately
+          // create tasks directly in Planning, Running, Awaiting, or Done.
+          showNewTaskRow: col == TaskColumn.toDo,
           children: [for (final t in grouped[col]!) _cardForTask(context, t)],
         ),
     ];

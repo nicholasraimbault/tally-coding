@@ -3,12 +3,19 @@ import 'package:tally_coding_app/theme/tc_tokens.dart';
 import 'package:tally_coding_app/widgets/kanban/kanban_cards.dart';
 
 /// A single column in the Kanban view: header + scrollable card stack +
-/// inline NewTaskRow at the bottom. Dumb — parent provides pre-built children.
+/// optional NewTaskRow at the bottom.
+///
+/// [showNewTaskRow] defaults to true for backwards-compatibility. Set it to
+/// false for columns where users cannot legitimately create tasks directly
+/// (Planning, Running, Awaiting, Done). Only the To do column should show
+/// the row — tasks enter the board at To do and the system promotes them.
 class KanbanColumn extends StatelessWidget {
   final String label;
   final int count;
   final List<Widget> children;
   final VoidCallback onNewTask;
+  /// When false, the [NewTaskRow] is omitted entirely. Defaults to true.
+  final bool showNewTaskRow;
 
   const KanbanColumn({
     super.key,
@@ -16,6 +23,7 @@ class KanbanColumn extends StatelessWidget {
     required this.count,
     required this.children,
     required this.onNewTask,
+    this.showNewTaskRow = true,
   });
 
   @override
@@ -63,8 +71,8 @@ class KanbanColumn extends StatelessWidget {
           child,
           const SizedBox(height: 8),
         ],
-        // Inline + New task row at the bottom
-        NewTaskRow(onTap: onNewTask),
+        // Inline + New task row at the bottom — only on To do column.
+        if (showNewTaskRow) NewTaskRow(onTap: onNewTask),
       ],
     );
   }
