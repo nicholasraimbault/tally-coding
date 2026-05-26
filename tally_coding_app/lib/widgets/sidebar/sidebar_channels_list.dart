@@ -19,18 +19,21 @@ class SidebarChannelEntry {
 /// Compact 1-line channel list for the desktop sidebar.
 ///
 /// Shows:
+/// - A "Board" nav entry above the CHANNELS section (kanban shortcut).
 /// - Section header "CHANNELS" + count + `+` adder button
 /// - One row per [SidebarChannelEntry]: `＃` icon + name (+ needs-attention
 ///   treatment: 3 px coral left accent + coral row tint + count pill + chevron)
 ///
 /// Active channel (matching [activeChannelName]) gets a subtle `rgba(tc.fg, 0.04)`
-/// background tint.
+/// background tint. [isBoardSelected] highlights the Board entry.
 ///
 /// Example:
 /// ```dart
 /// SidebarChannelsList(
 ///   channels: channels,
 ///   activeChannelName: 'general',
+///   isBoardSelected: false,
+///   onBoardTap: () => setState(() => _selected = const BoardSelected()),
 ///   onChannelTap: (name) => setState(() => _activeChannel = name),
 ///   onAddChannel: () => _showNewChannelModal(context),
 /// )
@@ -38,6 +41,11 @@ class SidebarChannelEntry {
 class SidebarChannelsList extends StatelessWidget {
   final List<SidebarChannelEntry> channels;
   final String? activeChannelName;
+  /// When true, the Board entry renders in the highlighted/active state.
+  final bool isBoardSelected;
+  /// Invoked when the user taps the Board nav entry. Should set the shell
+  /// selection to [BoardSelected].
+  final VoidCallback? onBoardTap;
   final void Function(String name) onChannelTap;
   final VoidCallback onAddChannel;
 
@@ -45,6 +53,8 @@ class SidebarChannelsList extends StatelessWidget {
     super.key,
     required this.channels,
     required this.activeChannelName,
+    this.isBoardSelected = false,
+    this.onBoardTap,
     required this.onChannelTap,
     required this.onAddChannel,
   });
@@ -55,6 +65,13 @@ class SidebarChannelsList extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // F1-Fix3: Board shortcut above the CHANNELS section.
+        // Allows desktop users to return to the kanban from any channel/task.
+        _BoardEntry(
+          tc: tc,
+          isActive: isBoardSelected,
+          onTap: onBoardTap ?? () {},
+        ),
         _SectionHeader(
           tc: tc,
           count: channels.length,
@@ -68,6 +85,72 @@ class SidebarChannelsList extends StatelessWidget {
             onTap: () => onChannelTap(ch.name),
           ),
       ],
+    );
+  }
+}
+
+/// A tappable "Board" nav entry shown above the CHANNELS section.
+/// Uses the kanban icon; highlights when [isActive].
+class _BoardEntry extends StatefulWidget {
+  final TCTokens tc;
+  final bool isActive;
+  final VoidCallback onTap;
+  const _BoardEntry({
+    required this.tc,
+    required this.isActive,
+    required this.onTap,
+  });
+
+  @override
+  State<_BoardEntry> createState() => _BoardEntryState();
+}
+
+class _BoardEntryState extends State<_BoardEntry> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = widget.tc;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        key: const Key('sidebar_board_entry'),
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          color: widget.isActive
+              ? Color.fromRGBO(
+                  tc.fg.r.toInt(), tc.fg.g.toInt(), tc.fg.b.toInt(), 0.06)
+              : (_hovered
+                  ? Color.fromRGBO(
+                      tc.fg.r.toInt(), tc.fg.g.toInt(), tc.fg.b.toInt(), 0.04)
+                  : Colors.transparent),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          child: Row(
+            children: [
+              Icon(
+                Icons.view_kanban,
+                size: 14,
+                color: widget.isActive || _hovered ? tc.fg : tc.fgXdim,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Board',
+                style: TextStyle(
+                  color: widget.isActive || _hovered ? tc.fg : tc.fgDim,
+                  fontSize: 13,
+                  fontWeight: widget.isActive
+                      ? FontWeight.w700
+                      : FontWeight.w500,
+                  fontFamily: 'JetBrainsMono',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
