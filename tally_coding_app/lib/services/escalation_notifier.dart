@@ -175,7 +175,7 @@ class EscalationNotifier {
       'Tally needs you',
       payload.question,
       details,
-      payload: '$actionPayloadPrefix',
+      payload: actionPayloadPrefix,
     );
   }
 }
