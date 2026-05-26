@@ -104,11 +104,14 @@ class PlanningCard extends StatelessWidget {
 
 /// Card for tasks workers are actively executing.
 /// Shows agent avatars + ETA + progress bar.
+/// When [escalated] is true, a coral "PAUSED · NEEDS YOU" footer is shown
+/// to signal that this task is awaiting operator input via the bottom sheet.
 class RunningTaskCard extends StatelessWidget {
   final String title;
   final List<AgentRole> agents;
   final double progress;
   final String? eta;
+  final bool escalated;
   final VoidCallback? onTap;
 
   const RunningTaskCard({
@@ -117,6 +120,7 @@ class RunningTaskCard extends StatelessWidget {
     required this.agents,
     required this.progress,
     this.eta,
+    this.escalated = false,
     this.onTap,
   });
 
@@ -161,6 +165,18 @@ class RunningTaskCard extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           BrutalProgressBar(value: progress),
+          if (escalated) ...[
+            const SizedBox(height: 8),
+            Text(
+              'PAUSED · NEEDS YOU',
+              style: TextStyle(
+                color: tc.red,
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.8,
+              ),
+            ),
+          ],
         ],
       ),
     );

@@ -146,6 +146,20 @@ void main() {
       await tester.tap(find.byType(RunningTaskCard));
       expect(taps, 1);
     });
+
+    testWidgets('RunningTaskCard with escalated=true shows Paused · needs you', (tester) async {
+      await tester.pumpWidget(_wrap(const RunningTaskCard(
+        title: 't', agents: [AgentRole.coder], progress: 0.5, escalated: true,
+      )));
+      expect(find.text('PAUSED · NEEDS YOU'), findsOneWidget);
+    });
+
+    testWidgets('RunningTaskCard default escalated=false does not show paused label', (tester) async {
+      await tester.pumpWidget(_wrap(const RunningTaskCard(
+        title: 't', agents: [AgentRole.coder], progress: 0.5,
+      )));
+      expect(find.text('PAUSED · NEEDS YOU'), findsNothing);
+    });
   });
 
   group('AwaitingCard', () {
