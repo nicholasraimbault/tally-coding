@@ -50,8 +50,11 @@ class EscalationSheet extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       decoration: BoxDecoration(
-        color: tc.sheet,
-        border: Border(top: BorderSide(color: coral, width: 1)),
+        // Coral wash: 6% opacity overlay signals urgency without full takeover.
+        color: Color.alphaBlend(coral.withValues(alpha: 0.06), tc.sheet),
+        border: Border(
+          top: BorderSide(color: coral.withValues(alpha: 0.45), width: 1),
+        ),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -64,7 +67,7 @@ class EscalationSheet extends StatelessWidget {
               height: 4,
               decoration: BoxDecoration(
                 color: tc.border,
-                borderRadius: BorderRadius.circular(2),
+                borderRadius: BorderRadius.circular(999),
               ),
             ),
           ),
@@ -87,18 +90,24 @@ class EscalationSheet extends StatelessWidget {
                           '#$channelName',
                           style: TextStyle(
                             color: tc.fg,
+                            fontFamily: 'JetBrainsMono',
                             fontSize: 13,
                             fontWeight: FontWeight.w700,
                           ),
                         ),
                         Text(
                           ' · ',
-                          style: TextStyle(color: tc.fgXdim, fontSize: 13),
+                          style: TextStyle(
+                            color: tc.fgXdim,
+                            fontFamily: 'JetBrainsMono',
+                            fontSize: 13,
+                          ),
                         ),
                         Text(
                           'needs you',
                           style: TextStyle(
                             color: coral,
+                            fontFamily: 'JetBrainsMono',
                             fontSize: 12.5,
                             fontWeight: FontWeight.w700,
                             letterSpacing: 0.4,
@@ -110,12 +119,16 @@ class EscalationSheet extends StatelessWidget {
                     Text(
                       'about: $taskTitle',
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: tc.fgDim, fontSize: 11.5),
+                      style: TextStyle(
+                        color: tc.fgDim,
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11.5,
+                      ),
                     ),
                   ],
                 ),
               ),
-              if (queueSize > 1) ...[
+              if (queueSize > 0) ...[
                 const SizedBox(width: 8),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -123,9 +136,10 @@ class EscalationSheet extends StatelessWidget {
                     border: Border.all(color: coral, width: 1),
                   ),
                   child: Text(
-                    '${queueIndex + 1} of $queueSize',
+                    '${queueIndex + 1}/$queueSize',
                     style: TextStyle(
                       color: coral,
+                      fontFamily: 'JetBrainsMono',
                       fontSize: 10,
                       fontWeight: FontWeight.w700,
                       fontFeatures: const [FontFeature.tabularFigures()],
@@ -136,10 +150,15 @@ class EscalationSheet extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
-          // Question
+          // Question — subdued per mockup (fgDim not fg).
           Text(
             escalation.question,
-            style: TextStyle(color: tc.fg, fontSize: 13.5, height: 1.4),
+            style: TextStyle(
+              color: tc.fgDim,
+              fontFamily: 'JetBrainsMono',
+              fontSize: 13.5,
+              height: 1.4,
+            ),
           ),
           const SizedBox(height: 14),
           // Quick reply buttons (one per option). 1-2 inline, 3+ stacked.
@@ -180,7 +199,7 @@ class EscalationSheet extends StatelessWidget {
               ],
             ),
           const SizedBox(height: 10),
-          // Bottom row: Open #channel ghost + Skip ghost
+          // Bottom row: Open #channel ghost + Skip ghost (Skip always visible per mockup).
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -196,13 +215,14 @@ class EscalationSheet extends StatelessWidget {
                 child: Text(
                   'OPEN #${channelName.toUpperCase()}',
                   style: const TextStyle(
+                    fontFamily: 'JetBrainsMono',
                     fontSize: 11,
                     fontWeight: FontWeight.w700,
                     letterSpacing: 0.8,
                   ),
                 ),
               ),
-              if (queueSize > 1)
+              if (queueSize > 0)
                 TextButton(
                   onPressed: onSkip,
                   style: TextButton.styleFrom(
@@ -215,6 +235,7 @@ class EscalationSheet extends StatelessWidget {
                   child: const Text(
                     'SKIP',
                     style: TextStyle(
+                      fontFamily: 'JetBrainsMono',
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
                       letterSpacing: 0.8,

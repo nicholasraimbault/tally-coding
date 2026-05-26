@@ -4,7 +4,7 @@ import 'package:tally_coding_app/widgets/kanban/kanban_cards.dart';
 import 'package:tally_coding_app/widgets/kanban/kanban_column.dart';
 import 'package:tally_coding_app/widgets/kanban/task_status.dart';
 
-const double _kColumnWidth = 280;
+const double _kColumnWidth = 234;
 const double _kColumnGap = 12;
 const double _kWideBreakpoint = 1100;
 
@@ -12,16 +12,21 @@ const double _kWideBreakpoint = 1100;
 ///
 /// Mobile (< 1100px): horizontal scroll, ~1.5 columns visible.
 /// Desktop (>= 1100px): all 5 columns side-by-side, equal width.
+///
+/// [escalatedTaskIds]: set of task IDs with active escalation. Running cards
+/// whose ID is in this set get coral chrome and "PAUSED · NEEDS YOU" footer.
 class KanbanView extends StatelessWidget {
   final List<Task> tasks;
   final void Function(Task) onTaskTap;
   final VoidCallback onNewTask;
+  final Set<String> escalatedTaskIds;
 
   const KanbanView({
     super.key,
     required this.tasks,
     required this.onTaskTap,
     required this.onNewTask,
+    this.escalatedTaskIds = const {},
   });
 
   Map<TaskColumn, List<Task>> _grouped() {
@@ -43,11 +48,12 @@ class KanbanView extends StatelessWidget {
         return PlanningCard(title: title, onTap: tap);
       case TaskColumn.running:
         // Agents not yet wired from backend; show empty for now.
-        // B3 will introduce escalation backreference + agent state on cards.
+        // Progress is null until backend exposes it — card shows no progress bar.
         return RunningTaskCard(
           title: title,
           agents: const [],
-          progress: 0.5, // backend doesn't expose progress yet — placeholder
+          progress: null,
+          escalated: escalatedTaskIds.contains(task.id),
           onTap: tap,
         );
       case TaskColumn.awaiting:
@@ -111,9 +117,11 @@ class KanbanView extends StatelessWidget {
           );
         }
         // Mobile: horizontal scroll with fixed-width columns.
+        // Bottom padding matches the AmbientMiniDash collapsed height (~140px)
+        // so the bottom cards are never hidden behind the bottom sheet.
         return SingleChildScrollView(
           scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 140),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [

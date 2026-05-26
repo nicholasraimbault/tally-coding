@@ -68,6 +68,7 @@ class InlineEscalationCard extends StatelessWidget {
                       'TALLY NEEDS YOU',
                       style: TextStyle(
                         color: coral,
+                        fontFamily: 'JetBrainsMono',
                         fontSize: 11,
                         fontWeight: FontWeight.w700,
                         letterSpacing: 0.8,
@@ -78,8 +79,9 @@ class InlineEscalationCard extends StatelessWidget {
                       taskTitle,
                       style: TextStyle(
                         color: tc.fgDim,
+                        fontFamily: 'JetBrainsMono',
                         fontSize: 12,
-                        fontStyle: FontStyle.italic,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ],
@@ -91,28 +93,58 @@ class InlineEscalationCard extends StatelessWidget {
           // Question
           Text(
             escalation.question,
-            style: TextStyle(color: tc.fg, fontSize: 13.5, height: 1.4),
+            style: TextStyle(
+              color: tc.fg,
+              fontFamily: 'JetBrainsMono',
+              fontSize: 13.5,
+              height: 1.4,
+            ),
           ),
           const SizedBox(height: 12),
-          // Quick reply buttons — always stacked vertically for consistent thumb-tap
-          for (int i = 0; i < escalation.options.length; i++) ...[
-            if (i > 0) const SizedBox(height: 6),
-            i == 0
-                ? BrutalButton.primary(
-                    label: escalation.options[i],
-                    onPressed: () => onReply(escalation.options[i]),
-                  )
-                : BrutalButton.outline(
-                    label: escalation.options[i],
-                    onPressed: () => onReply(escalation.options[i]),
+          // Quick reply buttons — 2 options inline (Row), 3+ stacked (Column).
+          if (escalation.options.length <= 2)
+            Row(
+              children: [
+                for (int i = 0; i < escalation.options.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 8),
+                  Expanded(
+                    child: i == 0
+                        ? BrutalButton.primary(
+                            label: escalation.options[i],
+                            onPressed: () => onReply(escalation.options[i]),
+                          )
+                        : BrutalButton.outline(
+                            label: escalation.options[i],
+                            onPressed: () => onReply(escalation.options[i]),
+                          ),
                   ),
-          ],
+                ],
+              ],
+            )
+          else
+            Column(
+              children: [
+                for (int i = 0; i < escalation.options.length; i++) ...[
+                  if (i > 0) const SizedBox(height: 6),
+                  i == 0
+                      ? BrutalButton.primary(
+                          label: escalation.options[i],
+                          onPressed: () => onReply(escalation.options[i]),
+                        )
+                      : BrutalButton.outline(
+                          label: escalation.options[i],
+                          onPressed: () => onReply(escalation.options[i]),
+                        ),
+                ],
+              ],
+            ),
           const SizedBox(height: 10),
           // Ghost link: "OPEN TASK CHANNEL" — navigates to the task channel
           // without dismissing the current long-term channel.
+          // 12px arrow icon prefix per mockup (Screen 5 / Open button pattern).
           Align(
             alignment: Alignment.centerLeft,
-            child: TextButton(
+            child: TextButton.icon(
               onPressed: onOpenTask,
               style: TextButton.styleFrom(
                 foregroundColor: tc.fgXdim,
@@ -121,9 +153,11 @@ class InlineEscalationCard extends StatelessWidget {
                   borderRadius: BorderRadius.zero,
                 ),
               ),
-              child: const Text(
+              icon: const Icon(Icons.arrow_forward, size: 12),
+              label: const Text(
                 'OPEN TASK CHANNEL',
                 style: TextStyle(
+                  fontFamily: 'JetBrainsMono',
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.8,

@@ -15,8 +15,9 @@ void main() {
     )));
     expect(find.text('6'), findsOneWidget);
     expect(find.text('3'), findsOneWidget);
-    expect(find.text('open'), findsOneWidget);
-    expect(find.text('done today'), findsOneWidget);
+    // Stat labels are uppercase per mockup.
+    expect(find.text('OPEN'), findsOneWidget);
+    expect(find.text('DONE TODAY'), findsOneWidget);
   });
 
   testWidgets('renders drag handle pill', (tester) async {

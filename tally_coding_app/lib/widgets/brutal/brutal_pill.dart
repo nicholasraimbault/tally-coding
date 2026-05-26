@@ -30,9 +30,11 @@ class BrutalPill extends StatelessWidget {
         label.toUpperCase(),
         style: TextStyle(
           color: color,
+          fontFamily: 'JetBrainsMono',
           fontSize: 10,
           fontWeight: FontWeight.w700,
           letterSpacing: 0.5,
+          fontFeatures: const [FontFeature.tabularFigures()],
         ),
       ),
     );

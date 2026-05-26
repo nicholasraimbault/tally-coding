@@ -37,7 +37,7 @@ class AmbientMiniDash extends StatelessWidget {
               height: 4,
               decoration: BoxDecoration(
                 color: tc.border,
-                borderRadius: BorderRadius.circular(2),
+                borderRadius: BorderRadius.circular(999),
               ),
             ),
           ),
@@ -49,7 +49,7 @@ class AmbientMiniDash extends StatelessWidget {
               const SizedBox(width: 6),
               _StatLabel(text: 'open'),
               const SizedBox(width: 10),
-              Text('│', style: TextStyle(color: tc.fgDimmer, fontSize: 14)),
+              Text('│', style: TextStyle(color: tc.fgDimmer, fontFamily: 'JetBrainsMono', fontSize: 14)),
               const SizedBox(width: 10),
               _StatNumber(value: doneCount),
               const SizedBox(width: 6),
@@ -70,12 +70,17 @@ class AmbientMiniDash extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                     decoration: BoxDecoration(
-                      color: tc.bubble,
+                      color: Colors.transparent,
                       border: Border.all(color: tc.border, width: 1),
                     ),
                     child: Text(
                       narratorText!,
-                      style: TextStyle(color: tc.fg, fontSize: 12.5, height: 1.4),
+                      style: TextStyle(
+                        color: tc.fgDim,
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 12.5,
+                        height: 1.4,
+                      ),
                     ),
                   ),
                 ),
@@ -99,7 +104,8 @@ class _StatNumber extends StatelessWidget {
       '$value',
       style: TextStyle(
         color: tc.fg,
-        fontSize: 22,
+        fontFamily: 'JetBrainsMono',
+        fontSize: 18,
         fontWeight: FontWeight.w700,
         fontFeatures: const [FontFeature.tabularFigures()],
       ),
@@ -115,12 +121,13 @@ class _StatLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     final tc = context.tc;
     return Text(
-      text,
+      text.toUpperCase(),
       style: TextStyle(
-        color: tc.fgDim,
-        fontSize: 11,
-        fontWeight: FontWeight.w500,
-        letterSpacing: 0.8,
+        color: tc.fgXdim,
+        fontFamily: 'JetBrainsMono',
+        fontSize: 10.5,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 0.6,
       ),
     );
   }
@@ -129,8 +136,14 @@ class _StatLabel extends StatelessWidget {
 class MiniTaskRow extends StatelessWidget {
   final String title;
   final double progress;
+  final List<AgentRole> agents;
 
-  const MiniTaskRow({super.key, required this.title, required this.progress});
+  const MiniTaskRow({
+    super.key,
+    required this.title,
+    required this.progress,
+    this.agents = const [],
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -140,11 +153,21 @@ class MiniTaskRow extends StatelessWidget {
       padding: const EdgeInsets.only(top: 10),
       child: Row(
         children: [
+          if (agents.isNotEmpty) ...[
+            Wrap(
+              spacing: 2,
+              children: [
+                for (final role in agents)
+                  AgentAvatar(role: role, size: 18, active: false),
+              ],
+            ),
+            const SizedBox(width: 6),
+          ],
           Expanded(
             child: Text(
               title,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(color: tc.fgDim, fontSize: 13),
+              style: TextStyle(color: tc.fgDim, fontFamily: 'JetBrainsMono', fontSize: 13),
             ),
           ),
           const SizedBox(width: 8),
@@ -167,6 +190,7 @@ class MiniTaskRow extends StatelessWidget {
             '${(clamped * 100).round()}%',
             style: TextStyle(
               color: tc.fgXdim,
+              fontFamily: 'JetBrainsMono',
               fontSize: 11,
               fontFeatures: const [FontFeature.tabularFigures()],
             ),

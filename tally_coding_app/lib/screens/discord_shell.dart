@@ -645,7 +645,11 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
         backgroundColor: tc.elev,
         foregroundColor: Colors.white,
         title: Text(channelTitle,
-            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+            style: const TextStyle(
+              fontFamily: 'JetBrainsMono',
+              fontWeight: FontWeight.w600,
+              fontSize: 16,
+            )),
         actions: [
           IconButton(
             tooltip: 'Settings',
