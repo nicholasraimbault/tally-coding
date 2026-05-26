@@ -37,6 +37,7 @@ import '../widgets/kanban/kanban.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/new_dm_modal.dart';
 import '../widgets/server_rail.dart';
+import '../widgets/sidebar/sidebar.dart';
 import 'workspace_settings.dart';
 
 /// The channel selection in the shell. `general` is the sentinel for
@@ -116,6 +117,9 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   // B3a: most-recent Tally narrator text from the WS stream.
   // Populated in Task 12; null until the first narrator event arrives.
   String? _latestNarratorText;
+  // B5: active workspace display name for the SidebarShell WorkspaceRow badge.
+  // Loaded asynchronously from /me/workspaces; shows 'workspace' as fallback.
+  String _workspaceDisplayName = 'workspace';
 
   @override
   void initState() {
@@ -194,6 +198,7 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     if (_lastFetchedDirectChannelsWorkspaceId != ctxId) {
       _lastFetchedDirectChannelsWorkspaceId = ctxId;
       _fetchDirectChannels();
+      _loadActiveWorkspaceName(); // B5: refresh workspace name on workspace switch
     }
   }
 
@@ -398,6 +403,29 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
     if (changed && mounted) setState(() {});
   }
 
+  /// B5: load the active workspace name for the SidebarShell WorkspaceRow badge.
+  /// Called from didChangeDependencies so WorkspaceContext is available.
+  /// Silently falls back to 'workspace' on error.
+  Future<void> _loadActiveWorkspaceName() async {
+    try {
+      final wsId = WorkspaceContext.of(context).activeWorkspaceId;
+      final list = await widget.client.listMyWorkspaces();
+      if (!mounted) return;
+      final ws = list.firstWhere(
+        (w) => w['id'] == wsId,
+        orElse: () => list.isNotEmpty ? list.first : <String, dynamic>{},
+      );
+      if (ws.isNotEmpty) {
+        final name = ws['name'] as String? ?? 'workspace';
+        if (_workspaceDisplayName != name) {
+          setState(() => _workspaceDisplayName = name);
+        }
+      }
+    } catch (_) {
+      // silent: badge shows 'workspace' as fallback
+    }
+  }
+
 /// Sprint 33-rest: server rail 💳 → push the billing screen.
   Future<void> _openBilling(BuildContext context) async {
     await Navigator.of(context).push<void>(
@@ -464,7 +492,18 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
   }
 
   Widget _buildWide(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
+    // B5: derive sidebar channel list from custom channels only (long-term channels).
+    final sidebarChannels = _customChannels.map((ch) => SidebarChannelEntry(
+      name: ch['name'] as String? ?? 'channel',
+      needsAttention: ch['_unread_escalation'] == true,
+      escalationCount: ch['_unread_escalation'] == true ? 1 : 0,
+    )).toList();
+
+    // B5: stub ambient data from current task list.
+    // Task 9 will wire this to MiniDashController when B3 controller ships.
+    final runningTasks = _tasks.where((t) => t.status == 'running').toList();
+    final doneTodayCount = _tasks.where((t) => t.status == 'completed').length;
+
     return Scaffold(
       body: SafeArea(
         child: Column(
@@ -478,62 +517,26 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
             Expanded(
               child: Row(
                 children: [
-                  // Sprint 50 B4: workspace-switching rail (far-left column).
-                  ServerRail(
-                    client: widget.client,
-                    activeWorkspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-                    onSelect: WorkspaceContext.of(context).onChange,
-                  ),
-                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-                  _ChannelList(
-                    tasks: _tasks,
-                    selected: _selected,
-                    loading: _loading && _tasks.isEmpty,
-                    error: _error,
-                    onSelect: (sel) => setState(() => _selected = sel),
-                    onRetry: _fetch,
-                    dmChannels: _dmChannels,
-                    scheduledChannels: _scheduledChannels,
-                    customChannels: _customChannels,
-                    // Sprint 51 B4: archive a custom channel from the rail.
-                    onArchiveChannel: (channelId) async {
-                      final messenger = ScaffoldMessenger.of(context);
-                      try {
-                        await widget.client.archiveChannel(channelId: channelId);
-                        await _fetchDirectChannels();
-                        messenger.showSnackBar(
-                          const SnackBar(content: Text('Channel archived')),
-                        );
-                      } catch (e) {
-                        messenger.showSnackBar(
-                          SnackBar(content: Text('Archive failed: $e')),
-                        );
-                      }
-                    },
-                    onNewScheduled: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => PersistentAgentsScreen(
-                          client: widget.client,
-                          workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-                        ),
-                      ),
-                    ),
-                    onNewDm: () async {
-                      final result = await showDialog<Map<String, dynamic>>(
-                        context: context,
-                        builder: (_) => NewDmModal(
-                          client: widget.client,
-                          workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
-                        ),
+                  // B5: SidebarShell replaces ServerRail + _ChannelList + _MembersPanel.
+                  SidebarShell(
+                    workspaceName: _workspaceDisplayName,
+                    onWorkspaceSwitcherTap: () => _openSettings(),
+                    onSearchTap: () {}, // search deferred
+                    channels: sidebarChannels,
+                    activeChannelName: _activeLongTermChannelName(),
+                    onChannelTap: (name) {
+                      final ch = _customChannels.firstWhere(
+                        (c) => c['name'] == name,
+                        orElse: () => <String, dynamic>{},
                       );
-                      if (result != null && mounted) {
-                        // Reload channels so any new DM appears in the rail.
-                        await _fetch();
-                        await _fetchDirectChannels();
+                      if (ch.isNotEmpty) {
+                        setState(() => _selected = DirectChannelSelected(
+                          ch['id'] as int,
+                          name,
+                        ));
                       }
                     },
-                    // Sprint 50 B7: open NewChannelModal; refresh rail on success.
-                    onNewChannel: () async {
+                    onAddChannel: () async {
                       final newCh = await showDialog<Map<String, dynamic>>(
                         context: context,
                         builder: (_) => NewChannelModal(
@@ -541,21 +544,24 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                           workspaceId: WorkspaceContext.of(context).activeWorkspaceId,
                         ),
                       );
-                      if (newCh != null && mounted) {
-                        await _fetchDirectChannels();
-                      }
+                      if (newCh != null && mounted) await _fetchDirectChannels();
                     },
-                    // Sprint 50 B7 / fixed Sprint 54: gear icon opens
-                    // WorkspaceSettingsScreen via the shared _openSettings
-                    // helper, which handles the "active workspace is
-                    // stale / not in /me/workspaces" edge case the
-                    // earlier silent-return handler swallowed.
-                    onOpenSettings: _openSettings,
+                    // Ambient mini-dash data (stub — wire MiniDashController in Task 9)
+                    openCount: runningTasks.length,
+                    doneToday: doneTodayCount,
+                    tasks: runningTasks.take(3).map((t) => SidebarMiniTaskData(
+                      title: t.channelTitle,
+                      agentRoles: _agentRolesFor(t),
+                      progressPct: _progressFor(t),
+                    )).toList(),
+                    narratorText: _latestNarratorText ?? 'Agents are running.',
+                    narratorEmphasis: const [],
+                    escalations: const [], // wire via MiniDashController in Task 9
+                    onQuickReply: (_) {},
+                    onSkipEscalation: () {},
+                    onOpenChannel: () {},
                   ),
-                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
                   Expanded(child: _mainPane()),
-                  Container(width: 1, color: cs.outlineVariant.withValues(alpha: 0.3)),
-                  _MembersPanel(selected: _selected, tasks: _tasks),
                 ],
               ),
             ),
@@ -564,6 +570,27 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
       ),
     );
   }
+
+  /// B5: returns the channel name for the currently selected long-term channel,
+  /// or null if a task channel / general / board is selected.
+  String? _activeLongTermChannelName() {
+    if (_selected case DirectChannelSelected(channelName: final name)) {
+      return name;
+    }
+    return null;
+  }
+
+  /// B5: extract agent role strings from a task's team_spec.
+  List<String> _agentRolesFor(Task t) {
+    final agents = (t.teamSpec?['agents'] as List<dynamic>?) ?? const [];
+    return agents
+        .map((a) => (a as Map<String, dynamic>)['role'] as String? ?? 'coder')
+        .toList();
+  }
+
+  /// B5: estimate task progress — 50% for running, 100% for completed.
+  int _progressFor(Task t) =>
+      t.status == 'completed' ? 100 : (t.status == 'running' ? 50 : 0);
 
   Widget _buildNarrow(BuildContext context) {
     final channelTitle = switch (_selected) {
