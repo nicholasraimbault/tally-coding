@@ -1239,10 +1239,11 @@ class _MembersPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     final isSheet = scrollController != null;
     return Container(
       width: isSheet ? null : 240,
-      color: const Color(0xFF2B2D31),
+      color: tc.sheet,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -1256,7 +1257,7 @@ class _MembersPanel extends StatelessWidget {
                 BoardSelected() => 'MEMBERS',
               },
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: const Color(0xFF8E9297),
+                    color: tc.fgDim,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 1.2,
                   ),
@@ -1269,6 +1270,7 @@ class _MembersPanel extends StatelessWidget {
   }
 
   Widget _body(BuildContext context) {
+    final tc = context.tc;
     // Sprint 49 B7: DM / scheduled_agent channels don't have agent rosters.
     // BoardSelected also has no task-specific roster.
     if (selected is GeneralSelected ||
@@ -1276,11 +1278,11 @@ class _MembersPanel extends StatelessWidget {
         selected is BoardSelected) {
       return ListView(
         controller: scrollController,
-        children: const [
+        children: [
           _MemberTile(
             role: tallyMember,
             status: 'online',
-            statusColor: Color(0xFF57F287),
+            statusColor: tc.green,
           ),
         ],
       );
@@ -1289,11 +1291,11 @@ class _MembersPanel extends StatelessWidget {
     final task = tasks.where((t) => t.id == taskId).cast<Task?>().firstOrNull;
     final agents = _agentListFor(task);
     if (agents.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.all(16),
+      return Padding(
+        padding: const EdgeInsets.all(16),
         child: Text(
           'Tally is still picking the team.',
-          style: TextStyle(color: Color(0xFF8E9297), fontSize: 12),
+          style: TextStyle(color: tc.fgDim, fontSize: 12),
         ),
       );
     }
@@ -1302,14 +1304,15 @@ class _MembersPanel extends StatelessWidget {
       itemCount: agents.length,
       itemBuilder: (context, i) {
         final a = agents[i];
+        final tc = context.tc;
         return _MemberTile(
           role: agentRoleOf(a.roleName),
           status: a.status,
           statusColor: switch (a.status) {
-            'working' => const Color(0xFF5865F2),
-            'done' => const Color(0xFF57F287),
-            'failed' => const Color(0xFFED4245),
-            _ => const Color(0xFF8E9297),
+            'working' => tc.cyan,
+            'done' => tc.green,
+            'failed' => tc.red,
+            _ => tc.fgDimmer,
           },
           model: a.model,
         );
@@ -1386,6 +1389,7 @@ class _MemberTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = context.tc;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
       child: Material(
@@ -1417,7 +1421,9 @@ class _MemberTile extends StatelessWidget {
                       decoration: BoxDecoration(
                         color: statusColor,
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0xFF2B2D31), width: 2),
+                        // ring color matches the panel surface so the dot
+                        // appears to float above the avatar bg.
+                        border: Border.all(color: tc.sheet, width: 2),
                       ),
                     ),
                   ],
@@ -1429,8 +1435,8 @@ class _MemberTile extends StatelessWidget {
                     children: [
                       Text(
                         role.name,
-                        style: const TextStyle(
-                          color: Colors.white,
+                        style: TextStyle(
+                          color: tc.fg,
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
                         ),
@@ -1441,8 +1447,8 @@ class _MemberTile extends StatelessWidget {
                             : role.tagline,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFF8E9297),
+                        style: TextStyle(
+                          color: tc.fgDim,
                           fontSize: 10,
                         ),
                       ),
