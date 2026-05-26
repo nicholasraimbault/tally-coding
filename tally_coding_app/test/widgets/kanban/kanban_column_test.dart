@@ -43,7 +43,30 @@ void main() {
     expect(find.text('beta'), findsOneWidget);
   });
 
-  testWidgets('renders NewTaskRow at the bottom', (tester) async {
+  testWidgets('renders NewTaskRow when showNewTaskRow is true (default)', (tester) async {
+    await tester.pumpWidget(_wrap(KanbanColumn(
+      label: 'To do',
+      count: 0,
+      children: const [],
+      onNewTask: () {},
+      showNewTaskRow: true,
+    )));
+    expect(find.text('+ New task'), findsOneWidget);
+  });
+
+  testWidgets('omits NewTaskRow when showNewTaskRow is false', (tester) async {
+    await tester.pumpWidget(_wrap(KanbanColumn(
+      label: 'Running',
+      count: 0,
+      children: const [],
+      onNewTask: () {},
+      showNewTaskRow: false,
+    )));
+    expect(find.text('+ New task'), findsNothing);
+  });
+
+  testWidgets('default showNewTaskRow=true keeps NewTaskRow visible', (tester) async {
+    // Backwards-compat: omitting showNewTaskRow shows the row by default.
     await tester.pumpWidget(_wrap(KanbanColumn(
       label: 'x',
       count: 0,

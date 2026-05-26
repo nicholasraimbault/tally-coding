@@ -29,6 +29,7 @@ import 'general_channel.dart';
 import 'task_channel.dart';
 import '../theme/tc_tokens.dart';
 import '../widgets/kanban/kanban.dart';
+import '../widgets/kanban/quick_add_task_modal.dart';
 import '../widgets/new_channel_modal.dart';
 import '../widgets/sidebar/sidebar.dart';
 import 'workspace_settings.dart';
@@ -549,6 +550,8 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                     },
                     // F1-Fix4: skip cycles the head escalation to the tail.
                     onSkipEscalation: bsController.skip,
+                    // F5: settings gear in SidebarFooter — mirrors narrow AppBar gear.
+                    onSettingsTap: () => _openSettings(),
                     // F1-Fix4: open escalation channel in the right pane.
                     onOpenChannel: () {
                       final esc = bsController.activeEscalation;
@@ -578,9 +581,15 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                                   onTaskTap: (task) => setState(
                                     () => _selected = TaskSelected(task.id),
                                   ),
-                                  onNewTask: () => setState(
-                                    () => _selected = const GeneralSelected(),
-                                  ),
+                                  onNewTask: () async {
+                                    final result =
+                                        await QuickAddTaskModal.show(
+                                      context,
+                                      client: widget.client,
+                                      projectId: _activeProjectId,
+                                    );
+                                    if (result != null && mounted) _fetch();
+                                  },
                                 ),
                               ),
                               // Right half: chat pane with a close affordance.
@@ -771,8 +780,14 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
                       tasks: _filteredTasksForKanban(),
                       onTaskTap: (task) =>
                           setState(() => _selected = TaskSelected(task.id)),
-                      onNewTask: () =>
-                          setState(() => _selected = const GeneralSelected()),
+                      onNewTask: () async {
+                        final result = await QuickAddTaskModal.show(
+                          context,
+                          client: widget.client,
+                          projectId: _activeProjectId,
+                        );
+                        if (result != null && mounted) _fetch();
+                      },
                     ),
                   ),
                 ),
@@ -795,8 +810,14 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
               tasks: _filteredTasksForKanban(),
               onTaskTap: (task) =>
                   setState(() => _selected = TaskSelected(task.id)),
-              onNewTask: () =>
-                  setState(() => _selected = const GeneralSelected()),
+              onNewTask: () async {
+                final result = await QuickAddTaskModal.show(
+                  context,
+                  client: widget.client,
+                  projectId: _activeProjectId,
+                );
+                if (result != null && mounted) _fetch();
+              },
             ),
     };
   }

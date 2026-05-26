@@ -111,4 +111,13 @@ void main() {
     ));
     expect(find.byType(SingleChildScrollView), findsNothing);
   });
+
+  testWidgets('+New task row appears only in To do column', (tester) async {
+    await _setWidth(tester, 1400);
+    await tester.pumpWidget(_wrap(
+      KanbanView(tasks: const [], onTaskTap: (_) {}, onNewTask: () {}),
+    ));
+    // There must be exactly one "+ New task" across all 5 columns.
+    expect(find.text('+ New task'), findsOneWidget);
+  });
 }
