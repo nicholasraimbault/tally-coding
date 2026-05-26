@@ -630,17 +630,29 @@ class _DiscordShellScreenState extends State<DiscordShellScreen> {
           directChannelId: cid,
           channelTitle: name,
         ),
-      // B3a Task 11: wrap kanban in a Stack so the bottom sheet can
+      // B3a Task 11 / F4: wrap kanban in a Stack so the bottom sheet can
       // overlay at the bottom without pushing kanban content up.
+      // The kanban layer is wrapped in a Consumer so a tap on the kanban
+      // area (when the sheet is expanded) collapses the sheet back to ambient.
       BoardSelected() => Stack(
           children: [
             Positioned.fill(
-              child: KanbanView(
-                tasks: _filteredTasksForKanban(),
-                onTaskTap: (task) =>
-                    setState(() => _selected = TaskSelected(task.id)),
-                onNewTask: () =>
-                    setState(() => _selected = const GeneralSelected()),
+              child: Consumer<BottomSheetController>(
+                builder: (context, bsc, child) => GestureDetector(
+                  // Tap on kanban behind when sheet is expanded → collapse.
+                  onTap: bsc.state == SheetState.channelsExpanded
+                      ? bsc.collapseToAmbient
+                      : null,
+                  behavior: HitTestBehavior.translucent,
+                  child: child,
+                ),
+                child: KanbanView(
+                  tasks: _filteredTasksForKanban(),
+                  onTaskTap: (task) =>
+                      setState(() => _selected = TaskSelected(task.id)),
+                  onNewTask: () =>
+                      setState(() => _selected = const GeneralSelected()),
+                ),
               ),
             ),
             Positioned(
@@ -969,14 +981,41 @@ class _MemberTile extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────
-// B3a: bottom-sheet overlay for the Board view.
+// F4: draggable bottom-sheet overlay for the Board view.
 // ─────────────────────────────────────────────────────────────
 
-/// Reads [BottomSheetController] from the Provider tree and renders
-/// either [AmbientMiniDash] (ambient state) or [EscalationSheet]
-/// (takeover state) depending on controller state.  Hidden when
-/// controller state is [SheetState.hidden].
-class _BoardBottomSheet extends StatelessWidget {
+/// Collapsed height — just the ambient mini-dash content.
+const double _sheetCollapsedHeight = 152.0;
+
+/// Expanded height as a fraction of the viewport (matches mockup Screen 3).
+const double _sheetExpandedFraction = 0.76;
+
+/// Draggable bottom sheet overlay for the Board view (mobile narrow layout).
+///
+/// Snaps between two heights:
+///   - collapsed: [_sheetCollapsedHeight] px — shows [AmbientMiniDash]
+///   - expanded:  [_sheetExpandedFraction] × viewport — shows [ChannelsSheet]
+///
+/// During takeover (escalation) the sheet is locked-height — user must resolve
+/// or skip the escalation before dragging is re-enabled.
+///
+/// Gesture rules:
+///   - While dragging: sheet follows finger 1:1 within [collapsed, expanded].
+///   - On release: velocity < −200 → snap to expanded; > 200 → snap to
+///     collapsed; otherwise snap to nearest.
+///   - Tap on drag handle in collapsed state → expand; in expanded → collapse.
+///   - Tap on kanban behind (when expanded) → collapse.
+///
+/// Example:
+/// ```dart
+/// _BoardBottomSheet(
+///   tasks: kanbanTasks,
+///   latestNarratorText: narrator,
+///   client: orchClient,
+///   onOpenChannel: (id, name) => setState(() => _selected = DirectChannelSelected(id, name)),
+/// )
+/// ```
+class _BoardBottomSheet extends StatefulWidget {
   final List<Task> tasks;
   final String? latestNarratorText;
   final TallyOrchClient client;
@@ -990,33 +1029,50 @@ class _BoardBottomSheet extends StatelessWidget {
   });
 
   @override
+  State<_BoardBottomSheet> createState() => _BoardBottomSheetState();
+}
+
+class _BoardBottomSheetState extends State<_BoardBottomSheet> {
+  /// Non-null while the user is actively dragging.
+  /// null = controller drives height via AnimatedContainer.
+  double? _dragHeight;
+
+  double _expandedHeight(BuildContext context) =>
+      MediaQuery.of(context).size.height * _sheetExpandedFraction;
+
+  /// Picks the nearest snap point given current height and velocity.
+  double _snapTarget(double currentHeight, double velocity, BuildContext context) {
+    final expanded = _expandedHeight(context);
+    if (velocity < -200) return expanded;       // fast upward → expand
+    if (velocity > 200) return _sheetCollapsedHeight;  // fast downward → collapse
+    // No strong velocity — snap to nearest.
+    final midpoint = (_sheetCollapsedHeight + expanded) / 2;
+    return currentHeight >= midpoint ? expanded : _sheetCollapsedHeight;
+  }
+
+  void _snapAndUpdateController(double target, BuildContext context) {
+    final controller = context.read<BottomSheetController>();
+    setState(() => _dragHeight = null);
+    if (target >= _expandedHeight(context) * 0.9) {
+      controller.expandChannels();
+    } else {
+      controller.collapseToAmbient();
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final controller = context.watch<BottomSheetController>();
 
     if (controller.state == SheetState.hidden) return const SizedBox.shrink();
 
-    // B3b Task 8: channels-expanded state — full channel list sheet.
-    if (controller.state == SheetState.channelsExpanded) {
-      return ChannelsSheet(
-        channels: controller.channels,
-        needsAttention: {
-          for (final e in controller.queue) e.channelId,
-        },
-        escalationCountByChannel: {
-          for (final e in controller.queue)
-            e.channelId: (controller.queue
-                    .where((q) => q.channelId == e.channelId)
-                    .length),
-        },
-        onChannelTap: (ch) => onOpenChannel(ch.id, ch.name),
-        onCollapse: controller.collapseToAmbient,
-      );
-    }
+    final expanded = _expandedHeight(context);
 
+    // Takeover state — locked height, no drag allowed.
     if (controller.state == SheetState.takeover &&
         controller.activeEscalation != null) {
       final esc = controller.activeEscalation!;
-      final task = tasks.firstWhere(
+      final task = widget.tasks.firstWhere(
         (t) => t.id == esc.taskId,
         orElse: () => Task.fromJson({
           'id': esc.taskId,
@@ -1031,25 +1087,16 @@ class _BoardBottomSheet extends StatelessWidget {
         queueIndex: 0,
         queueSize: controller.queueSize,
         taskTitle: task.channelTitle,
-        // B3b will derive channelName from real escalation routing
-        // (channel_id lookup).  For B3a, all escalations default to
-        // the 'general' long-term channel.
         channelName: 'general',
-        // B3a Task 14: post the chosen quick-reply option back to the
-        // long-term channel where the escalation lives, then resolve
-        // the active escalation so the sheet returns to ambient.
-        // If the POST fails, leave the escalation in the queue so the
-        // user can retry — don't silently drop it.
         onReply: (option) async {
           try {
-            await client.postMessage(
+            await widget.client.postMessage(
               channelId: esc.channelId,
               text: option,
               kind: 'message',
               payload: {'in_response_to_escalation': esc.id},
             );
           } catch (_) {
-            // POST failed — keep escalation active for retry.
             return;
           }
           if (context.mounted) {
@@ -1057,36 +1104,88 @@ class _BoardBottomSheet extends StatelessWidget {
           }
         },
         onSkip: controller.skip,
-        onOpen: () => onOpenChannel(esc.channelId, 'general'),
+        onOpen: () => widget.onOpenChannel(esc.channelId, 'general'),
       );
     }
 
-    // Ambient state: stat row + running-task progress rows + narrator bubble.
-    final done = tasks
-        .where(
-          (t) => t.status == 'completed' || t.status == 'failed',
-        )
-        .length;
-    final open = tasks.length - done;
-    final running = tasks.where((t) => t.status == 'running').toList();
+    // Determine target height driven by the controller when not dragging.
+    final controllerHeight = controller.state == SheetState.channelsExpanded
+        ? expanded
+        : _sheetCollapsedHeight;
 
-    // B3b Task 8: swipe-up on ambient dash expands to channels sheet.
+    // Current display height: drag-driven when the user is holding the finger,
+    // controller-driven otherwise.
+    final displayHeight = _dragHeight ?? controllerHeight;
+
+    // Build sheet content.  At intermediate drag positions show both ambient
+    // content (mini-dash) regardless of state so the drag handle is always
+    // visible.  The channels list fades in as the sheet rises.
+    final done = widget.tasks
+        .where((t) => t.status == 'completed' || t.status == 'failed')
+        .length;
+    final open = widget.tasks.length - done;
+    final running = widget.tasks.where((t) => t.status == 'running').toList();
+
+    // Fraction from collapsed to expanded — used to decide which content to show.
+    final fraction = ((displayHeight - _sheetCollapsedHeight) /
+            (expanded - _sheetCollapsedHeight))
+        .clamp(0.0, 1.0);
+    // Show channels list when the sheet is more than halfway up.
+    final showChannels = fraction > 0.5;
+
     return GestureDetector(
+      // Drag start: capture current height so we can delta from it.
+      onVerticalDragUpdate: (details) {
+        final current = _dragHeight ?? controllerHeight;
+        setState(() {
+          _dragHeight = (current - details.delta.dy)
+              .clamp(_sheetCollapsedHeight, expanded);
+        });
+      },
       onVerticalDragEnd: (details) {
-        // Negative primaryVelocity = upward swipe.
-        if ((details.primaryVelocity ?? 0) < -200) {
-          context.read<BottomSheetController>().expandChannels();
+        final current = _dragHeight ?? controllerHeight;
+        final velocity = details.primaryVelocity ?? 0;
+        final target = _snapTarget(current, velocity, context);
+        _snapAndUpdateController(target, context);
+      },
+      // Tap on the handle band — toggle between expanded / collapsed.
+      onTap: () {
+        if (controller.state == SheetState.channelsExpanded) {
+          _snapAndUpdateController(_sheetCollapsedHeight, context);
+        } else {
+          _snapAndUpdateController(expanded, context);
         }
       },
-      child: AmbientMiniDash(
-        openCount: open,
-        doneCount: done,
-        taskRows: [
-          for (final t in running.take(2))
-            // Progress placeholder: B3b will wire real per-task progress.
-            MiniTaskRow(title: t.channelTitle, progress: 0.5),
-        ],
-        narratorText: latestNarratorText,
+      // Tap outside is handled by the parent Stack — see [_mainPane].
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+        height: displayHeight,
+        child: showChannels
+            ? ChannelsSheet(
+                channels: controller.channels,
+                needsAttention: {
+                  for (final e in controller.queue) e.channelId,
+                },
+                escalationCountByChannel: {
+                  for (final e in controller.queue)
+                    e.channelId: (controller.queue
+                            .where((q) => q.channelId == e.channelId)
+                            .length),
+                },
+                onChannelTap: (ch) => widget.onOpenChannel(ch.id, ch.name),
+                onCollapse: () =>
+                    _snapAndUpdateController(_sheetCollapsedHeight, context),
+              )
+            : AmbientMiniDash(
+                openCount: open,
+                doneCount: done,
+                taskRows: [
+                  for (final t in running.take(2))
+                    MiniTaskRow(title: t.channelTitle, progress: 0.5),
+                ],
+                narratorText: widget.latestNarratorText,
+              ),
       ),
     );
   }
