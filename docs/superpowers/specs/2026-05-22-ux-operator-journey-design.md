@@ -490,5 +490,7 @@ The locked design (v17) drove the Claude Design iteration. Claude Design mockups
 - [x] Sub-project B2 (kanban refactor) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b2-kanban-refactor.md`
 - [x] Sub-project B2 implemented: KanbanView replaces the rail's TASKS section; 5 columns (To do · Planning · Running · Awaiting · Done) with mobile horizontal scroll + desktop side-by-side; inline +New task forwards to #general for goal entry; tap-card-to-open-task-channel works. Rail's other sections (#general, CHANNELS, SCHEDULED, DMs) stay until B3 retires the rail.
 - [ ] Sub-project B3 (mini dash + escalation flow + channels sheet) plan written.
+- [x] Sub-project B3a (mini dash + escalation takeover) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b3a-mini-dash-escalation-takeover.md`
+- [x] Sub-project B3a implemented: AmbientMiniDash + EscalationSheet + BottomSheetController; mounts on BoardSelected via Stack overlay; escalations enqueue from NotificationsWs kind='escalation' events; quick replies post back via TallyOrchClient.postMessage; kanban RunningTaskCard gets escalated variant (PAUSED · NEEDS YOU footer). Channels sheet expanded state + inline escalation card deferred to B3b.
 - [x] Sub-project B4 (push notifications + Tally narrator) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b4-push-narrator.md`
 - [x] Sub-project B5 (desktop sidebar variants) plan written: `docs/superpowers/plans/2026-05-25-sub-project-b5-desktop-sidebar.md`
